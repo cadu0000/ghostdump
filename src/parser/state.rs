@@ -13,7 +13,7 @@ pub enum State {
 
 pub enum NormalEvent {
     Continue,
-    StartInsertHeader,
+    StartInsertHeader(Vec<u8>),
 }
 
 pub struct NormalState {
@@ -35,8 +35,10 @@ impl NormalState {
         let is_insert = buf_len >= 6 && self.buf[buf_len - 6..].eq_ignore_ascii_case(b"INSERT");
         let is_copy = buf_len >= 4 && self.buf[buf_len - 4..].eq_ignore_ascii_case(b"COPY");
 
-        if is_insert || is_copy {
-            NormalEvent::StartInsertHeader
+        if is_insert {
+            NormalEvent::StartInsertHeader(b"INSERT".to_vec())
+        } else if is_copy {
+            NormalEvent::StartInsertHeader(b"COPY".to_vec())
         } else {
             NormalEvent::Continue
         }
@@ -51,7 +53,10 @@ pub enum InsertFormat {
 
 pub enum InsertHeaderEvent {
     Continue,
-    HeaderComplete(InsertFormat),
+    HeaderComplete {
+        format: InsertFormat,
+        header_bytes: Vec<u8>,
+    },
 }
 
 pub struct InsertHeaderState {
@@ -60,9 +65,9 @@ pub struct InsertHeaderState {
 }
 
 impl InsertHeaderState {
-    pub fn new(dialect: SqlDialect) -> Self {
+    pub fn new(dialect: SqlDialect, initial_bytes: Vec<u8>) -> Self {
         Self {
-            keyword_buf: Vec::with_capacity(256),
+            keyword_buf: initial_bytes,
             dialect,
         }
     }
@@ -96,7 +101,12 @@ impl InsertHeaderState {
         }
 
         if let Some(format) = found_format {
-            InsertHeaderEvent::HeaderComplete(format)
+            let header_bytes = std::mem::take(&mut self.keyword_buf);
+
+            InsertHeaderEvent::HeaderComplete {
+                format,
+                header_bytes,
+            }
         } else {
             InsertHeaderEvent::Continue
         }
