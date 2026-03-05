@@ -21,3 +21,4 @@ uuid = { version = "1.10", features = ["v4"] }
 sha2 = "0.10.9"
 hmac = "0.12.1"
 hex = "0.4.3"
+regex = "1.12.3"
