@@ -3,7 +3,9 @@ pub mod state;
 pub mod tokenizer;
 
 pub use schema::extract_metadata;
-pub use state::SqlDialect;
+pub use state::{InsertFormat, SqlDialect};
+pub use tokenizer::{join_tuple, split_tuple};
+
 use state::{
     InsertHeaderEvent, InsertHeaderState, NormalEvent, NormalState, State, ValueEvent, ValueState,
 };
@@ -74,7 +76,6 @@ mod tests {
 
         assert_eq!(extracted_events.len(), 3);
         assert_eq!(extracted_events[0], "INSERT INTO users (id, name) VALUES");
-
         assert_eq!(extracted_events[1], "(1, 'Alice')");
         assert_eq!(extracted_events[2], "(2, 'Bob, the Builder')");
     }
@@ -93,13 +94,42 @@ mod tests {
         }
 
         assert_eq!(extracted_events.len(), 3);
-
         assert_eq!(
             extracted_events[0],
             "COPY public.users (id, name) FROM stdin;"
         );
-
         assert_eq!(extracted_events[1], "1\tAlice\n");
         assert_eq!(extracted_events[2], "2\tBob\n");
+    }
+
+    #[test]
+    fn test_tokenizer_split_and_join_insert() {
+        let raw_tuple = b"1, 'Alice, QA', 'Bob \\'The Boss\\'', 30";
+        let format = InsertFormat::Values;
+
+        let columns = split_tuple(raw_tuple, format);
+        assert_eq!(columns.len(), 4);
+        assert_eq!(columns[0], b"1");
+        assert_eq!(columns[1], b" 'Alice, QA'");
+        assert_eq!(columns[2], b" 'Bob \\'The Boss\\''");
+        assert_eq!(columns[3], b" 30");
+
+        let joined = join_tuple(&columns, format);
+        assert_eq!(joined, raw_tuple);
+    }
+
+    #[test]
+    fn test_tokenizer_split_and_join_copy() {
+        let raw_tuple = b"100\t1234-5678-9012\tAlice\n";
+        let format = InsertFormat::Copy;
+
+        let columns = split_tuple(raw_tuple, format);
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0], b"100");
+        assert_eq!(columns[1], b"1234-5678-9012");
+        assert_eq!(columns[2], b"Alice");
+
+        let joined = join_tuple(&columns, format);
+        assert_eq!(joined, raw_tuple);
     }
 }
