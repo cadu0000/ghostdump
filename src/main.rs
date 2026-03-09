@@ -14,15 +14,11 @@ use std::io::{Read, Write};
 
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
-
     let input = InputSource::new(args.input.clone())?;
     let output = OutputSource::new(args.output.clone())?;
-
-    // let config = Config::load_from_file(args.config.unwrap_or_default())?;
-
     let dialect = SqlDialect::Postgres;
-    process_dump(&args, input, output, dialect)?;
 
+    process_dump(&args, input, output, dialect)?;
     Ok(())
 }
 
@@ -40,7 +36,7 @@ fn process_dump(
     let mut rows_processed = 0;
     let mut is_first_tuple = true;
 
-    'leitura: loop {
+    'read: loop {
         let bytes_read = reader.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
@@ -59,19 +55,24 @@ fn process_dump(
                     }
                     SqlEvent::Tuple(tuple_bytes, format) => {
                         let mut columns = split_tuple(&tuple_bytes, format);
+                        let num_cols = columns.len(); 
+                        for (i, col) in columns.iter_mut().enumerate() {
+                            let raw_string = String::from_utf8_lossy(col);
 
-                        if columns.len() > 1 {
-                            for col in columns.iter_mut() {
-                                let raw_string = String::from_utf8_lossy(col);
-                                let clean_string = raw_string.trim().trim_matches('\'');
+                            let clean_string = raw_string
+                                .trim()
+                                .trim_matches(|c| c == '\'' || c == '(' || c == ')');
 
-                                let hashed_string = engine::hmac_hash(clean_string, &args.secret);
+                            let hashed_string = engine::hmac_hash(clean_string, &args.secret);
 
-                                if format == InsertFormat::Values {
-                                    *col = format!(" '{}'", hashed_string).into_bytes();
-                                } else {
-                                    *col = hashed_string.into_bytes();
-                                }
+                            if format == InsertFormat::Values {
+                                let prefix = if i == 0 { "(" } else { " " };
+                                let suffix = if i == num_cols - 1 { ")" } else { "" };
+
+                                *col =
+                                    format!("{}'{}'{}", prefix, hashed_string, suffix).into_bytes();
+                            } else {
+                                *col = hashed_string.into_bytes();
                             }
                         }
 
@@ -90,8 +91,14 @@ fn process_dump(
 
                         if let Some(limit) = args.limit {
                             if rows_processed >= limit {
-                                break 'leitura;
+                                break 'read;
                             }
+                        }
+                    }
+                    SqlEvent::Footer(footer_bytes) => {
+                        if !args.dry_run {
+                            writer.write_all(&footer_bytes)?;
+                            writer.write_all(b"\n\n")?; 
                         }
                     }
                 }

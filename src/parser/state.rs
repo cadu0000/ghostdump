@@ -135,7 +135,7 @@ impl InsertHeaderState {
 pub enum ValueEvent {
     Continue,
     TupleComplete(Vec<u8>),
-    ExitValuesMode,
+    ExitValuesMode(Vec<u8>), 
 }
 
 pub struct ValueState {
@@ -181,7 +181,8 @@ impl ValueState {
             };
 
             if is_end_marker {
-                return ValueEvent::ExitValuesMode;
+                let data = std::mem::take(&mut self.tuple_buffer); 
+                return ValueEvent::ExitValuesMode(data); 
             } else {
                 let data = std::mem::take(&mut self.tuple_buffer);
 
@@ -229,7 +230,9 @@ impl ValueState {
                 }
             }
             b';' if !self.inside_string && self.paren_depth == 0 => {
-                return ValueEvent::ExitValuesMode;
+                self.tuple_buffer.push(byte); 
+                let data = std::mem::take(&mut self.tuple_buffer); 
+                return ValueEvent::ExitValuesMode(data); 
             }
             _ => {
                 if self.paren_depth > 0 {

@@ -13,6 +13,7 @@ use state::{
 pub enum SqlEvent {
     Header(Vec<u8>),
     Tuple(Vec<u8>, InsertFormat),
+    Footer(Vec<u8>),
 }
 
 pub struct SqlParser {
@@ -52,9 +53,9 @@ impl SqlParser {
             },
             State::ValueMode(v_state) => match v_state.process_byte(byte) {
                 ValueEvent::TupleComplete(data) => Some(SqlEvent::Tuple(data, v_state.format)),
-                ValueEvent::ExitValuesMode => {
+                ValueEvent::ExitValuesMode(footer_bytes) => { 
                     self.state = State::Normal(NormalState::new());
-                    None
+                    Some(SqlEvent::Footer(footer_bytes)) 
                 }
                 ValueEvent::Continue => None,
             },
@@ -77,6 +78,7 @@ mod tests {
                 let data = match event {
                     SqlEvent::Header(bytes) => bytes,
                     SqlEvent::Tuple(bytes, _) => bytes,
+                    SqlEvent::Footer(bytes) => bytes, 
                 };
 
                 let event_string = String::from_utf8_lossy(&data).into_owned();
@@ -84,11 +86,12 @@ mod tests {
             }
         }
 
-        assert_eq!(extracted_events.len(), 3);
+        assert_eq!(extracted_events.len(), 4); 
 
         assert_eq!(extracted_events[0], "INSERT INTO users (id, name) VALUES");
         assert_eq!(extracted_events[1], "(1, 'Alice')");
         assert_eq!(extracted_events[2], "(2, 'Bob, the Builder')");
+        assert_eq!(extracted_events[3], ";");
     }
 
     #[test]
@@ -102,6 +105,7 @@ mod tests {
                 let data = match event {
                     SqlEvent::Header(bytes) => bytes,
                     SqlEvent::Tuple(bytes, _) => bytes,
+                    SqlEvent::Footer(bytes) => bytes, 
                 };
 
                 let event_string = String::from_utf8_lossy(&data).into_owned();
@@ -109,7 +113,7 @@ mod tests {
             }
         }
 
-        assert_eq!(extracted_events.len(), 3);
+        assert_eq!(extracted_events.len(), 4); 
 
         assert_eq!(
             extracted_events[0],
@@ -117,6 +121,7 @@ mod tests {
         );
         assert_eq!(extracted_events[1], "1\tAlice\n");
         assert_eq!(extracted_events[2], "2\tBob\n");
+        assert_eq!(extracted_events[3], "\\.\n"); 
     }
 
     #[test]
