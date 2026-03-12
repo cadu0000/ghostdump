@@ -18,7 +18,7 @@ pub struct Args {
     #[arg(short = 'o', long, value_name = "OUTPUT_FILE", help = "Define o caminho do arquivo de saída")]
     pub output: Option<PathBuf>,
 
-    #[arg(short = 's', long, env = "BLINDFOLD_SECRET", hide_env_values = true, help = "Define uma nova secret_key")]
+    #[arg(short = 's', long, env = "GHOSTDUMP_SECRET", hide_env_values = true, help = "Define uma nova secret_key")]
     pub secret: String, 
 
     #[arg(short = 'v', long, action = clap::ArgAction::SetTrue, help = "Ativa logs detalhados (Debug)")]
