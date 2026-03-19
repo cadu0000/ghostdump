@@ -12,7 +12,11 @@ use state::{
 
 pub enum SqlEvent {
     DefaultStatement(u8),
-    Header(Vec<u8>),
+    Header {
+        raw_bytes: Vec<u8>,
+        table_name: Option<String>,
+        columns: Option<Vec<String>>,
+    },
     Tuple(Vec<u8>, InsertFormat),
     Footer(Vec<u8>),
 }
@@ -49,7 +53,16 @@ impl SqlParser {
                     let v_state = ValueState::new(self.dialect, format);
                     self.state = State::ValueMode(v_state);
 
-                    Some(SqlEvent::Header(header_bytes))
+                    let (table_name, columns) = match extract_metadata(&header_bytes) {
+                        Some((tbl, cols)) => (Some(tbl), cols),
+                        None => (None, None), 
+                    };
+
+                    Some(SqlEvent::Header {
+                        raw_bytes: header_bytes,
+                        table_name,
+                        columns,
+                    })
                 }
                 InsertHeaderEvent::Continue => None,
             },
@@ -64,6 +77,7 @@ impl SqlParser {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,10 +91,9 @@ mod tests {
         for &byte in sql {
             if let Some(event) = parser.handle_byte(byte) {
                 let data = match event {
-                    SqlEvent::Header(bytes) => bytes,
+                    SqlEvent::Header { raw_bytes, .. } => raw_bytes,
                     SqlEvent::Tuple(bytes, _) => bytes,
                     SqlEvent::Footer(bytes) => bytes,
-
                     SqlEvent::DefaultStatement(_) => continue,
                 };
 
@@ -106,10 +119,9 @@ mod tests {
         for &byte in sql {
             if let Some(event) = parser.handle_byte(byte) {
                 let data = match event {
-                    SqlEvent::Header(bytes) => bytes,
+                    SqlEvent::Header { raw_bytes, .. } => raw_bytes,
                     SqlEvent::Tuple(bytes, _) => bytes,
                     SqlEvent::Footer(bytes) => bytes,
-
                     SqlEvent::DefaultStatement(_) => continue,
                 };
 
