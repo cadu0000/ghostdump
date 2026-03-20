@@ -1,29 +1,53 @@
-# EXAMPLE
+# --- TABELA CUSTOMERS ---
+[tables.customers]
 
-[tables.users]
-columns = [
-    # 1. Deterministic Masking (Keeps JOINs and Foreign Keys working)
-    { name = "id", strategy = "hmac" },
-    { name = "company_id", strategy = "hmac" },
+  [[tables.customers.columns]]
+  name = "id"
+  strategy = "random_uuid"
 
-    # 2. Random Anonymization (Faker) for PII
-    { name = "name", strategy = "faker_name" },
-    { name = "email", strategy = "faker_email" },
+  [[tables.customers.columns]]
+  name = "name"
+  strategy = "faker_name"
 
-    # 3. Fixed Value (Useful for allowing logins in QA environments)
-    { name = "password_hash", strategy = "fixed", value = "$2a$12$R9eb8igRomIQaZAq" },
+  [[tables.customers.columns]]
+  name = "document"
+  strategy = "cpf" 
 
-    # 4. Suppression
-    { name = "session_token", strategy = "nullify" },
+  [[tables.customers.columns]]
+  name = "phone"
+  strategy = "faker_phone_br"
 
-    # 5. Local Differential Privacy (LDP) - Laplace Mechanism for Numerics
-    # Adds statistical noise. Ex: salary of 5000 becomes 5123.4
-    { name = "salary", strategy = "dp_laplace", epsilon = 0.5, sensitivity = 15000.0 }
-]
+  [[tables.customers.columns]]
+  name = "status"
+  strategy = "random_choice"
+  options = ["ACTIVE", "INACTIVE", "PENDING", "DELETED"]
 
-[tables.orders]
-columns = [
-    { name = "id", strategy = "hmac" },
-    { name = "user_id", strategy = "hmac" }, # Will perfectly match users.id
-    { name = "credit_card", strategy = "fake_credit_card" }
-]
+# --- TABELA SERVER_LOGS ---
+[tables.server_logs]
+
+  [[tables.server_logs.columns]]
+  name = "ip_address"
+  strategy = "faker_ip"
+
+  [[tables.server_logs.columns]]
+  name = "access_token"
+  strategy = "random_string"
+  length = 32
+
+  [[tables.server_logs.columns]]
+  name = "internal_code"
+  strategy = "nullify"
+
+# --- TABELA SALES ---
+[tables.sales]
+
+  [[tables.sales.columns]]
+  name = "category"
+  strategy = "fixed"
+  value = "GENERAL_MERCHANDISE"
+
+  [[tables.sales.columns]]
+  name = "value"
+  strategy = "dp_laplace"
+  epsilon = 0.3
+  sensitivity = 500.0
