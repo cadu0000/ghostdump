@@ -143,9 +143,13 @@ columns = [
 The secret key used to generate deterministic HMAC hashes. For security reasons, **never commit this to the repository**. It can be provided via CLI argument or environment variable:
 
 ```bash
-export GHOSTDUMP_SECRET="super_secret_key"
+export GHOSTDUMP_SECRET="$(openssl rand -hex 32)"
 
 ```
+
+The secret is required only when the rules use `hmac`. Use 32 or more random bytes: an empty secret is rejected, and one shorter than 16 bytes triggers a warning, because HMAC pseudonyms of low-entropy values (sequential IDs, CPFs) can be brute-forced by anyone who guesses the secret.
+
+All status messages are written to stderr, so stdout carries only the sanitized dump.
 
 ---
 
@@ -190,7 +194,7 @@ zcat production_db.sql.gz | ghostdump -c rules.toml | gzip > dev_db_anon.sql.gz
 | `-c` | `--config <FILE>` | Path to the TOML configuration file. |
 | `-i` | `--input <FILE>` | Path to the input SQL dump file. |
 | `-o` | `--output <FILE>` | Path to the output SQL dump file. |
-| `-s` | `--secret <STR>` | Cryptographic secret for HMAC (Can also use `GHOSTDUMP_SECRET` env var). |
+| `-s` | `--secret <STR>` | Cryptographic secret for HMAC, required when the rules use `hmac` (Can also use `GHOSTDUMP_SECRET` env var). |
 | `-p` | `--progress` | Displays real-time progress metrics (MB/s, ETA). |
 | `-v` | `--verbose` | Enables detailed debug logging for troubleshooting. |
 | `-d` | `--dry-run` | Processes input without writing output (Validation mode). |
