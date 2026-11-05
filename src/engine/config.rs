@@ -30,3 +30,12 @@ impl Config {
         Ok(config)
     }
 }
+impl Config {
+    /// Whether any column uses a strategy that needs the secret key.
+    pub fn uses_secret(&self) -> bool {
+        self.tables
+            .values()
+            .flat_map(|table| &table.columns)
+            .any(|column| matches!(column.strategy, StrategyConfig::Hmac))
+    }
+}
