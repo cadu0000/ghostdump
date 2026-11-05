@@ -19,8 +19,22 @@ pub struct TableConfig {
 pub struct ColumnConfig {
     pub name: String,
 
+    /// What to do with NULL values of this column.
+    #[serde(default)]
+    pub null_policy: NullPolicy,
+
     #[serde(flatten)]
     pub strategy: StrategyConfig,
+}
+
+/// `keep` (the default) writes NULL as NULL. `generate` masks NULL values too,
+/// with strategies that do not depend on the original value.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NullPolicy {
+    #[default]
+    Keep,
+    Generate,
 }
 
 impl Config {
@@ -37,5 +51,27 @@ impl Config {
             .values()
             .flat_map(|table| &table.columns)
             .any(|column| matches!(column.strategy, StrategyConfig::Hmac))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_null_policy_defaults_to_keep() {
+        let config: Config = toml::from_str(
+            r#"
+            [tables.t]
+            columns = [
+                { name = "a", strategy = "faker_name" },
+                { name = "b", strategy = "faker_name", null_policy = "generate" },
+            ]
+            "#,
+        )
+        .unwrap();
+        let columns = &config.tables["t"].columns;
+        assert_eq!(columns[0].null_policy, NullPolicy::Keep);
+        assert_eq!(columns[1].null_policy, NullPolicy::Generate);
     }
 }
