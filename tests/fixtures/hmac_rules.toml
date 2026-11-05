@@ -1,0 +1,4 @@
+[tables.users]
+columns = [
+    { name = "id", strategy = "hmac" },
+]
