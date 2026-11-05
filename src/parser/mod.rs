@@ -5,7 +5,7 @@ pub mod state;
 use std::fmt;
 use std::sync::Arc;
 
-pub use schema::{HeaderMetadata, extract_metadata};
+pub use schema::{HeaderMetadata, detect_dialect, extract_metadata};
 pub use state::{InsertFormat, Remainder, SqlDialect};
 
 use state::{

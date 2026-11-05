@@ -69,6 +69,23 @@ pub fn extract_metadata(header_bytes: &[u8], dialect: SqlDialect) -> Option<Head
     None
 }
 
+/// Guesses the dialect from the first bytes of a dump, using the comments
+/// and settings that pg_dump, mysqldump and SQLite's `.dump` write at the top.
+pub fn detect_dialect(prefix: &[u8]) -> Option<SqlDialect> {
+    let text = String::from_utf8_lossy(prefix);
+    let has = |marker: &str| text.contains(marker);
+
+    if has("PostgreSQL database dump") || has("SET standard_conforming_strings") {
+        Some(SqlDialect::Postgres)
+    } else if has("MySQL dump") || has("MariaDB dump") || has("/*!40101") {
+        Some(SqlDialect::Mysql)
+    } else if has("PRAGMA foreign_keys") || has("BEGIN TRANSACTION;") {
+        Some(SqlDialect::Sqlite)
+    } else {
+        None
+    }
+}
+
 /// The header with every comment replaced by spaces.
 fn without_comments(header: &[u8], dialect: SqlDialect) -> Vec<u8> {
     let mut lexer = Lexer::new(dialect);
@@ -149,5 +166,22 @@ mod tests {
             metadata("COPY t (a) FROM stdin WITH (FORMAT csv);", pg),
             named("t", &["a"])
         );
+    }
+
+    #[test]
+    fn test_detect_dialect() {
+        assert_eq!(
+            detect_dialect(b"--\n-- PostgreSQL database dump\n--\n"),
+            Some(SqlDialect::Postgres)
+        );
+        assert_eq!(
+            detect_dialect(b"-- MySQL dump 10.13  Distrib 8.0.36\n"),
+            Some(SqlDialect::Mysql)
+        );
+        assert_eq!(
+            detect_dialect(b"PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n"),
+            Some(SqlDialect::Sqlite)
+        );
+        assert_eq!(detect_dialect(b"INSERT INTO t VALUES (1);"), None);
     }
 }
