@@ -108,7 +108,7 @@ impl SqlParser {
 
     fn metadata_for(&mut self, header: &[u8]) -> Option<Arc<HeaderMetadata>> {
         if header != self.last_header.as_slice() {
-            self.last_metadata = extract_metadata(header).map(Arc::new);
+            self.last_metadata = extract_metadata(header, self.dialect).map(Arc::new);
             self.last_header.clear();
             self.last_header.extend_from_slice(header);
         }
@@ -280,6 +280,23 @@ mod tests {
         // MySQL: the backslash escapes the quote.
         let (seen, _) = parse(SqlDialect::Mysql, b"INSERT INTO t (a) VALUES ('it\\'s)'), ('x');");
         assert_eq!(seen[1], tuple("('it\\'s)')"));
+    }
+
+    #[test]
+    fn test_replace_and_value_are_mysql_data_statements() {
+        let (seen, _) = parse(SqlDialect::Mysql, b"REPLACE INTO t (a) VALUE (1);");
+        assert_eq!(
+            seen,
+            [
+                header("REPLACE INTO t (a) VALUE "),
+                tuple("(1)"),
+                footer(";")
+            ]
+        );
+
+        // PostgreSQL has neither REPLACE nor VALUE.
+        assert_passes_through(SqlDialect::Postgres, b"REPLACE INTO t (a) VALUES (1);");
+        assert_passes_through(SqlDialect::Postgres, b"INSERT INTO t (a) VALUE (1);");
     }
 
     #[test]

@@ -44,9 +44,9 @@ pub enum NormalEvent {
     DefaultStatement(u8),
 }
 
-/// Bytes held back so that the first word of a statement (up to `INSERT`)
+/// Bytes held back so that the first word of a statement (up to `REPLACE`)
 /// and the byte after it are still available when the keyword is recognized.
-const LOOKBEHIND: usize = 7;
+const LOOKBEHIND: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum StatementPhase {
@@ -62,8 +62,8 @@ enum StatementPhase {
     Body,
 }
 
-/// Passes SQL through and watches for statements that start with `INSERT`
-/// or `COPY`. Keywords inside literals, comments, identifiers or other
+/// Passes SQL through and watches for statements that start with `INSERT`,
+/// `REPLACE` (MySQL and SQLite) or `COPY` (PostgreSQL). Keywords inside literals, comments, identifiers or other
 /// statements are ignored.
 pub struct NormalState {
     dialect: SqlDialect,
@@ -189,6 +189,7 @@ impl NormalState {
     fn keyword_before_last(&self, len: usize) -> Option<DataKeyword> {
         let (word, keyword): (&[u8], DataKeyword) = match len {
             6 => (b"INSERT", DataKeyword::Insert),
+            7 if self.dialect != SqlDialect::Postgres => (b"REPLACE", DataKeyword::Insert),
             4 if self.dialect == SqlDialect::Postgres => (b"COPY", DataKeyword::Copy),
             _ => return None,
         };
@@ -287,7 +288,7 @@ impl InsertHeaderState {
 
         match self.keyword {
             // `INSERT ... DEFAULT VALUES;` has no rows: it falls through to `NotData`.
-            DataKeyword::Insert if !ends_statement && self.last_word_is(word_len, b"VALUES") => {
+            DataKeyword::Insert if !ends_statement && self.is_values_keyword(word_len) => {
                 let mut header_bytes = std::mem::take(&mut self.keyword_buf);
                 header_bytes.pop();
 
@@ -312,6 +313,12 @@ impl InsertHeaderState {
         }
 
         InsertHeaderEvent::Continue
+    }
+
+    /// `VALUES`, or its MySQL synonym `VALUE`, made of the `len` bytes before the last one.
+    fn is_values_keyword(&self, len: usize) -> bool {
+        self.last_word_is(len, b"VALUES")
+            || (self.dialect == SqlDialect::Mysql && self.last_word_is(len, b"VALUE"))
     }
 
     /// Whether the `len` bytes before the last one spell `word`.
