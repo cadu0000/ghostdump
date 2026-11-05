@@ -2,14 +2,13 @@ pub mod config;
 pub mod strategy;
 
 use rand::{Rng, thread_rng};
-use std::io::{Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 
 use crate::engine::config::Config;
 use crate::engine::strategy::StrategyConfig;
-use crate::io::{InputSource, OutputSource};
 use crate::parser::state::{InsertFormat, SqlDialect};
 use crate::parser::tokenizer::{join_tuple, split_tuple};
-use crate::parser::{SqlEvent, SqlParser};
+use crate::parser::{Remainder, SqlEvent, SqlParser};
 
 pub struct AnonymizerEngine {
     config: Config,
@@ -64,20 +63,21 @@ impl AnonymizerEngine {
 
     pub fn process_dump(
         &self,
-        input: InputSource,
-        output: OutputSource,
+        input: impl Read,
+        output: impl Write,
         dialect: SqlDialect,
         dry_run: bool,
         limit: Option<usize>,
-    ) -> std::io::Result<usize> {
-        let mut reader = input.into_buffered();
-        let mut writer = output.into_buffered();
+    ) -> io::Result<usize> {
+        let mut reader = BufReader::new(input);
+        let mut writer = BufWriter::new(output);
         let mut parser = SqlParser::new(dialect);
-        let mut rng = thread_rng(); 
+        let mut rng = thread_rng();
 
         let mut buffer = [0u8; 64 * 1024];
         let mut rows_processed = 0;
         let mut is_first_tuple = true;
+        let mut reached_limit = false;
 
         let mut active_strategy_map: Vec<Option<&StrategyConfig>> = Vec::new();
 
@@ -95,7 +95,13 @@ impl AnonymizerEngine {
                                 writer.write_all(&[b])?;
                             }
                         }
-                        
+
+                        SqlEvent::Passthrough(bytes) => {
+                            if !dry_run {
+                                writer.write_all(&bytes)?;
+                            }
+                        }
+
                         SqlEvent::Header {
                             raw_bytes,
                             table_name,
@@ -157,10 +163,11 @@ impl AnonymizerEngine {
                             is_first_tuple = false;
                             rows_processed += 1;
 
-                            if let Some(l) = limit {
-                                if rows_processed >= l {
-                                    break 'leitura;
-                                }
+                            if let Some(l) = limit
+                                && rows_processed >= l
+                            {
+                                reached_limit = true;
+                                break 'leitura;
                             }
                         }
 
@@ -175,9 +182,71 @@ impl AnonymizerEngine {
             }
         }
 
+        // With `--limit` the output stops on purpose, in the middle of the input.
+        if !reached_limit {
+            match parser.finish() {
+                Remainder::Bytes(rest) => {
+                    if !dry_run {
+                        writer.write_all(&rest)?;
+                    }
+                }
+                Remainder::UnterminatedData { partial_row: false } => {
+                    eprintln!(
+                        "Warning: the input ended inside a data block, before its terminator (`;` or `\\.`)."
+                    );
+                }
+                Remainder::UnterminatedData { partial_row: true } => {
+                    if !dry_run {
+                        writer.flush()?;
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the input ended in the middle of a data row (truncated dump?). \
+                         The incomplete row was not written, because it could not be masked.",
+                    ));
+                }
+            }
+        }
+
         if !dry_run {
             writer.flush()?;
         }
         Ok(rows_processed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn engine() -> AnonymizerEngine {
+        AnonymizerEngine::new(
+            Config {
+                tables: HashMap::new(),
+            },
+            String::new(),
+        )
+    }
+
+    fn run(input: &[u8]) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        engine().process_dump(input, &mut out, SqlDialect::Postgres, false, None)?;
+        Ok(out)
+    }
+
+    #[test]
+    fn test_statements_outside_data_blocks_round_trip() {
+        let input = include_bytes!("../../tests/fixtures/passthrough.sql");
+        assert_eq!(
+            String::from_utf8_lossy(&run(input).unwrap()),
+            String::from_utf8_lossy(input)
+        );
+    }
+
+    #[test]
+    fn test_truncated_row_is_an_error() {
+        let err = run(b"INSERT INTO t (a) VALUES (1), (2").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
