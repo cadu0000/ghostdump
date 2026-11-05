@@ -31,7 +31,7 @@ pub fn extract_metadata(header_bytes: &[u8], dialect: SqlDialect) -> Option<Head
     });
 
     let copy_re = COPY_RE.get_or_init(|| {
-        Regex::new(r"(?i)COPY\s+(?P<table>[^\s\(]+)(?:\s*\((?P<cols>[^\)]+)\))?\s*FROM\s+STDIN;")
+        Regex::new(r"(?i)COPY\s+(?P<table>[^\s\(]+)(?:\s*\((?P<cols>[^\)]+)\))?\s*FROM\s+STDIN\b")
             .unwrap()
     });
 
@@ -135,6 +135,19 @@ mod tests {
         assert_eq!(
             metadata("INSERT INTO public.t VALUES ", SqlDialect::Postgres),
             Some(("t".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn test_copy_header_with_and_without_options() {
+        let pg = SqlDialect::Postgres;
+        assert_eq!(
+            metadata("COPY public.t (a, b) FROM stdin;", pg),
+            named("t", &["a", "b"])
+        );
+        assert_eq!(
+            metadata("COPY t (a) FROM stdin WITH (FORMAT csv);", pg),
+            named("t", &["a"])
         );
     }
 }

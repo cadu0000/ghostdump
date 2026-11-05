@@ -1,5 +1,5 @@
 use ghostdump::cli::{Args, MIN_SECRET_BYTES, SecretError, SecretLength, check_secret};
-use ghostdump::engine::AnonymizerEngine;
+use ghostdump::engine::{AnonymizerEngine, RunOptions};
 use ghostdump::engine::config::Config;
 use ghostdump::io::{InputSource, OutputSource};
 use ghostdump::parser::state::SqlDialect;
@@ -49,8 +49,13 @@ fn main() {
         .unwrap_or_else(|e| fatal(&format!("could not open the input: {}", e)));
     let output = OutputSource::new(args.output.clone())
         .unwrap_or_else(|e| fatal(&format!("could not open the output: {}", e)));
-    let dialect = SqlDialect::Postgres;
     let engine = AnonymizerEngine::new(config, secret);
+    let options = RunOptions {
+        dry_run: args.dry_run,
+        limit: args.limit,
+        max_row_bytes: args.max_row_size.saturating_mul(1024 * 1024),
+        ..RunOptions::new(SqlDialect::Postgres)
+    };
 
     if args.dry_run {
         info!("Dry-Run mode enabled. Data will be processed, but nothing will be written to disk.");
@@ -58,7 +63,7 @@ fn main() {
 
     let start_time = Instant::now();
     let report = engine
-        .process_dump(input, output, dialect, args.dry_run, args.limit)
+        .process_dump(input, output, &options)
         .unwrap_or_else(|e| fatal(&e.to_string()));
     let duration = start_time.elapsed();
 

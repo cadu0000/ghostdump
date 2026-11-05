@@ -2,6 +2,7 @@ pub mod lexer;
 pub mod schema;
 pub mod state;
 
+use std::fmt;
 use std::sync::Arc;
 
 pub use schema::{HeaderMetadata, extract_metadata};
@@ -10,6 +11,29 @@ pub use state::{InsertFormat, Remainder, SqlDialect};
 use state::{
     InsertHeaderEvent, InsertHeaderState, NormalEvent, NormalState, State, ValueEvent, ValueState,
 };
+
+/// Largest row or data block header accepted by default: 256 MiB.
+pub const DEFAULT_MAX_ROW_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParseError {
+    /// A row or a data block header grew past the size limit.
+    TooLarge { limit: usize },
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::TooLarge { limit } => write!(
+                f,
+                "a data row or statement header is longer than {limit} bytes \
+                 (raise --max-row-size if the dump really has rows this large)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 /// What the parser reports for each input byte. Writing every byte of
 /// `DefaultStatement`, `Passthrough`, `Header`, `Tuple` and `Footer`, in
@@ -25,9 +49,13 @@ pub enum SqlEvent {
         /// Shared between identical headers (`pg_dump --inserts` repeats
         /// the same header on every row).
         metadata: Option<Arc<HeaderMetadata>>,
+        /// A COPY with options the row codec cannot read.
+        opaque: bool,
     },
     Tuple(Vec<u8>, InsertFormat),
     Footer(Vec<u8>),
+    /// The input cannot be processed safely; the run must stop.
+    Error(ParseError),
 }
 
 pub struct SqlParser {
@@ -37,6 +65,7 @@ pub struct SqlParser {
     /// parsed again.
     last_header: Vec<u8>,
     last_metadata: Option<Arc<HeaderMetadata>>,
+    max_row_bytes: usize,
 }
 
 impl SqlParser {
@@ -46,7 +75,15 @@ impl SqlParser {
             dialect,
             last_header: Vec::new(),
             last_metadata: None,
+            max_row_bytes: DEFAULT_MAX_ROW_BYTES,
         }
+    }
+
+    /// Rows and data block headers longer than `limit` bytes are reported
+    /// as errors instead of growing the buffer without bound.
+    pub fn with_max_row_bytes(mut self, limit: usize) -> Self {
+        self.max_row_bytes = limit;
+        self
     }
 
     pub fn handle_byte(&mut self, byte: u8) -> Option<SqlEvent> {
@@ -62,6 +99,7 @@ impl SqlParser {
                         keyword,
                         initial_bytes,
                         delimiter,
+                        self.max_row_bytes,
                     ));
                     None
                 }
@@ -73,8 +111,9 @@ impl SqlParser {
                     format,
                     mut header_bytes,
                     carry,
+                    opaque,
                 } => {
-                    let mut v_state = ValueState::new(self.dialect, format);
+                    let mut v_state = ValueState::new(self.dialect, format, self.max_row_bytes);
                     if let Some(carry) = carry
                         && !v_state.take_carry(carry)
                     {
@@ -86,12 +125,14 @@ impl SqlParser {
                     Some(SqlEvent::Header {
                         raw_bytes: header_bytes,
                         metadata,
+                        opaque,
                     })
                 }
                 InsertHeaderEvent::NotData(bytes) => {
                     self.state = State::Normal(NormalState::new(self.dialect));
                     Some(SqlEvent::Passthrough(bytes))
                 }
+                InsertHeaderEvent::TooLarge => Some(self.too_large()),
                 InsertHeaderEvent::Continue => None,
             },
             State::ValueMode(v_state) => match v_state.process_byte(byte) {
@@ -101,9 +142,16 @@ impl SqlParser {
                     Some(SqlEvent::Footer(footer_bytes))
                 }
                 ValueEvent::Passthrough(byte) => Some(SqlEvent::DefaultStatement(byte)),
+                ValueEvent::RowTooLarge => Some(self.too_large()),
                 ValueEvent::Continue => None,
             },
         }
+    }
+
+    fn too_large(&self) -> SqlEvent {
+        SqlEvent::Error(ParseError::TooLarge {
+            limit: self.max_row_bytes,
+        })
     }
 
     fn metadata_for(&mut self, header: &[u8]) -> Option<Arc<HeaderMetadata>> {
@@ -194,6 +242,7 @@ mod tests {
                 Some(SqlEvent::Header { raw_bytes, .. }) => seen.push(Seen::Header(text(&raw_bytes))),
                 Some(SqlEvent::Tuple(row, _)) => seen.push(Seen::Tuple(text(&row))),
                 Some(SqlEvent::Footer(bytes)) => seen.push(Seen::Footer(text(&bytes))),
+                Some(SqlEvent::Error(e)) => panic!("unexpected error: {e}"),
                 None => {}
             }
         }
@@ -297,6 +346,49 @@ mod tests {
         // PostgreSQL has neither REPLACE nor VALUE.
         assert_passes_through(SqlDialect::Postgres, b"REPLACE INTO t (a) VALUES (1);");
         assert_passes_through(SqlDialect::Postgres, b"INSERT INTO t (a) VALUE (1);");
+    }
+
+    #[test]
+    fn test_copy_with_options_is_opaque() {
+        let opaque = |sql: &[u8]| -> Vec<bool> {
+            let mut parser = SqlParser::new(SqlDialect::Postgres);
+            sql.iter()
+                .filter_map(|&byte| match parser.handle_byte(byte) {
+                    Some(SqlEvent::Header { opaque, .. }) => Some(opaque),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            opaque(b"COPY t (a) FROM stdin WITH (FORMAT csv);\n\"x\"\n\\.\n"),
+            [true]
+        );
+        assert_eq!(opaque(b"COPY t (a) FROM stdin ;\n1\n\\.\n"), [false]);
+    }
+
+    #[test]
+    fn test_rows_longer_than_the_limit_are_reported() {
+        let errors = |sql: &[u8]| -> Vec<SqlEvent> {
+            let mut parser = SqlParser::new(SqlDialect::Postgres).with_max_row_bytes(16);
+            sql.iter()
+                .filter_map(|&byte| parser.handle_byte(byte))
+                .filter(|event| matches!(event, SqlEvent::Error(_)))
+                .collect()
+        };
+        let too_large = SqlEvent::Error(ParseError::TooLarge { limit: 16 });
+        assert_eq!(
+            errors(b"COPY t FROM stdin;\n0123456789abcdefghij\n").first(),
+            Some(&too_large)
+        );
+        assert_eq!(
+            errors(b"INSERT INTO t VALUES ('0123456789abcdef');").first(),
+            Some(&too_large)
+        );
+        // The header counts too.
+        assert_eq!(
+            errors(b"INSERT INTO a_very_long_table_name (a) VALUES (1);").first(),
+            Some(&too_large)
+        );
     }
 
     #[test]

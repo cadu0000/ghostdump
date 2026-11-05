@@ -56,12 +56,20 @@ pub struct Args {
         short = 'l',
         long,
         value_name = "ROWS",
-        help = "Limita o processamento a N linhas de INSERT"
+        help = "Para depois de N linhas de dados, fechando o comando em que estão"
     )]
     pub limit: Option<usize>,
 
     #[arg(short = 'p', long, help = "Exibe uma barra de progresso no terminal")]
     pub progress: bool,
+
+    #[arg(
+        long,
+        value_name = "MiB",
+        default_value_t = 256,
+        help = "Tamanho máximo de uma linha de dados, em MiB"
+    )]
+    pub max_row_size: usize,
 }
 
 /// Secrets shorter than this, in bytes, trigger a warning.

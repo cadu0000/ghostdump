@@ -234,10 +234,15 @@ pub enum InsertHeaderEvent {
         header_bytes: Vec<u8>,
         /// The byte after `VALUES`, which belongs to the rows.
         carry: Option<u8>,
+        /// COPY with options GhostDump cannot read (`WITH (FORMAT csv)`): its
+        /// rows can be copied but not masked.
+        opaque: bool,
     },
     /// The statement ended without opening a data block (`INSERT ... SELECT`,
     /// `COPY ... TO stdout`); its bytes pass through unchanged.
     NotData(Vec<u8>),
+    /// The header grew past the size limit without ending.
+    TooLarge,
 }
 
 pub struct InsertHeaderState {
@@ -247,6 +252,11 @@ pub struct InsertHeaderState {
     lexer: Lexer,
     /// Length of the run of identifier bytes that ends at the last byte.
     word_len: usize,
+    /// COPY: the word `STDIN` appeared, so the statement reads rows.
+    saw_stdin: bool,
+    /// COPY: something other than spaces followed `STDIN`.
+    copy_options: bool,
+    max_bytes: usize,
 }
 
 impl InsertHeaderState {
@@ -255,6 +265,7 @@ impl InsertHeaderState {
         keyword: DataKeyword,
         initial_bytes: Vec<u8>,
         delimiter: u8,
+        max_bytes: usize,
     ) -> Self {
         // The keyword itself is plain code; only the byte after it can
         // change the lexer state (for example, by opening a comment).
@@ -267,23 +278,38 @@ impl InsertHeaderState {
             keyword,
             lexer,
             word_len: 0,
+            saw_stdin: false,
+            copy_options: false,
+            max_bytes,
         }
     }
 
     pub fn process_byte(&mut self, byte: u8) -> InsertHeaderEvent {
         self.keyword_buf.push(byte);
-
-        if self.lexer.feed(byte) != ByteClass::Code {
-            self.word_len = 0;
-            return InsertHeaderEvent::Continue;
+        if self.keyword_buf.len() > self.max_bytes {
+            return InsertHeaderEvent::TooLarge;
         }
 
-        if is_ident_byte(byte) {
+        let class = self.lexer.feed(byte);
+        if class == ByteClass::Code && is_ident_byte(byte) {
             self.word_len += 1;
+            self.note_copy_option(byte, class);
             return InsertHeaderEvent::Continue;
         }
 
+        // A word ends here, if one was being read.
         let word_len = std::mem::take(&mut self.word_len);
+        if self.keyword == DataKeyword::Copy
+            && !self.saw_stdin
+            && self.last_word_is(word_len, b"STDIN")
+        {
+            self.saw_stdin = true;
+        }
+        self.note_copy_option(byte, class);
+
+        if class != ByteClass::Code {
+            return InsertHeaderEvent::Continue;
+        }
         let ends_statement = byte == b';';
 
         match self.keyword {
@@ -296,13 +322,15 @@ impl InsertHeaderState {
                     format: InsertFormat::Values,
                     header_bytes,
                     carry: Some(byte),
+                    opaque: false,
                 };
             }
-            DataKeyword::Copy if ends_statement && self.last_word_is(word_len, b"STDIN") => {
+            DataKeyword::Copy if ends_statement && self.saw_stdin => {
                 return InsertHeaderEvent::HeaderComplete {
                     format: InsertFormat::Copy,
                     header_bytes: std::mem::take(&mut self.keyword_buf),
                     carry: None,
+                    opaque: self.copy_options,
                 };
             }
             _ => {}
@@ -321,6 +349,14 @@ impl InsertHeaderState {
             || (self.dialect == SqlDialect::Mysql && self.last_word_is(len, b"VALUE"))
     }
 
+    /// After `STDIN`, anything other than spaces and the final `;` is a COPY option.
+    fn note_copy_option(&mut self, byte: u8, class: ByteClass) {
+        let plain = class == ByteClass::Code && (byte.is_ascii_whitespace() || byte == b';');
+        if self.saw_stdin && !plain {
+            self.copy_options = true;
+        }
+    }
+
     /// Whether the `len` bytes before the last one spell `word`.
     fn last_word_is(&self, len: usize, word: &[u8]) -> bool {
         let end = self.keyword_buf.len() - 1;
@@ -336,6 +372,8 @@ pub enum ValueEvent {
     /// as `ON CONFLICT DO NOTHING`, the rest of the COPY command line),
     /// written unchanged.
     Passthrough(u8),
+    /// A row grew past the size limit without ending.
+    RowTooLarge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -360,11 +398,13 @@ pub struct ValueState {
     pub format: InsertFormat,
     phase: RowPhase,
     lexer: Lexer,
+    max_row_bytes: usize,
 }
 
 impl ValueState {
-    pub fn new(dialect: SqlDialect, format: InsertFormat) -> Self {
+    pub fn new(dialect: SqlDialect, format: InsertFormat, max_row_bytes: usize) -> Self {
         ValueState {
+            max_row_bytes,
             tuple_buffer: Vec::with_capacity(1024),
             dialect,
             format,
@@ -422,7 +462,7 @@ impl ValueState {
         self.tuple_buffer.push(byte);
 
         if byte != b'\n' {
-            return ValueEvent::Continue;
+            return self.size_check();
         }
 
         let data = std::mem::take(&mut self.tuple_buffer);
@@ -444,6 +484,9 @@ impl ValueState {
         match self.phase {
             RowPhase::InRow(depth) => {
                 self.tuple_buffer.push(byte);
+                if self.tuple_buffer.len() > self.max_row_bytes {
+                    return ValueEvent::RowTooLarge;
+                }
                 if is_code && byte == b'(' {
                     self.phase = RowPhase::InRow(depth + 1);
                 } else if is_code && byte == b')' {
@@ -477,6 +520,16 @@ impl ValueState {
             RowPhase::CopyCommandLine | RowPhase::CopyData => {
                 unreachable!("COPY bytes are handled by process_copy_byte")
             }
+        }
+    }
+}
+
+impl ValueState {
+    fn size_check(&self) -> ValueEvent {
+        if self.tuple_buffer.len() > self.max_row_bytes {
+            ValueEvent::RowTooLarge
+        } else {
+            ValueEvent::Continue
         }
     }
 }
