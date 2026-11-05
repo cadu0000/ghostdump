@@ -332,6 +332,15 @@ mod tests {
     }
 
     #[test]
+    fn test_replace_and_insert_ignore_are_masked() {
+        let input = b"REPLACE INTO `users` (`id`, `name`) VALUES (1,'Ana');\n\
+                      INSERT IGNORE INTO `users` (`id`, `name`) VALUES (2,'Bia');\n";
+        let out = run_with(NAME_RULES, SqlDialect::Mysql, input).unwrap();
+        assert!(!out.contains("Ana") && !out.contains("Bia"), "{out}");
+        assert_eq!(out.matches("'O\\'Conner'").count(), 2, "{out}");
+    }
+
+    #[test]
     fn test_insert_without_column_list_is_copied() {
         let input = b"INSERT INTO users VALUES (1, 'Ana');";
         let out = run_with(NAME_RULES, SqlDialect::Postgres, input).unwrap();
