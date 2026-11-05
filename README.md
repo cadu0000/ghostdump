@@ -37,7 +37,7 @@ Compressed SQL Dump
  FSM SQL Parser
        │
        ▼
-Column Tokenizer
+  Row Codec
        │
        ▼
  Masking Engine (HMAC / Faker / DP)
@@ -104,10 +104,10 @@ GhostDump is currently under active development. The core parsing engine is func
 * [x] **CLI Foundation**: Robust argument parsing using `clap`.
 * [x] **Masking Strategies**: Deterministic HMAC and Faker-based PII anonymization.
 * [ ] **Differential Privacy**: Laplace mechanism implementation.
-* [ ] **Rule Engine Integration**: Connect the `rules.toml` to the FSM.
+* [x] **Rule Engine Integration**: Connect the `rules.toml` to the FSM.
 * [ ] **UX & Metrics**: Real-time progress metrics (`indicatif`).
 * [x] **Structured Logging**: Verbose debug mode (`--verbose`) and `GHOSTDUMP_LOG`.
-* [ ] **Edge Cases**: Advanced handling of `NULL` values.
+* [x] **Edge Cases**: Advanced handling of `NULL` values (`null_policy`).
 * [ ] **Parallel Processing**: Multi-threading for the masking step.
 
 ---
@@ -137,6 +137,8 @@ columns = [
 ]
 
 ```
+
+Only the declared columns are rewritten; every other byte of the dump, including the layout of `INSERT` statements and `COPY` blocks, is copied unchanged. Values keep their SQL type: numbers stay unquoted, generated text is escaped for the dialect, and `NULL` stays `NULL` by default. Add `null_policy = "generate"` to a column to replace `NULL` values too (with strategies that do not depend on the original value).
 
 ### 2. The Cryptographic Secret
 
