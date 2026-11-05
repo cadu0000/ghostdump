@@ -1,24 +1,30 @@
 pub mod lexer;
 pub mod schema;
 pub mod state;
-pub mod tokenizer;
 
-pub use schema::extract_metadata;
+use std::sync::Arc;
+
+pub use schema::{HeaderMetadata, extract_metadata};
 pub use state::{InsertFormat, Remainder, SqlDialect};
-pub use tokenizer::{join_tuple, split_tuple};
 
 use state::{
     InsertHeaderEvent, InsertHeaderState, NormalEvent, NormalState, State, ValueEvent, ValueState,
 };
 
+/// What the parser reports for each input byte. Writing every byte of
+/// `DefaultStatement`, `Passthrough`, `Header`, `Tuple` and `Footer`, in
+/// order, reproduces the input exactly.
+#[derive(Debug, PartialEq)]
 pub enum SqlEvent {
+    /// A byte outside data rows, to be written unchanged.
     DefaultStatement(u8),
     /// Bytes outside data rows, to be written unchanged.
     Passthrough(Vec<u8>),
     Header {
         raw_bytes: Vec<u8>,
-        table_name: Option<String>,
-        columns: Option<Vec<String>>,
+        /// Shared between identical headers (`pg_dump --inserts` repeats
+        /// the same header on every row).
+        metadata: Option<Arc<HeaderMetadata>>,
     },
     Tuple(Vec<u8>, InsertFormat),
     Footer(Vec<u8>),
@@ -27,6 +33,10 @@ pub enum SqlEvent {
 pub struct SqlParser {
     state: State,
     dialect: SqlDialect,
+    /// The last header seen and its metadata, so repeated headers are not
+    /// parsed again.
+    last_header: Vec<u8>,
+    last_metadata: Option<Arc<HeaderMetadata>>,
 }
 
 impl SqlParser {
@@ -34,6 +44,8 @@ impl SqlParser {
         Self {
             state: State::Normal(NormalState::at_input_start(dialect)),
             dialect,
+            last_header: Vec::new(),
+            last_metadata: None,
         }
     }
 
@@ -59,25 +71,21 @@ impl SqlParser {
             State::InsertHeader(header_state) => match header_state.process_byte(byte) {
                 InsertHeaderEvent::HeaderComplete {
                     format,
-                    header_bytes,
+                    mut header_bytes,
                     carry,
                 } => {
                     let mut v_state = ValueState::new(self.dialect, format);
-                    if let Some(carry) = carry {
-                        // The byte after VALUES never completes a row.
-                        v_state.process_byte(carry);
+                    if let Some(carry) = carry
+                        && !v_state.take_carry(carry)
+                    {
+                        header_bytes.push(carry);
                     }
                     self.state = State::ValueMode(v_state);
 
-                    let (table_name, columns) = match extract_metadata(&header_bytes) {
-                        Some((tbl, cols)) => (Some(tbl), cols),
-                        None => (None, None),
-                    };
-
+                    let metadata = self.metadata_for(&header_bytes);
                     Some(SqlEvent::Header {
                         raw_bytes: header_bytes,
-                        table_name,
-                        columns,
+                        metadata,
                     })
                 }
                 InsertHeaderEvent::NotData(bytes) => {
@@ -92,9 +100,19 @@ impl SqlParser {
                     self.state = State::Normal(NormalState::new(self.dialect));
                     Some(SqlEvent::Footer(footer_bytes))
                 }
+                ValueEvent::Passthrough(byte) => Some(SqlEvent::DefaultStatement(byte)),
                 ValueEvent::Continue => None,
             },
         }
+    }
+
+    fn metadata_for(&mut self, header: &[u8]) -> Option<Arc<HeaderMetadata>> {
+        if header != self.last_header.as_slice() {
+            self.last_metadata = extract_metadata(header).map(Arc::new);
+            self.last_header.clear();
+            self.last_header.extend_from_slice(header);
+        }
+        self.last_metadata.clone()
     }
 
     /// Ends the input and returns what the parser still holds.
@@ -151,78 +169,135 @@ mod tests {
         parser.finish()
     }
 
-    #[test]
-    fn test_parser_with_traditional_insert() {
-        let mut parser = SqlParser::new(SqlDialect::Mysql);
-        let sql = b"INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob, the Builder');";
-        let mut extracted_events = Vec::new();
+    /// Everything the parser reports for `sql`, with single bytes merged
+    /// into runs, plus the remainder at the end of the input.
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Bytes(String),
+        Header(String),
+        Tuple(String),
+        Footer(String),
+    }
 
+    fn parse(dialect: SqlDialect, sql: &[u8]) -> (Vec<Seen>, Remainder) {
+        let mut parser = SqlParser::new(dialect);
+        let mut seen: Vec<Seen> = Vec::new();
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        let push_bytes = |seen: &mut Vec<Seen>, bytes: &[u8]| match seen.last_mut() {
+            Some(Seen::Bytes(run)) => run.push_str(&text(bytes)),
+            _ => seen.push(Seen::Bytes(text(bytes))),
+        };
         for &byte in sql {
-            if let Some(event) = parser.handle_byte(byte) {
-                let data = match event {
-                    SqlEvent::Header { raw_bytes, .. } => raw_bytes,
-                    SqlEvent::Tuple(bytes, _) => bytes,
-                    SqlEvent::Footer(bytes) => bytes,
-                    SqlEvent::DefaultStatement(_) | SqlEvent::Passthrough(_) => continue,
-                };
-
-                let event_string = String::from_utf8_lossy(&data).into_owned();
-                extracted_events.push(event_string);
+            match parser.handle_byte(byte) {
+                Some(SqlEvent::DefaultStatement(b)) => push_bytes(&mut seen, &[b]),
+                Some(SqlEvent::Passthrough(bytes)) => push_bytes(&mut seen, &bytes),
+                Some(SqlEvent::Header { raw_bytes, .. }) => seen.push(Seen::Header(text(&raw_bytes))),
+                Some(SqlEvent::Tuple(row, _)) => seen.push(Seen::Tuple(text(&row))),
+                Some(SqlEvent::Footer(bytes)) => seen.push(Seen::Footer(text(&bytes))),
+                None => {}
             }
         }
+        (seen, parser.finish())
+    }
 
-        assert_eq!(extracted_events.len(), 4);
+    fn bytes(s: &str) -> Seen {
+        Seen::Bytes(s.into())
+    }
+    fn header(s: &str) -> Seen {
+        Seen::Header(s.into())
+    }
+    fn tuple(s: &str) -> Seen {
+        Seen::Tuple(s.into())
+    }
+    fn footer(s: &str) -> Seen {
+        Seen::Footer(s.into())
+    }
 
-        assert_eq!(extracted_events[0], "INSERT INTO users (id, name) VALUES");
-        assert_eq!(extracted_events[1], "(1, 'Alice')");
-        assert_eq!(extracted_events[2], "(2, 'Bob, the Builder')");
-        assert_eq!(extracted_events[3], ";");
+    #[test]
+    fn test_parser_with_traditional_insert() {
+        let (seen, _) = parse(
+            SqlDialect::Mysql,
+            b"INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob, the Builder');",
+        );
+        assert_eq!(
+            seen,
+            [
+                header("INSERT INTO users (id, name) VALUES "),
+                tuple("(1, 'Alice')"),
+                bytes(", "),
+                tuple("(2, 'Bob, the Builder')"),
+                footer(";"),
+            ]
+        );
     }
 
     #[test]
     fn test_parser_with_postgres_copy() {
-        let mut parser = SqlParser::new(SqlDialect::Postgres);
-        let sql = b"COPY public.users (id, name) FROM stdin;\n1\tAlice\n2\tBob\n\\.\n";
-        let mut extracted_events = Vec::new();
-
-        for &byte in sql {
-            if let Some(event) = parser.handle_byte(byte) {
-                let data = match event {
-                    SqlEvent::Header { raw_bytes, .. } => raw_bytes,
-                    SqlEvent::Tuple(bytes, _) => bytes,
-                    SqlEvent::Footer(bytes) => bytes,
-                    SqlEvent::DefaultStatement(_) | SqlEvent::Passthrough(_) => continue,
-                };
-
-                let event_string = String::from_utf8_lossy(&data).into_owned();
-                extracted_events.push(event_string);
-            }
-        }
-
-        assert_eq!(extracted_events.len(), 4);
-
-        assert_eq!(
-            extracted_events[0],
-            "COPY public.users (id, name) FROM stdin;"
+        let (seen, _) = parse(
+            SqlDialect::Postgres,
+            b"COPY public.users (id, name) FROM stdin;\n1\tAlice\n2\tBob\n\\.\n",
         );
-        assert_eq!(extracted_events[1], "1\tAlice\n");
-        assert_eq!(extracted_events[2], "2\tBob\n");
-        assert_eq!(extracted_events[3], "\\.\n");
+        assert_eq!(
+            seen,
+            [
+                header("COPY public.users (id, name) FROM stdin;"),
+                bytes("\n"),
+                tuple("1\tAlice\n"),
+                tuple("2\tBob\n"),
+                footer("\\.\n"),
+            ]
+        );
     }
 
     #[test]
-    fn test_tokenizer_split_and_join_copy() {
-        let raw_tuple = b"100\t1234-5678-9012\tAlice\n";
-        let format = InsertFormat::Copy;
+    fn test_every_byte_is_delivered_in_order() {
+        let sql = b"SET x = 1;\nINSERT INTO t (a, b) VALUES\n  (1, 'x') , -- first\n  (2, ')')\nON CONFLICT (a) DO NOTHING;\nCOPY t (a) FROM stdin;\n\n1\n\\.\nSELECT 1;\n";
+        let (seen, rest) = parse(SqlDialect::Postgres, sql);
+        let mut out = String::new();
+        for item in &seen {
+            match item {
+                Seen::Bytes(s) | Seen::Header(s) | Seen::Tuple(s) | Seen::Footer(s) => out.push_str(s),
+            }
+        }
+        if let Remainder::Bytes(rest) = rest {
+            out.push_str(&String::from_utf8_lossy(&rest));
+        }
+        assert_eq!(out, String::from_utf8_lossy(sql));
+        assert!(seen.contains(&tuple("(2, ')')")));
+        assert!(!seen.contains(&tuple("(a)")));
+    }
 
-        let columns = split_tuple(raw_tuple, format);
-        assert_eq!(columns.len(), 3);
-        assert_eq!(columns[0], b"100");
-        assert_eq!(columns[1], b"1234-5678-9012");
-        assert_eq!(columns[2], b"Alice");
+    #[test]
+    fn test_values_rows_are_framed_with_dialect_rules() {
+        // PostgreSQL: 'C:\' ends at the second quote, so the row ends at `)`.
+        let (seen, _) = parse(
+            SqlDialect::Postgres,
+            b"INSERT INTO t (a) VALUES ('C:\\'), ('x');",
+        );
+        assert_eq!(seen[1], tuple("('C:\\')"));
+        assert_eq!(seen[3], tuple("('x')"));
 
-        let joined = join_tuple(&columns, format);
-        assert_eq!(joined, raw_tuple);
+        // MySQL: the backslash escapes the quote.
+        let (seen, _) = parse(SqlDialect::Mysql, b"INSERT INTO t (a) VALUES ('it\\'s)'), ('x');");
+        assert_eq!(seen[1], tuple("('it\\'s)')"));
+    }
+
+    #[test]
+    fn test_repeated_headers_share_metadata() {
+        let mut parser = SqlParser::new(SqlDialect::Postgres);
+        // The header of a statement carries the line break before it, so
+        // the second and third headers are identical.
+        let sql = b"INSERT INTO t (a) VALUES (1);\nINSERT INTO t (a) VALUES (2);\nINSERT INTO t (a) VALUES (3);\n";
+        let metadata: Vec<Arc<HeaderMetadata>> = sql
+            .iter()
+            .filter_map(|&byte| match parser.handle_byte(byte) {
+                Some(SqlEvent::Header { metadata, .. }) => metadata,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(metadata.len(), 3);
+        assert!(Arc::ptr_eq(&metadata[1], &metadata[2]));
+        assert_eq!(metadata[0].table, "t");
     }
 
     #[test]

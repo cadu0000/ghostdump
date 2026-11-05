@@ -12,6 +12,8 @@ use sha2::Sha256;
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
+use crate::codec::SqlValue;
+
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -34,47 +36,48 @@ pub enum StrategyConfig {
 }
 
 impl StrategyConfig {
-    pub fn apply(
-        &self,
-        original_value: Option<&str>,
-        rng: &mut impl Rng,
-        secret: &str,
-    ) -> Option<String> {
+    /// Masks one value. NULL inputs reach this function only when the
+    /// column's `null_policy` is `generate`; strategies that derive their
+    /// output from the input keep NULL as NULL.
+    pub fn apply(&self, value: SqlValue, rng: &mut impl Rng, secret: &str) -> SqlValue {
         match self {
-            StrategyConfig::FakerName => Some(Name().fake::<String>()),
-            StrategyConfig::FakerEmail => Some(SafeEmail().fake::<String>()),
-            StrategyConfig::FakerIp => Some(IPv4().fake::<String>()),
-            StrategyConfig::RandomUuid => Some(Uuid::new_v4().to_string()),
-            StrategyConfig::FakeCreditCard => Some(generate_fake_credit_card(rng)),
-            StrategyConfig::FakerPhoneBr => Some(generate_fake_phone_br(rng)),
-            StrategyConfig::Cpf => Some(cpf::generate()),
-            StrategyConfig::Cnpj => Some(cnpj::generate()),
-            StrategyConfig::Fixed { value } => Some(value.clone()),
-            StrategyConfig::Nullify => None,
+            StrategyConfig::FakerName => SqlValue::Text(Name().fake::<String>()),
+            StrategyConfig::FakerEmail => SqlValue::Text(SafeEmail().fake::<String>()),
+            StrategyConfig::FakerIp => SqlValue::Text(IPv4().fake::<String>()),
+            StrategyConfig::RandomUuid => SqlValue::Text(Uuid::new_v4().to_string()),
+            StrategyConfig::FakeCreditCard => SqlValue::Text(generate_fake_credit_card(rng)),
+            StrategyConfig::FakerPhoneBr => SqlValue::Text(generate_fake_phone_br(rng)),
+            StrategyConfig::Cpf => SqlValue::Text(cpf::generate()),
+            StrategyConfig::Cnpj => SqlValue::Text(cnpj::generate()),
+            StrategyConfig::Fixed { value } => SqlValue::Text(value.clone()),
+            StrategyConfig::Nullify => SqlValue::Null,
             StrategyConfig::RandomChoice { options } => {
-                Some(options.choose(rng).cloned().unwrap_or_default())
+                SqlValue::Text(options.choose(rng).cloned().unwrap_or_default())
             }
-            StrategyConfig::Hmac => {
-                let val = original_value.unwrap_or("");
-                let hashed = hmac_hash(val, secret);
-                Some(hashed)
-            }
+            // A pseudonym of NULL would link every NULL to each other.
+            StrategyConfig::Hmac => match value.as_str() {
+                Some(text) => SqlValue::Text(hmac_hash(text, secret)),
+                None => SqlValue::Null,
+            },
+            // A number stays unquoted when it came unquoted.
             StrategyConfig::DpLaplace {
                 epsilon,
                 sensitivity,
-            } => {
-                let val = original_value.unwrap_or("0");
-                let noisy_value = dp_laplace(val, *epsilon, *sensitivity, rng);
-                Some(noisy_value.to_string())
-            }
-            StrategyConfig::RandomString { length } => {
-                let random_str: String = rng
-                    .sample_iter(&Alphanumeric)
+            } => match value {
+                SqlValue::Null => SqlValue::Null,
+                SqlValue::Raw(text) => {
+                    SqlValue::Raw(dp_laplace(&text, *epsilon, *sensitivity, rng))
+                }
+                SqlValue::Text(text) => {
+                    SqlValue::Text(dp_laplace(&text, *epsilon, *sensitivity, rng))
+                }
+            },
+            StrategyConfig::RandomString { length } => SqlValue::Text(
+                rng.sample_iter(&Alphanumeric)
                     .take(*length)
                     .map(char::from)
-                    .collect();
-                Some(random_str)
-            }
+                    .collect(),
+            ),
         }
     }
 }
@@ -184,6 +187,40 @@ mod tests {
         StdRng::seed_from_u64(42)
     }
 
+    fn text(value: &str) -> SqlValue {
+        SqlValue::Text(value.into())
+    }
+
+    #[test]
+    fn test_null_is_kept_by_value_derived_strategies() {
+        let mut rng = seeded_rng();
+        let dp = StrategyConfig::DpLaplace {
+            epsilon: 1.0,
+            sensitivity: 1.0,
+        };
+        assert_eq!(StrategyConfig::Hmac.apply(SqlValue::Null, &mut rng, "s"), SqlValue::Null);
+        assert_eq!(dp.apply(SqlValue::Null, &mut rng, "s"), SqlValue::Null);
+    }
+
+    #[test]
+    fn test_literal_type_is_preserved() {
+        let mut rng = seeded_rng();
+        let dp = StrategyConfig::DpLaplace {
+            epsilon: 1.0,
+            sensitivity: 1.0,
+        };
+        assert!(matches!(dp.apply(SqlValue::Raw("10".into()), &mut rng, "s"), SqlValue::Raw(_)));
+        assert!(matches!(dp.apply(text("10"), &mut rng, "s"), SqlValue::Text(_)));
+    }
+
+    #[test]
+    fn test_hmac_ignores_the_literal_form() {
+        let mut rng = seeded_rng();
+        let raw = StrategyConfig::Hmac.apply(SqlValue::Raw("42".into()), &mut rng, "s");
+        let quoted = StrategyConfig::Hmac.apply(text("42"), &mut rng, "s");
+        assert_eq!(raw, quoted);
+    }
+
     #[test]
     fn test_all_strategies_do_not_panic() {
         let mut rng = seeded_rng();
@@ -213,15 +250,15 @@ mod tests {
         ];
 
         for strategy in strategies {
-            let _ = strategy.apply(Some("12345"), &mut rng, "secret");
+            let _ = strategy.apply(text("12345"), &mut rng, "secret");
         }
     }
 
     #[test]
     fn test_nullify_strategy() {
         let mut rng = seeded_rng();
-        let result = StrategyConfig::Nullify.apply(Some("123"), &mut rng, "secret");
-        assert!(result.is_none());
+        let result = StrategyConfig::Nullify.apply(text("123"), &mut rng, "secret");
+        assert_eq!(result, SqlValue::Null);
     }
 
     #[test]
@@ -230,16 +267,16 @@ mod tests {
         let strategy = StrategyConfig::Fixed {
             value: "CONST".into(),
         };
-        let result = strategy.apply(Some("123"), &mut rng, "secret");
-        assert_eq!(result.unwrap(), "CONST");
+        let result = strategy.apply(text("123"), &mut rng, "secret");
+        assert_eq!(result, text("CONST"));
     }
 
     #[test]
     fn test_random_string_length() {
         let mut rng = seeded_rng();
         let strategy = StrategyConfig::RandomString { length: 12 };
-        let result = strategy.apply(Some("abc"), &mut rng, "secret").unwrap();
-        assert_eq!(result.len(), 12);
+        let result = strategy.apply(text("abc"), &mut rng, "secret");
+        assert_eq!(result.as_str().unwrap().len(), 12);
     }
 
     #[test]
@@ -250,27 +287,26 @@ mod tests {
             options: options.clone(),
         };
 
-        let result = strategy.apply(Some("abc"), &mut rng, "secret").unwrap();
-        assert!(options.contains(&result));
+        let result = strategy.apply(text("abc"), &mut rng, "secret");
+        assert!(options.iter().any(|o| Some(o.as_str()) == result.as_str()));
     }
 
     #[test]
     fn test_uuid_strategy_valid_format() {
         let mut rng = seeded_rng();
         let result = StrategyConfig::RandomUuid
-            .apply(Some("abc"), &mut rng, "secret")
-            .unwrap();
+            .apply(text("abc"), &mut rng, "secret");
 
-        assert!(uuid::Uuid::parse_str(&result).is_ok());
+        assert!(uuid::Uuid::parse_str(result.as_str().unwrap()).is_ok());
     }
 
     #[test]
     fn test_cpf_strategy_structure() {
         let mut rng = seeded_rng();
         let result = StrategyConfig::Cpf
-            .apply(Some("abc"), &mut rng, "secret")
-            .unwrap();
+            .apply(text("abc"), &mut rng, "secret");
 
+        let result = result.as_str().unwrap();
         assert_eq!(result.len(), 11);
         assert!(result.chars().all(|c| c.is_ascii_digit()));
     }
@@ -279,9 +315,9 @@ mod tests {
     fn test_cnpj_strategy_structure() {
         let mut rng = seeded_rng();
         let result = StrategyConfig::Cnpj
-            .apply(Some("abc"), &mut rng, "secret")
-            .unwrap();
+            .apply(text("abc"), &mut rng, "secret");
 
+        let result = result.as_str().unwrap();
         assert_eq!(result.len(), 14);
         assert!(result.chars().all(|c| c.is_ascii_digit()));
     }
@@ -290,9 +326,9 @@ mod tests {
     fn test_credit_card_structure() {
         let mut rng = seeded_rng();
         let result = StrategyConfig::FakeCreditCard
-            .apply(Some("abc"), &mut rng, "secret")
-            .unwrap();
+            .apply(text("abc"), &mut rng, "secret");
 
+        let result = result.as_str().unwrap();
         assert_eq!(result.len(), 19);
         assert_eq!(result.matches('-').count(), 3);
     }
@@ -301,10 +337,9 @@ mod tests {
     fn test_phone_br_format() {
         let mut rng = seeded_rng();
         let result = StrategyConfig::FakerPhoneBr
-            .apply(Some("abc"), &mut rng, "secret")
-            .unwrap();
+            .apply(text("abc"), &mut rng, "secret");
 
-        assert!(result.starts_with('('));
+        assert!(result.as_str().unwrap().starts_with('('));
     }
 
     #[test]
@@ -314,8 +349,8 @@ mod tests {
 
         let strategy = StrategyConfig::Hmac;
 
-        let r1 = strategy.apply(Some("123"), &mut rng1, "secret");
-        let r2 = strategy.apply(Some("123"), &mut rng2, "secret");
+        let r1 = strategy.apply(text("123"), &mut rng1, "secret");
+        let r2 = strategy.apply(text("123"), &mut rng2, "secret");
 
         assert_eq!(r1, r2);
     }
@@ -329,10 +364,9 @@ mod tests {
             sensitivity: 100.0,
         };
 
-        let result = strategy.apply(Some("5000"), &mut rng, "secret");
+        let result = strategy.apply(SqlValue::Raw("5000".into()), &mut rng, "secret");
 
-        assert!(result.is_some());
-        assert!(!result.unwrap().is_empty());
+        assert!(!result.as_str().unwrap().is_empty());
     }
     #[test]
     fn test_dp_laplace_valid_number() {

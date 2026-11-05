@@ -1,7 +1,15 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-pub fn extract_metadata(header_bytes: &[u8]) -> Option<(String, Option<Vec<String>>)> {
+/// Names read from the header of a data block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeaderMetadata {
+    pub table: String,
+    /// `None` when the statement has no column list.
+    pub columns: Option<Vec<String>>,
+}
+
+pub fn extract_metadata(header_bytes: &[u8]) -> Option<HeaderMetadata> {
     let header_str = String::from_utf8_lossy(header_bytes);
 
     static INSERT_RE: OnceLock<Regex> = OnceLock::new();
@@ -17,27 +25,27 @@ pub fn extract_metadata(header_bytes: &[u8]) -> Option<(String, Option<Vec<Strin
             .unwrap()
     });
 
-    let process_match = |caps: regex::Captures| -> (String, Option<Vec<String>>) {
+    let process_match = |caps: regex::Captures| -> HeaderMetadata {
         let raw_table = caps.name("table").unwrap().as_str();
 
         let table = raw_table
-            .split('.')
-            .last()
+            .rsplit('.')
+            .next()
             .unwrap_or(raw_table)
             .trim_matches(|c| c == '"' || c == '`' || c == '\'')
             .to_string();
 
-        let cols = caps.name("cols").map(|m| {
+        let columns = caps.name("cols").map(|m| {
             m.as_str()
                 .split(',')
                 .map(|s| {
-                    s.trim_matches(|c| c == '"' || c == '`' || c == '\'' || c == ' ' || c == '\n')
+                    s.trim_matches(|c: char| c == '"' || c == '`' || c == '\'' || c.is_whitespace())
                         .to_string()
                 })
                 .collect()
         });
 
-        (table, cols)
+        HeaderMetadata { table, columns }
     };
 
     if let Some(caps) = insert_re.captures(&header_str) {

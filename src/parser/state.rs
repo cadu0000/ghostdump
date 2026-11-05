@@ -325,31 +325,61 @@ pub enum ValueEvent {
     Continue,
     TupleComplete(Vec<u8>),
     ExitValuesMode(Vec<u8>),
+    /// A byte outside the rows (separators, comments, trailing clauses such
+    /// as `ON CONFLICT DO NOTHING`, the rest of the COPY command line),
+    /// written unchanged.
+    Passthrough(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RowPhase {
+    /// VALUES: after `VALUES` or a comma, before the next row.
+    BeforeRow,
+    /// VALUES: inside a row, at the given parenthesis depth.
+    InRow(usize),
+    /// VALUES: after a row, before a comma or the end of the list.
+    AfterRow,
+    /// VALUES: after the rows, in a trailing clause, until the `;`.
+    Trailer,
+    /// COPY: on the rest of the `COPY ... FROM stdin;` line, which holds no data.
+    CopyCommandLine,
+    /// COPY: data lines, until the `\.` line.
+    CopyData,
 }
 
 pub struct ValueState {
-    pub paren_depth: usize,
-    pub inside_string: bool,
-    pub escape_next: bool,
     pub tuple_buffer: Vec<u8>,
     pub dialect: SqlDialect,
     pub format: InsertFormat,
-    /// COPY only: still on the line of the `COPY ... FROM stdin;` command,
-    /// which holds no data.
-    in_command_line: bool,
+    phase: RowPhase,
+    lexer: Lexer,
 }
 
 impl ValueState {
     pub fn new(dialect: SqlDialect, format: InsertFormat) -> Self {
         ValueState {
-            paren_depth: 0,
-            inside_string: false,
-            escape_next: false,
             tuple_buffer: Vec::with_capacity(1024),
             dialect,
             format,
-            in_command_line: format == InsertFormat::Copy,
+            phase: match format {
+                InsertFormat::Values => RowPhase::BeforeRow,
+                InsertFormat::Copy => RowPhase::CopyCommandLine,
+            },
+            lexer: Lexer::new(dialect),
         }
+    }
+
+    /// Takes the byte that followed `VALUES`. Returns true when it opened the
+    /// first row; otherwise the byte belongs to the header and only updates
+    /// the lexer (it may open a comment, for example).
+    pub fn take_carry(&mut self, byte: u8) -> bool {
+        let class = self.lexer.feed(byte);
+        if class == ByteClass::Code && byte == b'(' {
+            self.phase = RowPhase::InRow(1);
+            self.tuple_buffer.push(byte);
+            return true;
+        }
+        false
     }
 
     pub fn process_byte(&mut self, byte: u8) -> ValueEvent {
@@ -363,24 +393,23 @@ impl ValueState {
     pub fn finish(&mut self) -> Remainder {
         let rest = std::mem::take(&mut self.tuple_buffer);
 
-        match self.format {
+        match self.phase {
             // End-of-data marker without its final newline.
-            InsertFormat::Copy if rest == b"\\." || rest == b"\\.\r" => Remainder::Bytes(rest),
-            InsertFormat::Copy => Remainder::UnterminatedData {
+            RowPhase::CopyData if rest == b"\\." || rest == b"\\.\r" => Remainder::Bytes(rest),
+            RowPhase::CopyData => Remainder::UnterminatedData {
                 partial_row: !rest.is_empty(),
             },
-            InsertFormat::Values => Remainder::UnterminatedData {
-                partial_row: self.paren_depth > 0,
-            },
+            RowPhase::InRow(_) => Remainder::UnterminatedData { partial_row: true },
+            _ => Remainder::UnterminatedData { partial_row: false },
         }
     }
 
     fn process_copy_byte(&mut self, byte: u8) -> ValueEvent {
-        if self.in_command_line {
+        if self.phase == RowPhase::CopyCommandLine {
             if byte == b'\n' {
-                self.in_command_line = false;
+                self.phase = RowPhase::CopyData;
             }
-            return ValueEvent::Continue;
+            return ValueEvent::Passthrough(byte);
         }
 
         self.tuple_buffer.push(byte);
@@ -402,49 +431,54 @@ impl ValueState {
     }
 
     fn process_values_byte(&mut self, byte: u8) -> ValueEvent {
-        if self.escape_next {
-            self.tuple_buffer.push(byte);
-            self.escape_next = false;
-            return ValueEvent::Continue;
-        }
+        let class = self.lexer.feed(byte);
+        let is_code = class == ByteClass::Code;
 
-        match byte {
-            b'\\' => {
+        match self.phase {
+            RowPhase::InRow(depth) => {
                 self.tuple_buffer.push(byte);
-                self.escape_next = true;
-            }
-            b'\'' => {
-                self.tuple_buffer.push(byte);
-                self.inside_string = !self.inside_string;
-            }
-            b'(' if !self.inside_string => {
-                self.paren_depth += 1;
-                self.tuple_buffer.push(byte);
-            }
-            b')' if !self.inside_string => {
-                self.tuple_buffer.push(byte);
-
-                if self.paren_depth > 0 {
-                    self.paren_depth -= 1;
-
-                    if self.paren_depth == 0 {
-                        let data = std::mem::take(&mut self.tuple_buffer);
-                        return ValueEvent::TupleComplete(data);
+                if is_code && byte == b'(' {
+                    self.phase = RowPhase::InRow(depth + 1);
+                } else if is_code && byte == b')' {
+                    if depth == 1 {
+                        self.phase = RowPhase::AfterRow;
+                        return ValueEvent::TupleComplete(std::mem::take(&mut self.tuple_buffer));
                     }
+                    self.phase = RowPhase::InRow(depth - 1);
                 }
+                ValueEvent::Continue
             }
-            b';' if !self.inside_string && self.paren_depth == 0 => {
+            _ if is_code && byte == b';' => ValueEvent::ExitValuesMode(vec![byte]),
+            RowPhase::BeforeRow if is_code && byte == b'(' => {
+                self.phase = RowPhase::InRow(1);
                 self.tuple_buffer.push(byte);
-                let data = std::mem::take(&mut self.tuple_buffer);
-                return ValueEvent::ExitValuesMode(data);
+                ValueEvent::Continue
             }
-            _ => {
-                if self.paren_depth > 0 {
-                    self.tuple_buffer.push(byte);
+            RowPhase::AfterRow if is_code && byte == b',' => {
+                self.phase = RowPhase::BeforeRow;
+                ValueEvent::Passthrough(byte)
+            }
+            RowPhase::BeforeRow | RowPhase::AfterRow => {
+                // Anything other than whitespace or a comment ends the list of
+                // rows: `ON CONFLICT (id) DO NOTHING` must not be read as a row.
+                if !is_separator(byte, class) {
+                    self.phase = RowPhase::Trailer;
                 }
+                ValueEvent::Passthrough(byte)
+            }
+            RowPhase::Trailer => ValueEvent::Passthrough(byte),
+            RowPhase::CopyCommandLine | RowPhase::CopyData => {
+                unreachable!("COPY bytes are handled by process_copy_byte")
             }
         }
+    }
+}
 
-        ValueEvent::Continue
+/// Whitespace, comments, and a `-` or `/` that may open a comment.
+fn is_separator(byte: u8, class: ByteClass) -> bool {
+    match class {
+        ByteClass::Comment | ByteClass::CommentStart => true,
+        ByteClass::Literal => false,
+        ByteClass::Code => byte.is_ascii_whitespace() || byte == b'-' || byte == b'/',
     }
 }
