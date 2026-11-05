@@ -93,6 +93,8 @@ GhostDump's FSM parser is designed to handle the most common SQL dump formats:
 * **PostgreSQL**: Native support for `COPY ... FROM stdin;` formats (tab-separated values) and traditional `INSERT INTO` statements.
 * **MySQL / SQLite**: Support for multi-value `INSERT INTO ... VALUES (...), (...);` dumps.
 
+GhostDump fails closed: when a table has rules that cannot be applied, it stops with an error instead of writing the rows unmasked. This happens when an `INSERT` has no column list, when a `COPY ... FROM stdin` uses options such as `WITH (FORMAT csv)`, or when a data block's table name cannot be read. Rows larger than `--max-row-size` (256 MiB by default) also stop the run.
+
 ---
 
 ##  Roadmap & Current Status
@@ -200,7 +202,8 @@ zcat production_db.sql.gz | ghostdump -c rules.toml | gzip > dev_db_anon.sql.gz
 | `-p` | `--progress` | Displays real-time progress metrics (MB/s, ETA). |
 | `-v` | `--verbose` | Enables detailed debug logging for troubleshooting. |
 | `-d` | `--dry-run` | Processes input without writing output (Validation mode). |
-| `-l` | `--limit <ROWS>` | Stop after processing N rows. |
+| `-l` | `--limit <ROWS>` | Stop after N data rows, closing the statement they belong to. Statements after that point (such as a final `COMMIT`) are not written. |
+| | `--max-row-size <MiB>` | Largest data row accepted (default 256). |
 
 ---
 
