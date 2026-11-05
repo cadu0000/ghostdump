@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -65,11 +65,27 @@ pub struct Args {
 
     #[arg(
         long,
+        value_enum,
+        default_value_t = DialectArg::Auto,
+        help = "Dialeto SQL do dump; auto detecta pelo cabeçalho"
+    )]
+    pub dialect: DialectArg,
+
+    #[arg(
+        long,
         value_name = "MiB",
         default_value_t = 256,
         help = "Tamanho máximo de uma linha de dados, em MiB"
     )]
     pub max_row_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+pub enum DialectArg {
+    Auto,
+    Postgres,
+    Mysql,
+    Sqlite,
 }
 
 /// Secrets shorter than this, in bytes, trigger a warning.

@@ -1,13 +1,16 @@
-use ghostdump::cli::{Args, MIN_SECRET_BYTES, SecretError, SecretLength, check_secret};
+use ghostdump::cli::{
+    Args, DialectArg, MIN_SECRET_BYTES, SecretError, SecretLength, check_secret,
+};
 use ghostdump::engine::{AnonymizerEngine, RunOptions};
 use ghostdump::engine::config::Config;
 use ghostdump::io::{InputSource, OutputSource};
+use ghostdump::parser::detect_dialect;
 use ghostdump::parser::state::SqlDialect;
 
 use clap::Parser as ClapParser;
 use log::{Level, LevelFilter, debug, error, info, warn};
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::time::Instant;
 
 // Every message goes to stderr: stdout may carry the sanitized dump.
@@ -47,6 +50,8 @@ fn main() {
 
     let input = InputSource::new(args.input.clone())
         .unwrap_or_else(|e| fatal(&format!("could not open the input: {}", e)));
+    let mut input = BufReader::with_capacity(64 * 1024, input);
+    let dialect = resolve_dialect(args.dialect, &mut input);
     let output = OutputSource::new(args.output.clone())
         .unwrap_or_else(|e| fatal(&format!("could not open the output: {}", e)));
     let engine = AnonymizerEngine::new(config, secret);
@@ -54,7 +59,7 @@ fn main() {
         dry_run: args.dry_run,
         limit: args.limit,
         max_row_bytes: args.max_row_size.saturating_mul(1024 * 1024),
-        ..RunOptions::new(SqlDialect::Postgres)
+        ..RunOptions::new(dialect)
     };
 
     if args.dry_run {
@@ -107,6 +112,26 @@ fn init_logger(verbose: bool) {
             writeln!(buf, "{}: {}", prefix, record.args())
         })
         .init();
+}
+
+fn resolve_dialect(choice: DialectArg, input: &mut impl BufRead) -> SqlDialect {
+    let dialect = match choice {
+        DialectArg::Postgres => SqlDialect::Postgres,
+        DialectArg::Mysql => SqlDialect::Mysql,
+        DialectArg::Sqlite => SqlDialect::Sqlite,
+        DialectArg::Auto => {
+            // Peek without consuming: the engine still reads these bytes.
+            let prefix = input
+                .fill_buf()
+                .unwrap_or_else(|e| fatal(&format!("could not read the input: {}", e)));
+            detect_dialect(prefix).unwrap_or_else(|| {
+                warn!("could not detect the SQL dialect; assuming PostgreSQL (use --dialect)");
+                SqlDialect::Postgres
+            })
+        }
+    };
+    debug!("dialect: {dialect:?}");
+    dialect
 }
 
 fn resolve_secret(secret: Option<&str>) -> String {
