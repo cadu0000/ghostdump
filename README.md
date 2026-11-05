@@ -106,7 +106,7 @@ GhostDump is currently under active development. The core parsing engine is func
 * [ ] **Differential Privacy**: Laplace mechanism implementation.
 * [ ] **Rule Engine Integration**: Connect the `rules.toml` to the FSM.
 * [ ] **UX & Metrics**: Real-time progress metrics (`indicatif`).
-* [ ] **Structured Logging**: Verbose debug mode (`--verbose`).
+* [x] **Structured Logging**: Verbose debug mode (`--verbose`) and `GHOSTDUMP_LOG`.
 * [ ] **Edge Cases**: Advanced handling of `NULL` values.
 * [ ] **Parallel Processing**: Multi-threading for the masking step.
 
@@ -149,7 +149,7 @@ export GHOSTDUMP_SECRET="$(openssl rand -hex 32)"
 
 The secret is required only when the rules use `hmac`. Use 32 or more random bytes: an empty secret is rejected, and one shorter than 16 bytes triggers a warning, because HMAC pseudonyms of low-entropy values (sequential IDs, CPFs) can be brute-forced by anyone who guesses the secret.
 
-All status messages are written to stderr, so stdout carries only the sanitized dump.
+All status messages and warnings are written to stderr, so stdout carries only the sanitized dump. Use `-v` for debug messages, or set `GHOSTDUMP_LOG` (for example `GHOSTDUMP_LOG=warn`) to choose the level. Logs never include column values.
 
 ---
 
