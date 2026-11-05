@@ -88,12 +88,15 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 | 114bd151f8fb0
 
 ##  Supported SQL Dialects
 
-GhostDump's FSM parser is designed to handle the most common SQL dump formats:
+GhostDump's FSM parser is designed to handle the most common SQL dump formats. The dialect is detected from the dump header (`--dialect auto`, the default) or chosen with `--dialect postgres|mysql|sqlite`.
 
-* **PostgreSQL**: Native support for `COPY ... FROM stdin;` formats (tab-separated values) and traditional `INSERT INTO` statements.
-* **MySQL / SQLite**: Support for multi-value `INSERT INTO ... VALUES (...), (...);` dumps.
+* **PostgreSQL**: `COPY ... FROM stdin;` blocks in text format and `INSERT INTO` statements (including `pg_dump --inserts`, `--column-inserts` and `--on-conflict-do-nothing`).
+* **MySQL**: multi-row `INSERT`, `INSERT IGNORE` and `REPLACE` statements. Rules need column names in the statements: dump with `mysqldump --complete-insert`.
+* **SQLite**: `INSERT` and `INSERT OR ...` statements with a column list.
 
 GhostDump fails closed: when a table has rules that cannot be applied, it stops with an error instead of writing the rows unmasked. This happens when an `INSERT` has no column list, when a `COPY ... FROM stdin` uses options such as `WITH (FORMAT csv)`, or when a data block's table name cannot be read. Rows larger than `--max-row-size` (256 MiB by default) also stop the run.
+
+Not supported yet: MySQL `DELIMITER` blocks (stored routines), SQLite triggers with several statements, and inserts inside CTEs (`WITH ... INSERT`).
 
 ---
 
@@ -203,6 +206,7 @@ zcat production_db.sql.gz | ghostdump -c rules.toml | gzip > dev_db_anon.sql.gz
 | `-v` | `--verbose` | Enables detailed debug logging for troubleshooting. |
 | `-d` | `--dry-run` | Processes input without writing output (Validation mode). |
 | `-l` | `--limit <ROWS>` | Stop after N data rows, closing the statement they belong to. Statements after that point (such as a final `COMMIT`) are not written. |
+| | `--dialect <NAME>` | `auto` (default), `postgres`, `mysql` or `sqlite`. |
 | | `--max-row-size <MiB>` | Largest data row accepted (default 256). |
 
 ---
