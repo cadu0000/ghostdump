@@ -5,6 +5,7 @@ use std::process::{Command, Output, Stdio};
 
 const PASSTHROUGH: &[u8] = include_bytes!("fixtures/passthrough.sql");
 const HMAC_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/hmac_rules.toml");
+const DP_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dp_rules.toml");
 
 /// Runs ghostdump with `args`, the secret (if any) in the environment, and
 /// `stdin` as input.
@@ -87,4 +88,39 @@ fn truncated_data_block_fails_without_writing_the_partial_row() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("middle of a data row"));
     assert!(!String::from_utf8_lossy(&output.stdout).contains("sec"));
+}
+
+#[test]
+fn verbose_logging_does_not_touch_stdout() {
+    let quiet = run(&[], None, PASSTHROUGH);
+    let verbose = run(&["-v"], None, PASSTHROUGH);
+
+    assert!(verbose.status.success());
+    assert_eq!(quiet.stdout, verbose.stdout);
+    assert!(stderr(&verbose).contains("debug:"));
+}
+
+#[test]
+fn log_level_can_be_overridden() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ghostdump"));
+    let output = command
+        .env("GHOSTDUMP_LOG", "warn")
+        .stdin(Stdio::null())
+        .output()
+        .expect("the binary runs");
+
+    assert!(output.status.success());
+    assert!(!stderr(&output).contains("Starting GhostDump"));
+}
+
+#[test]
+fn logs_never_contain_column_values() {
+    let dump = b"INSERT INTO users (salary) VALUES ('Batman-Secret-123');\n";
+    for flags in [&[][..], &["-v"][..]] {
+        let args: Vec<&str> = ["-c", DP_RULES].iter().chain(flags).copied().collect();
+        let output = run(&args, None, dump);
+
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+        assert!(!stderr(&output).contains("Batman-Secret-123"));
+    }
 }
