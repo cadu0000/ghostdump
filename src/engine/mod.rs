@@ -1,6 +1,7 @@
 pub mod config;
 pub mod strategy;
 
+use log::{debug, warn};
 use rand::{Rng, thread_rng};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
@@ -9,6 +10,14 @@ use crate::engine::strategy::StrategyConfig;
 use crate::parser::state::{InsertFormat, SqlDialect};
 use crate::parser::tokenizer::{join_tuple, split_tuple};
 use crate::parser::{Remainder, SqlEvent, SqlParser};
+
+/// Summary of a run, returned to the caller instead of printed.
+#[derive(Debug, Default, PartialEq)]
+pub struct RunReport {
+    pub rows_processed: usize,
+    /// The input ended inside a data block, before its terminator.
+    pub unterminated_data_block: bool,
+}
 
 pub struct AnonymizerEngine {
     config: Config,
@@ -68,7 +77,8 @@ impl AnonymizerEngine {
         dialect: SqlDialect,
         dry_run: bool,
         limit: Option<usize>,
-    ) -> io::Result<usize> {
+    ) -> io::Result<RunReport> {
+        debug!("engine start: dialect {dialect:?}, dry run {dry_run}, limit {limit:?}");
         let mut reader = BufReader::new(input);
         let mut writer = BufWriter::new(output);
         let mut parser = SqlParser::new(dialect);
@@ -78,6 +88,8 @@ impl AnonymizerEngine {
         let mut rows_processed = 0;
         let mut is_first_tuple = true;
         let mut reached_limit = false;
+        let mut unterminated_data_block = false;
+        let mut last_logged_table: Option<String> = None;
 
         let mut active_strategy_map: Vec<Option<&StrategyConfig>> = Vec::new();
 
@@ -111,6 +123,11 @@ impl AnonymizerEngine {
 
                             if let (Some(tbl), Some(cols)) = (table_name, columns) {
                                 active_strategy_map = self.build_strategy_map(&tbl, &cols);
+                                // pg_dump --inserts repeats the header on every row.
+                                if last_logged_table.as_deref() != Some(tbl.as_str()) {
+                                    log_masking_plan(&tbl, &cols, &active_strategy_map);
+                                    last_logged_table = Some(tbl);
+                                }
                             } else {
                                 active_strategy_map = Vec::new();
                             }
@@ -191,9 +208,8 @@ impl AnonymizerEngine {
                     }
                 }
                 Remainder::UnterminatedData { partial_row: false } => {
-                    eprintln!(
-                        "Warning: the input ended inside a data block, before its terminator (`;` or `\\.`)."
-                    );
+                    warn!("the input ended inside a data block, before its terminator (`;` or `\\.`)");
+                    unterminated_data_block = true;
                 }
                 Remainder::UnterminatedData { partial_row: true } => {
                     if !dry_run {
@@ -211,7 +227,26 @@ impl AnonymizerEngine {
         if !dry_run {
             writer.flush()?;
         }
-        Ok(rows_processed)
+        Ok(RunReport {
+            rows_processed,
+            unterminated_data_block,
+        })
+    }
+}
+
+/// Logs which columns of a data block are masked. Only schema names are
+/// logged, never values.
+fn log_masking_plan(table: &str, columns: &[String], plan: &[Option<&StrategyConfig>]) {
+    let masked: Vec<&str> = columns
+        .iter()
+        .zip(plan)
+        .filter(|(_, strategy)| strategy.is_some())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if masked.is_empty() {
+        debug!("table `{table}`: no masked columns, rows are copied");
+    } else {
+        debug!("table `{table}`: masking {}", masked.join(", "));
     }
 }
 
@@ -231,7 +266,8 @@ mod tests {
 
     fn run(input: &[u8]) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
-        engine().process_dump(input, &mut out, SqlDialect::Postgres, false, None)?;
+        let report = engine().process_dump(input, &mut out, SqlDialect::Postgres, false, None)?;
+        assert!(!report.unterminated_data_block);
         Ok(out)
     }
 

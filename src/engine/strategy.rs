@@ -3,11 +3,13 @@ use fake::Fake;
 use fake::faker::internet::en::{IPv4, SafeEmail};
 use fake::faker::name::en::Name;
 use hmac::{Hmac, Mac};
+use log::warn;
 use rand::Rng;
 use rand::distributions::Alphanumeric;
 use rand::seq::SliceRandom;
 use serde::Deserialize;
 use sha2::Sha256;
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -106,6 +108,17 @@ pub fn hmac_hash(val: &str, secret: &str) -> String {
     hex::encode(result.into_bytes())
 }
 
+static INVALID_PARAMETERS: AtomicBool = AtomicBool::new(false);
+static NOT_A_NUMBER: AtomicBool = AtomicBool::new(false);
+
+/// Runs `log` the first time only, so a warning appears once per run
+/// instead of once per value.
+fn warn_once(flag: &AtomicBool, log: impl FnOnce()) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        log();
+    }
+}
+
 /// Applies the Laplace Mechanism for Differential Privacy.
 ///
 /// WARNING (SECURITY DEBT):
@@ -126,10 +139,12 @@ pub fn dp_laplace(value: &str, epsilon: f64, sensitivity: f64, rng: &mut impl Rn
     }
 
     if epsilon <= 0.0 || sensitivity <= 0.0 {
-        eprintln!(
-            "Warning: Invalid DP parameters (epsilon: {}, sensitivity: {}). Returning original value.",
-            epsilon, sensitivity
-        );
+        warn_once(&INVALID_PARAMETERS, || {
+            warn!(
+                "dp_laplace: invalid parameters (epsilon: {epsilon}, sensitivity: {sensitivity}); \
+                 values of this column are written unchanged"
+            )
+        });
         return value.to_string();
     }
     
@@ -141,10 +156,10 @@ pub fn dp_laplace(value: &str, epsilon: f64, sensitivity: f64, rng: &mut impl Rn
     let parsed_value: f64 = match trimmed.parse() {
         Ok(v) => v,
         Err(_) => {
-            eprintln!(
-                "Warning: Failure to convert '{}' to f64 in DP Laplace.",
-                trimmed
-            );
+            // Never log the value itself: logs are an output channel too.
+            warn_once(&NOT_A_NUMBER, || {
+                warn!("dp_laplace: a value is not a number and was written unchanged")
+            });
             return value.to_string();
         }
     };

@@ -5,21 +5,32 @@ use ghostdump::io::{InputSource, OutputSource};
 use ghostdump::parser::state::SqlDialect;
 
 use clap::Parser as ClapParser;
+use log::{Level, LevelFilter, debug, error, info, warn};
 use std::collections::HashMap;
+use std::io::Write;
 use std::time::Instant;
 
-// Status messages go to stderr: stdout may carry the sanitized dump.
+// Every message goes to stderr: stdout may carry the sanitized dump.
 fn main() {
     let args = Args::parse();
+    init_logger(args.verbose);
 
-    eprintln!("Starting GhostDump...");
+    info!("Starting GhostDump...");
 
     let config = match args.config {
-        Some(ref path) => Config::load_from_file(path).unwrap_or_else(|e| {
-            fatal(&format!("could not load the rules file: {}", e));
-        }),
+        Some(ref path) => {
+            let config = Config::load_from_file(path).unwrap_or_else(|e| {
+                fatal(&format!("could not load the rules file: {}", e));
+            });
+            debug!(
+                "loaded rules for {} table(s) from {}",
+                config.tables.len(),
+                path.display()
+            );
+            config
+        }
         None => {
-            eprintln!(
+            info!(
                 "No rules (-c) provided. GhostDump will perform an exact copy of the original data."
             );
             Config {
@@ -42,32 +53,62 @@ fn main() {
     let engine = AnonymizerEngine::new(config, secret);
 
     if args.dry_run {
-        eprintln!(
-            "Dry-Run mode enabled. Data will be processed, but nothing will be written to disk."
-        );
+        info!("Dry-Run mode enabled. Data will be processed, but nothing will be written to disk.");
     }
 
     let start_time = Instant::now();
-    let rows_processed = engine
+    let report = engine
         .process_dump(input, output, dialect, args.dry_run, args.limit)
         .unwrap_or_else(|e| fatal(&e.to_string()));
     let duration = start_time.elapsed();
 
-    eprintln!("Processing completed successfully!");
-    eprintln!("Rows processed: {}", rows_processed);
-    eprintln!("Total time: {:.2?}", duration);
+    info!("Processing completed successfully!");
+    info!("Rows processed: {}", report.rows_processed);
+    info!("Total time: {:.2?}", duration);
 
     if duration.as_secs_f64() > 0.0 {
-        let rows_per_sec = (rows_processed as f64 / duration.as_secs_f64()) as u64;
-        eprintln!("Speed: {} rows/second", rows_per_sec);
+        let rows_per_sec = (report.rows_processed as f64 / duration.as_secs_f64()) as u64;
+        info!("Speed: {} rows/second", rows_per_sec);
     }
+}
+
+/// `-v` turns on debug messages; `GHOSTDUMP_LOG` (for example `warn`)
+/// replaces the level filter altogether.
+fn init_logger(verbose: bool) {
+    let level = if verbose {
+        LevelFilter::Debug
+    } else {
+        LevelFilter::Info
+    };
+
+    let mut builder = env_logger::Builder::new();
+    match std::env::var("GHOSTDUMP_LOG") {
+        Ok(filters) => builder.parse_filters(&filters),
+        Err(_) => builder
+            .filter_level(LevelFilter::Warn)
+            .filter_module("ghostdump", level),
+    };
+
+    builder
+        .target(env_logger::Target::Stderr)
+        .format(|buf, record| {
+            let prefix = match record.level() {
+                Level::Info => return writeln!(buf, "{}", record.args()),
+                Level::Error => "error",
+                Level::Warn => "warning",
+                Level::Debug => "debug",
+                Level::Trace => "trace",
+            };
+            writeln!(buf, "{}: {}", prefix, record.args())
+        })
+        .init();
 }
 
 fn resolve_secret(secret: Option<&str>) -> String {
     match check_secret(secret) {
         Ok(SecretLength::Recommended) => {}
-        Ok(SecretLength::Short) => eprintln!(
-            "Warning: the secret is shorter than {} bytes. HMAC pseudonyms of low-entropy \
+        Ok(SecretLength::Short) => warn!(
+            "the secret is shorter than {} bytes. HMAC pseudonyms of low-entropy \
              values (IDs, CPFs) can be brute-forced if the secret is guessed. \
              Use 32 or more random bytes.",
             MIN_SECRET_BYTES
@@ -84,6 +125,6 @@ fn resolve_secret(secret: Option<&str>) -> String {
 }
 
 fn fatal(message: &str) -> ! {
-    eprintln!("Fatal error: {}", message);
+    error!("{}", message);
     std::process::exit(1);
 }
