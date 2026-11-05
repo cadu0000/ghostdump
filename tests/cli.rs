@@ -4,6 +4,7 @@ use std::io::{ErrorKind, Write};
 use std::process::{Command, Output, Stdio};
 
 const PASSTHROUGH: &[u8] = include_bytes!("fixtures/passthrough.sql");
+const PG_DATA: &[u8] = include_bytes!("fixtures/pg_data.sql");
 const HMAC_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/hmac_rules.toml");
 const DP_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dp_rules.toml");
 
@@ -123,4 +124,15 @@ fn logs_never_contain_column_values() {
         assert!(output.status.success(), "stderr: {}", stderr(&output));
         assert!(!stderr(&output).contains("Batman-Secret-123"));
     }
+}
+
+#[test]
+fn data_blocks_are_copied_exactly_without_rules() {
+    let output = run(&[], None, PG_DATA);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(PG_DATA)
+    );
 }
