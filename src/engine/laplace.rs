@@ -481,3 +481,165 @@ mod tests {
         assert_eq!(far, edge);
     }
 }
+
+/// Statistical validation of both samplers. Slow (millions of samples), so
+/// ignored by default: `cargo test --release -- --ignored`.
+///
+/// Each check runs on a correct sampler and on a deliberately broken one
+/// (the negative control), so a check that cannot detect anything fails.
+#[cfg(test)]
+mod validation {
+    use super::*;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    const SAMPLES: usize = 1_000_000;
+    /// Standard normal quantile for a false alarm probability of 1e-4.
+    const Z_1E4: f64 = 3.719;
+
+    /// Upper 1e-4 quantile of a chi-square with `df` degrees of freedom
+    /// (Wilson–Hilferty approximation).
+    fn chi2_critical(df: usize) -> f64 {
+        let df = df as f64;
+        let h = 2.0 / (9.0 * df);
+        df * (1.0 - h + Z_1E4 * h.sqrt()).powi(3)
+    }
+
+    fn chi2(observed: &[usize], expected: &[f64]) -> f64 {
+        observed
+            .iter()
+            .zip(expected)
+            .map(|(&o, &e)| (o as f64 - e).powi(2) / e)
+            .sum()
+    }
+
+    /// Inverse CDF of Laplace(0, b).
+    fn laplace_quantile(p: f64, b: f64) -> f64 {
+        if p < 0.5 {
+            b * (2.0 * p).ln()
+        } else {
+            -b * (2.0 * (1.0 - p)).ln()
+        }
+    }
+
+    /// Chi-square over 100 equiprobable bins of Laplace(0, b). True when the
+    /// samples fit.
+    fn fits_laplace(samples: &[f64], b: f64) -> bool {
+        let bins = 100;
+        let edges: Vec<f64> = (1..bins)
+            .map(|i| laplace_quantile(i as f64 / bins as f64, b))
+            .collect();
+        let mut observed = vec![0usize; bins];
+        for &x in samples {
+            observed[edges.partition_point(|&edge| edge <= x)] += 1;
+        }
+        let expected = vec![samples.len() as f64 / bins as f64; bins];
+        chi2(&observed, &expected) < chi2_critical(bins - 1)
+    }
+
+    /// Largest normalized periodogram value of the residues modulo 4096.
+    /// Under uniform residues each value is about Exp(1); a periodic
+    /// artifact shows as a peak.
+    fn periodogram_peak(values: impl Iterator<Item = i64>) -> f64 {
+        const N: usize = 4096;
+        let mut counts = vec![0f64; N];
+        let mut n = 0usize;
+        for value in values {
+            counts[value.rem_euclid(N as i64) as usize] += 1.0;
+            n += 1;
+        }
+        let mean = n as f64 / N as f64;
+        let mut peak = 0f64;
+        for k in 1..N / 2 {
+            let (mut re, mut im) = (0f64, 0f64);
+            for (j, &c) in counts.iter().enumerate() {
+                let angle = -2.0 * std::f64::consts::PI * (j * k % N) as f64 / N as f64;
+                re += (c - mean) * angle.cos();
+                im += (c - mean) * angle.sin();
+            }
+            peak = peak.max((re * re + im * im) / (N as f64 * mean));
+        }
+        peak
+    }
+
+    /// The periodogram peak above which residues are not uniform: the
+    /// largest of 2047 Exp(1) values passes it with probability 1e-4.
+    fn periodogram_threshold() -> f64 {
+        (2047.0f64 / 1e-4).ln()
+    }
+
+    fn rng() -> StdRng {
+        StdRng::seed_from_u64(20261106)
+    }
+
+    #[test]
+    #[ignore = "slow: run with cargo test --release -- --ignored"]
+    fn exact_sampler_matches_the_discrete_laplace_pmf() {
+        let t = 3u64;
+        let q = (-1.0 / t as f64).exp();
+        let pmf = |z: i64| (1.0 - q) / (1.0 + q) * q.powi(z.unsigned_abs() as i32);
+        let mut rng = rng();
+
+        // Bins -15..=15, plus one bin for each tail.
+        let check = |sample: &mut dyn FnMut() -> i64| -> bool {
+            let mut observed = vec![0usize; 33];
+            for _ in 0..SAMPLES {
+                let z = sample();
+                observed[(z.clamp(-16, 16) + 16) as usize] += 1;
+            }
+            let tail: f64 = q.powi(16) / (1.0 + q);
+            let expected: Vec<f64> = (-16i64..=16)
+                .map(|z| {
+                    let p = if z.abs() == 16 { tail } else { pmf(z) };
+                    p * SAMPLES as f64
+                })
+                .collect();
+            chi2(&observed, &expected) < chi2_critical(32)
+        };
+
+        assert!(check(&mut || discrete_laplace(t, &mut rng)));
+        // Negative control: parameter 4 instead of 3.
+        assert!(!check(&mut || discrete_laplace(t + 1, &mut rng)));
+    }
+
+    #[test]
+    #[ignore = "slow: run with cargo test --release -- --ignored"]
+    fn both_samplers_fit_the_laplace_distribution() {
+        let b = 10_000.0;
+        let mut rng = rng();
+
+        let exact: Vec<f64> = (0..SAMPLES)
+            .map(|_| discrete_laplace(b as u64, &mut rng) as f64)
+            .collect();
+        assert!(fits_laplace(&exact, b), "exact sampler");
+
+        let float: Vec<f64> = (0..SAMPLES).map(|_| laplace_noise(b, &mut rng)).collect();
+        assert!(fits_laplace(&float, b), "f64 sampler");
+
+        // Negative control: noise 5% wider than declared.
+        let wide: Vec<f64> = (0..SAMPLES)
+            .map(|_| laplace_noise(b * 1.05, &mut rng))
+            .collect();
+        assert!(!fits_laplace(&wide, b), "wider noise was not detected");
+    }
+
+    #[test]
+    #[ignore = "slow: run with cargo test --release -- --ignored"]
+    fn no_sampler_shows_periodic_artifacts() {
+        let t = 10_000_000u64;
+        let threshold = periodogram_threshold();
+        let mut rng = rng();
+
+        let exact = periodogram_peak((0..SAMPLES).map(|_| discrete_laplace(t, &mut rng)));
+        assert!(exact < threshold, "exact sampler peak {exact}");
+
+        let float = periodogram_peak(
+            (0..SAMPLES).map(|_| laplace_noise(t as f64, &mut rng).round() as i64),
+        );
+        assert!(float < threshold, "f64 sampler peak {float}");
+
+        // Negative control: values forced to multiples of 8.
+        let broken = periodogram_peak((0..SAMPLES).map(|_| discrete_laplace(t, &mut rng) & !7));
+        assert!(broken > threshold, "period 8 was not detected ({broken})");
+    }
+}
