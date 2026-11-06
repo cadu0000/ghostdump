@@ -103,6 +103,145 @@ fn laplace_noise(scale: f64, rng: &mut impl Rng) -> f64 {
     }
 }
 
+/// Bernoulli(num / den), exactly: one uniform integer compared with `num`.
+fn bernoulli(num: u128, den: u128, rng: &mut impl Rng) -> bool {
+    rng.gen_range(0..den) < num
+}
+
+/// Bernoulli(exp(-num / den)) for 0 <= num / den <= 1 (Canonne, Kamath and
+/// Steinke, 2020, algorithm 1). Only integer comparisons are involved.
+fn bernoulli_exp_le1(num: u128, den: u128, rng: &mut impl Rng) -> bool {
+    let mut k: u128 = 1;
+    while bernoulli(num, den * k, rng) {
+        k += 1;
+    }
+    k % 2 == 1
+}
+
+/// A sample of the discrete Laplace distribution with parameter `t`:
+/// P(z) is proportional to exp(-|z| / t) for every integer z (Canonne,
+/// Kamath and Steinke, 2020, algorithm 2 with s = 1).
+///
+/// No floating-point operation is involved, so the output carries none of
+/// the low-order artifacts of `f64` samplers (Mironov, 2012).
+pub fn discrete_laplace(t: u64, rng: &mut impl Rng) -> i64 {
+    assert!(t > 0, "the discrete Laplace parameter must be positive");
+    let t = u128::from(t);
+    loop {
+        let u = rng.gen_range(0..t);
+        if !bernoulli_exp_le1(u, t, rng) {
+            continue;
+        }
+        let mut v: u128 = 0;
+        while bernoulli_exp_le1(1, 1, rng) {
+            v += 1;
+        }
+        let magnitude = u + t * v;
+        let negative = rng.r#gen::<bool>();
+        if negative && magnitude == 0 {
+            continue;
+        }
+        // The magnitude has a geometric tail: it fits in an i64 for any t
+        // accepted by the rules (see `ExactDomain`).
+        let magnitude = i64::try_from(magnitude).unwrap_or(i64::MAX);
+        return if negative { -magnitude } else { magnitude };
+    }
+}
+
+/// Largest noise parameter accepted, so that values plus noise stay far
+/// from the limits of an i64.
+const MAX_NOISE_PARAMETER: u64 = 1 << 50;
+
+/// The integer domain of an exact `dp_laplace` column: values in units of
+/// the published precision (with `scale = 2`, one unit is 0.01).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExactDomain {
+    /// 10^scale.
+    unit: i64,
+    lo: i64,
+    hi: i64,
+    /// Discrete Laplace parameter: t = ceil((hi - lo) / ε).
+    t: u64,
+}
+
+impl ExactDomain {
+    /// The domain for `bounds = [lo, hi]` written with `decimals` places,
+    /// and the noise parameter that makes it ε-LDP.
+    pub fn new(epsilon: f64, lo: f64, hi: f64, decimals: usize) -> Result<Self, String> {
+        let unit = 10i64
+            .checked_pow(decimals as u32)
+            .ok_or("`scale` is too large for the exact sampler")?;
+        let to_units = |value: f64| {
+            let units = (value * unit as f64).round();
+            // 2^53: beyond it, f64 no longer holds every integer.
+            if units.abs() > 9_007_199_254_740_992.0 {
+                Err("`bounds` times 10^scale must stay below 2^53 for the exact sampler")
+            } else {
+                Ok(units as i64)
+            }
+        };
+        let (lo, hi) = (to_units(lo)?, to_units(hi)?);
+        if lo >= hi {
+            return Err("`bounds` must differ by at least one unit of `scale`".into());
+        }
+
+        let delta = (hi - lo) as u64;
+        let needed = (delta as f64 / epsilon).ceil();
+        if needed.is_nan() || needed > MAX_NOISE_PARAMETER as f64 {
+            return Err(format!(
+                "bounds, scale and epsilon need a noise parameter of {needed} units, above \
+                 the exact sampler's limit of 2^50; use a larger epsilon or a smaller scale"
+            ));
+        }
+        let mut t = (needed as u64).max(1);
+        // ceil in f64 may land one below the exact value: make sure Δ/t <= ε.
+        while (delta as f64) / (t as f64) > epsilon {
+            t += 1;
+        }
+        Ok(Self { unit, lo, hi, t })
+    }
+
+    /// The ε this domain really spends: Δ / t, never above the configured ε.
+    pub fn effective_epsilon(&self) -> f64 {
+        (self.hi - self.lo) as f64 / self.t as f64
+    }
+
+    /// Clamps `value` to the bounds and converts it to units; values that
+    /// are not numbers take the midpoint.
+    pub fn to_units(&self, value: Option<f64>) -> i64 {
+        match value {
+            Some(v) => {
+                let units = (v * self.unit as f64).round();
+                (units.max(self.lo as f64).min(self.hi as f64)) as i64
+            }
+            None => self.lo + (self.hi - self.lo) / 2,
+        }
+    }
+
+    pub fn noisy(&self, units: i64, clamp_output: bool, rng: &mut impl Rng) -> i64 {
+        let noisy = units + discrete_laplace(self.t, rng);
+        if clamp_output {
+            noisy.clamp(self.lo, self.hi)
+        } else {
+            noisy
+        }
+    }
+
+    /// Writes a number of units with the decimal point in place, without
+    /// any floating-point step.
+    pub fn format(&self, units: i64) -> String {
+        let decimals = self.unit.ilog10() as usize;
+        let sign = if units < 0 { "-" } else { "" };
+        let magnitude = units.unsigned_abs();
+        let unit = self.unit as u64;
+        if decimals == 0 {
+            format!("{sign}{magnitude}")
+        } else {
+            format!("{sign}{}.{:0decimals$}", magnitude / unit, magnitude % unit)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +344,76 @@ mod tests {
     #[test]
     fn test_negative_zero_is_written_as_zero() {
         assert_eq!(mechanism(false).format(-0.001), "0.00");
+    }
+
+    #[test]
+    fn test_discrete_laplace_matches_its_distribution() {
+        // P(z) = (1 - q) / (1 + q) * q^|z| with q = exp(-1/t).
+        let t = 3;
+        let q = (-1.0 / t as f64).exp();
+        let n = 200_000;
+        let mut rng = rng();
+        let mut counts = std::collections::HashMap::new();
+        for _ in 0..n {
+            *counts
+                .entry(discrete_laplace(t, &mut rng))
+                .or_insert(0usize) += 1;
+        }
+        for z in -6i64..=6 {
+            let expected = (1.0 - q) / (1.0 + q) * q.powi(z.unsigned_abs() as i32);
+            let observed = counts.get(&z).copied().unwrap_or(0) as f64 / n as f64;
+            let sd = (expected * (1.0 - expected) / n as f64).sqrt();
+            assert!(
+                (observed - expected).abs() < 5.0 * sd,
+                "z = {z}: {observed} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_exact_domain_spends_at_most_epsilon() {
+        for (epsilon, lo, hi, decimals) in [
+            (1.0, 0.0, 100_000.0, 2),
+            (0.5, 0.0, 10_000.0, 2),
+            (0.3, 18.0, 99.0, 0),
+            (2.0, 0.0, 1.0, 4),
+            (0.7, -5.5, 5.5, 1),
+        ] {
+            let domain = ExactDomain::new(epsilon, lo, hi, decimals).unwrap();
+            assert!(domain.effective_epsilon() <= epsilon, "{domain:?}");
+            assert!(domain.effective_epsilon() > 0.99 * epsilon, "{domain:?}");
+        }
+    }
+
+    #[test]
+    fn test_exact_domain_rejects_what_it_cannot_represent() {
+        assert!(ExactDomain::new(1.0, 0.0, 1e15, 4).is_err());
+        assert!(ExactDomain::new(1e-12, 0.0, 1e6, 2).is_err());
+        assert!(ExactDomain::new(1.0, 0.0, 0.001, 2).is_err());
+    }
+
+    #[test]
+    fn test_exact_units_and_format() {
+        let domain = ExactDomain::new(1.0, 0.0, 100.0, 2).unwrap();
+        assert_eq!(domain.to_units(Some(12.345)), 1235);
+        assert_eq!(domain.to_units(Some(1e9)), 10_000);
+        assert_eq!(domain.to_units(Some(-3.0)), 0);
+        assert_eq!(domain.to_units(None), 5_000);
+        assert_eq!(domain.format(1235), "12.35");
+        assert_eq!(domain.format(-5), "-0.05");
+        assert_eq!(domain.format(0), "0.00");
+
+        let integers = ExactDomain::new(1.0, 18.0, 99.0, 0).unwrap();
+        assert_eq!(integers.format(-42), "-42");
+    }
+
+    #[test]
+    fn test_exact_clamp_output() {
+        let domain = ExactDomain::new(0.1, 0.0, 1.0, 2).unwrap();
+        let mut rng = rng();
+        for _ in 0..1000 {
+            let out = domain.noisy(50, true, &mut rng);
+            assert!((0..=100).contains(&out), "{out}");
+        }
     }
 }
