@@ -140,26 +140,35 @@ impl<'a, W: Write> Sink<'a> for SequentialSink<'_, W> {
     }
 }
 
-/// A segment on its way to a worker: the bytes to write, with the rows to
-/// mask and where each one goes among them.
+/// A segment on its way to a worker: the bytes to write, and the rows to
+/// mask with where each one goes among them. Segments and their buffers are
+/// reused, so the threads do not allocate per row or free what another
+/// thread allocated.
 struct Segment<'a> {
     bytes: Vec<u8>,
-    rows: Vec<PendingRow<'a>>,
+    /// The rows to mask, one after another.
+    row_bytes: Vec<u8>,
+    rows: Vec<PendingRow>,
+    /// The plans of the rows, without repeats.
+    plans: Vec<Arc<MaskingPlan<'a>>>,
 }
 
-struct PendingRow<'a> {
+struct PendingRow {
     /// Offset in `bytes` where the masked row is written.
     at: usize,
-    row: Vec<u8>,
+    /// End of the row in `row_bytes`; it starts where the previous one ends.
+    end: usize,
     format: InsertFormat,
-    plan: Arc<MaskingPlan<'a>>,
+    plan: usize,
 }
 
-impl Segment<'_> {
+impl<'a> Segment<'a> {
     fn new() -> Self {
         Self {
-            bytes: Vec::with_capacity(SEGMENT_BYTES),
-            rows: Vec::with_capacity(SEGMENT_ROWS),
+            bytes: Vec::new(),
+            row_bytes: Vec::new(),
+            rows: Vec::new(),
+            plans: Vec::new(),
         }
     }
 
@@ -167,31 +176,55 @@ impl Segment<'_> {
         self.bytes.is_empty() && self.rows.is_empty()
     }
 
-    /// The segment as it is written, with its rows masked.
+    fn push_row(&mut self, row: &[u8], format: InsertFormat, plan: &Arc<MaskingPlan<'a>>) {
+        if !self
+            .plans
+            .last()
+            .is_some_and(|last| Arc::ptr_eq(last, plan))
+        {
+            self.plans.push(Arc::clone(plan));
+        }
+        self.row_bytes.extend_from_slice(row);
+        self.rows.push(PendingRow {
+            at: self.bytes.len(),
+            end: self.row_bytes.len(),
+            format,
+            plan: self.plans.len() - 1,
+        });
+    }
+
+    /// Writes the segment to `out` with its rows masked.
     fn mask(
         &self,
         seed: [u8; 32],
         context: RowContext,
         stats: &mut MaskStats,
-    ) -> io::Result<Vec<u8>> {
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
         let mut rng = StdRng::from_seed(seed);
-        let rows: usize = self.rows.iter().map(|r| r.row.len()).sum();
-        let mut out = Vec::with_capacity(self.bytes.len() + rows + rows / 2);
-        let mut copied = 0;
-        for pending in &self.rows {
-            out.extend_from_slice(&self.bytes[copied..pending.at]);
-            copied = pending.at;
+        let (mut copied, mut start) = (0, 0);
+        for row in &self.rows {
+            out.extend_from_slice(&self.bytes[copied..row.at]);
+            copied = row.at;
             context.mask_row(
-                &pending.row,
-                pending.format,
-                &pending.plan,
+                &self.row_bytes[start..row.end],
+                row.format,
+                &self.plans[row.plan],
                 &mut rng,
                 stats,
-                &mut out,
+                out,
             )?;
+            start = row.end;
         }
         out.extend_from_slice(&self.bytes[copied..]);
-        Ok(out)
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.row_bytes.clear();
+        self.rows.clear();
+        self.plans.clear();
     }
 }
 
@@ -199,12 +232,16 @@ struct Job<'a> {
     index: u64,
     seed: [u8; 32],
     segment: Segment<'a>,
+    out: Vec<u8>,
 }
 
-struct Done {
+struct Done<'a> {
     index: u64,
-    output: io::Result<Vec<u8>>,
+    result: io::Result<()>,
     stats: MaskStats,
+    /// Returned for reuse, cleared.
+    segment: Segment<'a>,
+    out: Vec<u8>,
 }
 
 /// Groups the output into segments, masks them on a pool of threads and
@@ -219,9 +256,11 @@ pub struct ParallelSink<'a, W> {
     clock: SegmentClock,
     segment: Segment<'a>,
     jobs: Option<Sender<Job<'a>>>,
-    results: Receiver<Done>,
+    results: Receiver<Done<'a>>,
     /// Masked segments that arrived before an earlier one.
-    waiting: BTreeMap<u64, Done>,
+    waiting: BTreeMap<u64, Done<'a>>,
+    /// Segments and output buffers ready for reuse.
+    free: Vec<(Segment<'a>, Vec<u8>)>,
     sent: u64,
     written: u64,
     max_in_flight: u64,
@@ -258,6 +297,7 @@ impl<'a, W: Write> ParallelSink<'a, W> {
             jobs: Some(jobs),
             results,
             waiting: BTreeMap::new(),
+            free: Vec::new(),
             sent: 0,
             written: 0,
             max_in_flight: 2 * threads as u64,
@@ -275,11 +315,15 @@ impl<'a, W: Write> ParallelSink<'a, W> {
     /// Sends the current segment to the workers, then writes the segments
     /// that are ready, waiting while too many are out.
     fn dispatch(&mut self) -> io::Result<()> {
-        let segment = mem::replace(&mut self.segment, Segment::new());
+        let (next, out) = self
+            .free
+            .pop()
+            .unwrap_or_else(|| (Segment::new(), Vec::new()));
         let job = Job {
             index: self.sent,
             seed: self.run_rng.r#gen(),
-            segment,
+            segment: mem::replace(&mut self.segment, next),
+            out,
         };
         let jobs = self
             .jobs
@@ -303,12 +347,16 @@ impl<'a, W: Write> ParallelSink<'a, W> {
     }
 
     /// Writes every segment that is next in order.
-    fn collect(&mut self, done: Done) -> io::Result<()> {
+    fn collect(&mut self, done: Done<'a>) -> io::Result<()> {
         self.waiting.insert(done.index, done);
         while let Some(done) = self.waiting.remove(&self.written) {
+            done.result?;
             self.stats.add(&done.stats);
-            self.writer.write_all(&done.output?)?;
+            self.writer.write_all(&done.out)?;
             self.written += 1;
+            let mut out = done.out;
+            out.clear();
+            self.free.push((done.segment, out));
         }
         Ok(())
     }
@@ -326,14 +374,9 @@ impl<'a, W: Write> Sink<'a> for ParallelSink<'a, W> {
         format: InsertFormat,
         plan: &Arc<MaskingPlan<'a>>,
     ) -> io::Result<()> {
-        let bytes = row.len();
-        self.segment.rows.push(PendingRow {
-            at: self.segment.bytes.len(),
-            row,
-            format,
-            plan: Arc::clone(plan),
-        });
-        self.tick(1, bytes)
+        // Copied, so the row is freed by the thread that allocated it.
+        self.segment.push_row(&row, format, plan);
+        self.tick(1, row.len())
     }
 
     fn finish(mut self) -> io::Result<MaskStats> {
@@ -351,26 +394,35 @@ impl<'a, W: Write> Sink<'a> for ParallelSink<'a, W> {
 }
 
 /// A worker: masks segments from the queue until it is closed.
-fn work(queue: &Mutex<Receiver<Job>>, done: &Sender<Done>, context: RowContext) {
+fn work<'a>(queue: &Mutex<Receiver<Job<'a>>>, done: &Sender<Done<'a>>, context: RowContext) {
     loop {
         // The lock is held only while waiting for a job, not while masking.
         let job = queue.lock().unwrap_or_else(PoisonError::into_inner).recv();
-        let Ok(job) = job else {
+        let Ok(Job {
+            index,
+            seed,
+            mut segment,
+            mut out,
+        }) = job
+        else {
             return;
         };
         let mut stats = MaskStats::default();
         // A panic becomes an error for this segment, so the writer is never
         // left waiting for a segment that will not come.
-        let output = panic::catch_unwind(AssertUnwindSafe(|| {
-            job.segment.mask(job.seed, context, &mut stats)
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            segment.mask(seed, context, &mut stats, &mut out)
         }))
         .unwrap_or_else(|_| Err(io::Error::other("a masking thread panicked")));
-        let result = Done {
-            index: job.index,
-            output,
+        segment.clear();
+        let finished = Done {
+            index,
+            result,
             stats,
+            segment,
+            out,
         };
-        if done.send(result).is_err() {
+        if done.send(finished).is_err() {
             return;
         }
     }
