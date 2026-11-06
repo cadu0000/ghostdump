@@ -233,6 +233,8 @@ cargo test -- --nocapture
 
 ```
 
+Continuous integration (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on every push and pull request. The integration tests in `tests/` run the binary on fixture dumps and compare its output with expected files.
+
 For reproducible experiments, the hidden `--seed <N>` option fixes every random choice (generated values and Laplace noise). Anyone who knows the seed can recompute them, so never use it on real data.
 
 ---
