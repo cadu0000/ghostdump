@@ -237,3 +237,11 @@ fn noise_is_reproducible_only_with_a_seed() {
     assert_ne!(seeded("7"), seeded("8"));
     assert_ne!(unseeded(), unseeded());
 }
+
+#[test]
+fn progress_flag_keeps_stdout_clean() {
+    let output = run(&["-p"], None, PG_DATA);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(output.stdout, PG_DATA);
+}
