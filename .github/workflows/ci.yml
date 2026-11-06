@@ -22,3 +22,5 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      - name: Validate the Laplace samplers
+        run: cargo test --release -- --ignored
