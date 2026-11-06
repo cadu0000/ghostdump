@@ -137,7 +137,10 @@ impl LaplaceMechanism {
 
 /// A Laplace sample with the given scale: an exponential magnitude with a
 /// random sign. `1 - U` lies in (0, 1], so the logarithm is always finite.
-fn laplace_noise(scale: f64, rng: &mut impl Rng) -> f64 {
+///
+/// This is the `f64` sampler. It is public so that the floating-point
+/// experiment (`examples/fp_distinguisher.rs`) can attack it directly.
+pub fn laplace_noise(scale: f64, rng: &mut impl Rng) -> f64 {
     let magnitude = -(1.0 - rng.r#gen::<f64>()).ln() * scale;
     if rng.r#gen::<bool>() {
         magnitude
