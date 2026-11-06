@@ -233,6 +233,26 @@ fn seeded_run_matches_the_golden_output() {
 }
 
 #[test]
+fn threads_give_the_golden_output() {
+    let expected = include_bytes!("fixtures/pg_data_masked.sql");
+    for threads in ["2", "4"] {
+        let output = run(
+            &["-c", PG_RULES, "--seed", "42", "--threads", threads],
+            Some(GOLDEN_SECRET),
+            PG_DATA,
+        );
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+        assert!(output.stdout == expected, "{threads} threads");
+    }
+}
+
+#[test]
+fn zero_threads_are_rejected() {
+    let output = run(&["--threads", "0"], None, b"");
+    assert!(!output.status.success());
+}
+
+#[test]
 fn noise_is_reproducible_only_with_a_seed() {
     let dump = b"INSERT INTO users (salary) VALUES (10), (20), (30);\n";
     let seeded = |seed: &str| run(&["-c", DP_RULES, "--seed", seed], None, dump).stdout;
