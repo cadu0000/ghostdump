@@ -27,6 +27,10 @@ pub enum StrategyConfig {
         /// Which sampler draws the noise.
         #[serde(default)]
         mechanism: LaplaceSampler,
+        /// Draw the noise from a keyed PRF of the value: equal values get
+        /// equal outputs in every row and run. Needs the secret.
+        #[serde(default)]
+        consistent: bool,
     },
     FakerName,
     FakerEmail,
@@ -93,6 +97,7 @@ impl StrategyConfig {
                 scale,
                 clamp_output,
                 mechanism,
+                consistent,
             } => compile_laplace(
                 *epsilon,
                 *bounds,
@@ -100,6 +105,7 @@ impl StrategyConfig {
                 *scale,
                 *clamp_output,
                 *mechanism,
+                *consistent,
             ),
         }
     }
@@ -112,6 +118,7 @@ fn compile_laplace(
     scale: Option<u32>,
     clamp_output: bool,
     sampler: LaplaceSampler,
+    consistent: bool,
 ) -> Result<Masker, String> {
     if sensitivity.is_some() {
         return Err(
@@ -150,6 +157,11 @@ fn compile_laplace(
     let mechanism = match sampler {
         LaplaceSampler::Exact => LaplaceMechanism::exact(epsilon, lo, hi, decimals, clamp_output)?,
         LaplaceSampler::F64 => LaplaceMechanism::new(epsilon, lo, hi, decimals, clamp_output),
+    };
+    let mechanism = if consistent {
+        mechanism.with_consistent_noise()
+    } else {
+        mechanism
     };
     Ok(Masker::Laplace(mechanism))
 }
@@ -233,6 +245,14 @@ mod tests {
         assert!(m.describe().contains("exact integer sampler"));
         let too_fine = r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 1e12], scale = 6"#;
         assert!(compile(too_fine).unwrap_err().contains("2^53"));
+    }
+
+    #[test]
+    fn test_consistent_noise_needs_the_secret() {
+        let plain = r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2"#;
+        assert!(!compile(plain).unwrap().uses_secret());
+        let consistent = r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2, consistent = true"#;
+        assert!(compile(consistent).unwrap().uses_secret());
     }
 
     #[test]

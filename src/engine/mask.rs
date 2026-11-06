@@ -78,7 +78,7 @@ impl Masker {
                 Some(text) => SqlValue::Text(hmac_hash(text, secret)),
                 None => SqlValue::Null,
             },
-            Masker::Laplace(mechanism) => mechanism.apply(value, rng, stats),
+            Masker::Laplace(mechanism) => mechanism.apply(value, rng, secret, stats),
         }
     }
 
@@ -93,7 +93,18 @@ impl Masker {
     }
 
     pub fn uses_secret(&self) -> bool {
-        matches!(self, Masker::Hmac)
+        match self {
+            Masker::Hmac => true,
+            Masker::Laplace(m) => m.is_consistent(),
+            _ => false,
+        }
+    }
+
+    /// Names the column the masker belongs to (used by consistent noise).
+    pub fn bind(&mut self, table: &str, column: &str) {
+        if let Masker::Laplace(m) = self {
+            m.bind(table, column);
+        }
     }
 
     /// One line for the debug log and the guarantees table.

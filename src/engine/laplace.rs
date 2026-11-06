@@ -1,6 +1,9 @@
 //! The Laplace mechanism of `dp_laplace` columns.
 
-use rand::Rng;
+use hmac::{Hmac, Mac};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use sha2::Sha256;
 
 use crate::codec::SqlValue;
 use crate::engine::mask::MaskStats;
@@ -17,6 +20,10 @@ use crate::engine::mask::MaskStats;
 /// in floating point, which is vulnerable to attacks on the low-order bits
 /// (Mironov, 2012): its guarantee assumes exact arithmetic. It is kept to
 /// measure the cost of exact sampling.
+///
+/// With consistent noise, the noise of a value is drawn from a generator
+/// seeded by HMAC-SHA256(secret, column, value): the same value in the same
+/// column always gets the same noise, in every row and every run.
 #[derive(Debug, Clone)]
 pub struct LaplaceMechanism {
     epsilon: f64,
@@ -25,6 +32,8 @@ pub struct LaplaceMechanism {
     decimals: usize,
     clamp_output: bool,
     sampler: Sampler,
+    /// `Some(label)` for consistent noise; the label names the column.
+    consistent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,7 +54,27 @@ impl LaplaceMechanism {
             sampler: Sampler::F64 {
                 noise_scale: (hi - lo) / epsilon,
             },
+            consistent: None,
         }
+    }
+
+    /// Draws the noise of each value from a keyed PRF of the value instead
+    /// of the run's generator. `bind` then names the column.
+    pub fn with_consistent_noise(mut self) -> Self {
+        self.consistent = Some(String::new());
+        self
+    }
+
+    /// Names the column whose values this mechanism masks, so that equal
+    /// values in different columns get different noise.
+    pub fn bind(&mut self, table: &str, column: &str) {
+        if let Some(label) = &mut self.consistent {
+            *label = format!("{table}.{column}");
+        }
+    }
+
+    pub fn is_consistent(&self) -> bool {
+        self.consistent.is_some()
     }
 
     /// The exact integer sampler; fails when the bounds, `scale` and ε do
@@ -67,6 +96,7 @@ impl LaplaceMechanism {
         &self,
         value: SqlValue,
         rng: &mut impl Rng,
+        secret: &str,
         stats: &mut MaskStats,
     ) -> SqlValue {
         let parsed = value
@@ -78,9 +108,21 @@ impl LaplaceMechanism {
         }
 
         let text = match &self.sampler {
-            Sampler::F64 { noise_scale } => self.format(self.noisy(parsed, *noise_scale, rng)),
+            Sampler::F64 { noise_scale } => {
+                let clamped = self.clamp(parsed);
+                let noisy = match self.prf(secret, &clamped.to_bits().to_le_bytes()) {
+                    Some(mut keyed) => self.noisy(clamped, *noise_scale, &mut keyed),
+                    None => self.noisy(clamped, *noise_scale, rng),
+                };
+                self.format(noisy)
+            }
             Sampler::Exact(domain) => {
-                domain.format(domain.noisy(domain.to_units(parsed), self.clamp_output, rng))
+                let units = domain.to_units(parsed);
+                let noisy = match self.prf(secret, &units.to_le_bytes()) {
+                    Some(mut keyed) => domain.noisy(units, self.clamp_output, &mut keyed),
+                    None => domain.noisy(units, self.clamp_output, rng),
+                };
+                domain.format(noisy)
             }
         };
         // A number stays unquoted when it came unquoted.
@@ -105,6 +147,11 @@ impl LaplaceMechanism {
             Sampler::F64 { .. } => "f64 sampler: assumes exact arithmetic".to_string(),
             Sampler::Exact(_) => format!("exact integer sampler, configured ε = {}", self.epsilon),
         };
+        let sampler = if self.is_consistent() {
+            format!("{sampler}; consistent noise: equal values get equal outputs")
+        } else {
+            sampler
+        };
         format!(
             "Laplace noise, ε-LDP per value with ε = {}, bounds [{}, {}], scale {} ({sampler})",
             self.epsilon(),
@@ -114,9 +161,25 @@ impl LaplaceMechanism {
         )
     }
 
-    /// `None` stands for a value that is not a number.
-    fn noisy(&self, value: Option<f64>, noise_scale: f64, rng: &mut impl Rng) -> f64 {
-        let clamped = value.map_or((self.lo + self.hi) / 2.0, |v| v.clamp(self.lo, self.hi));
+    /// For consistent noise: a generator seeded by HMAC-SHA256 of the
+    /// column label and the clamped value, keyed with the secret.
+    fn prf(&self, secret: &str, value: &[u8]) -> Option<StdRng> {
+        let label = self.consistent.as_ref()?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+            .expect("HMAC accepts keys of any length");
+        mac.update(b"ghostdump/dp_laplace/");
+        mac.update(label.as_bytes());
+        mac.update(b"\0");
+        mac.update(value);
+        Some(StdRng::from_seed(mac.finalize().into_bytes().into()))
+    }
+
+    /// `None` stands for a value that is not a number: it takes the midpoint.
+    fn clamp(&self, value: Option<f64>) -> f64 {
+        value.map_or((self.lo + self.hi) / 2.0, |v| v.clamp(self.lo, self.hi))
+    }
+
+    fn noisy(&self, clamped: f64, noise_scale: f64, rng: &mut impl Rng) -> f64 {
         let noisy = clamped + laplace_noise(noise_scale, rng);
         if self.clamp_output {
             noisy.clamp(self.lo, self.hi)
@@ -305,7 +368,7 @@ mod tests {
 
     fn apply(m: &LaplaceMechanism, value: SqlValue, rng: &mut StdRng) -> (SqlValue, MaskStats) {
         let mut stats = MaskStats::default();
-        let out = m.apply(value, rng, &mut stats);
+        let out = m.apply(value, rng, "test-secret", &mut stats);
         (out, stats)
     }
 
@@ -474,6 +537,42 @@ mod tests {
         }
         assert!(m.epsilon() <= 1.0);
         assert!(m.describe().contains("exact integer sampler"));
+    }
+
+    #[test]
+    fn test_consistent_noise_depends_only_on_value_column_and_secret() {
+        let mut exact = LaplaceMechanism::exact(1.0, 0.0, 100.0, 2, false)
+            .unwrap()
+            .with_consistent_noise();
+        exact.bind("users", "salary");
+        let mut float = LaplaceMechanism::new(1.0, 0.0, 100.0, 2, false).with_consistent_noise();
+        float.bind("users", "salary");
+
+        for m in [&exact, &float] {
+            let run = |m: &LaplaceMechanism, value: &str, secret: &str, seed: u64| {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let mut stats = MaskStats::default();
+                m.apply(SqlValue::Raw(value.into()), &mut rng, secret, &mut stats)
+            };
+            // The run's generator does not matter; the value, column and secret do.
+            assert_eq!(run(m, "42", "k", 1), run(m, "42", "k", 2));
+            assert_eq!(run(m, "42", "k", 1), run(m, "42.00", "k", 3));
+            assert_ne!(run(m, "42", "k", 1), run(m, "43", "k", 1));
+            assert_ne!(run(m, "42", "k", 1), run(m, "42", "other", 1));
+            // Values clamped to the same bound get the same noise.
+            assert_eq!(run(m, "500", "k", 1), run(m, "100", "k", 1));
+        }
+
+        let mut other = LaplaceMechanism::exact(1.0, 0.0, 100.0, 2, false)
+            .unwrap()
+            .with_consistent_noise();
+        other.bind("users", "bonus");
+        let mut rng = rng();
+        let mut stats = MaskStats::default();
+        let a = exact.apply(SqlValue::Raw("42".into()), &mut rng, "k", &mut stats);
+        let b = other.apply(SqlValue::Raw("42".into()), &mut rng, "k", &mut stats);
+        assert_ne!(a, b);
+        assert!(exact.describe().contains("consistent noise"));
     }
 
     #[test]

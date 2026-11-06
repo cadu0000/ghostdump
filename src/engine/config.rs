@@ -87,11 +87,12 @@ impl Config {
         for (table, table_config) in self.tables {
             let mut columns = Vec::with_capacity(table_config.columns.len());
             for column in table_config.columns {
-                let masker = column.strategy.compile().map_err(|message| ConfigError {
+                let mut masker = column.strategy.compile().map_err(|message| ConfigError {
                     table: table.clone(),
                     column: column.name.clone(),
                     message,
                 })?;
+                masker.bind(&table, &column.name);
                 columns.push(CompiledColumn {
                     name: column.name,
                     null_policy: column.null_policy,
