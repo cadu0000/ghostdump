@@ -233,6 +233,8 @@ cargo test -- --nocapture
 
 ```
 
+For reproducible experiments, the hidden `--seed <N>` option fixes every random choice (generated values and Laplace noise). Anyone who knows the seed can recompute them, so never use it on real data.
+
 ---
 
 ##  License
