@@ -247,6 +247,20 @@ For reproducible experiments, the hidden `--seed <N>` option fixes every random 
 
 ---
 
+##  Documentation
+
+| Page | Contents |
+| --- | --- |
+| [docs/guarantees.md](docs/guarantees.md) | What each strategy protects, under which conditions, and the propositions behind it |
+| [docs/experiments/utility.md](docs/experiments/utility.md) | Utility of masked dumps: local arms, SQL and estimator analysts, central-DP comparator (`scripts/utility_eval.py`) |
+| [docs/experiments/floating-point.md](docs/experiments/floating-point.md) | Floating-point distinguishing experiment on the Laplace samplers (`examples/fp_distinguisher.rs`) |
+| [docs/benchmarks.md](docs/benchmarks.md) | Microbenchmarks and end-to-end throughput and memory (`benches/`, `scripts/bench_grid.py`) |
+| [docs/decisions/0001-laplace-sampler.md](docs/decisions/0001-laplace-sampler.md) | Why the exact integer sampler, and why not OpenDP |
+| [docs/dataset-generation.md](docs/dataset-generation.md) | The seeded dataset generator and its rule sets |
+| [docs/future-work.md](docs/future-work.md) | Shuffling and other directions not taken |
+
+---
+
 ##  License
 
 This project is licensed under either of the following licenses, at your option:
