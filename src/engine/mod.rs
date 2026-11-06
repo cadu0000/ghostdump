@@ -11,9 +11,10 @@ use rand::rngs::StdRng;
 use std::collections::BTreeMap;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
+use std::thread;
 
 use crate::engine::config::{CompiledColumn, CompiledConfig};
-use crate::engine::sink::{MaskingPlan, SequentialSink, Sink};
+use crate::engine::sink::{MaskingPlan, ParallelSink, RowContext, SequentialSink, Sink};
 use crate::parser::state::{InsertFormat, SqlDialect};
 use crate::parser::{DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SqlEvent, SqlParser};
 
@@ -30,6 +31,10 @@ pub struct RunOptions {
     /// Seed for every random choice, for reproducible experiments. Anyone who
     /// knows it can recompute the generated values and the noise.
     pub seed: Option<u64>,
+    /// Threads that mask rows; the calling thread reads, parses and writes.
+    /// With 1, rows are masked on the calling thread. The output is the same
+    /// for any number, given a seed.
+    pub threads: usize,
 }
 
 impl RunOptions {
@@ -40,6 +45,7 @@ impl RunOptions {
             limit: None,
             max_row_bytes: DEFAULT_MAX_ROW_BYTES,
             seed: None,
+            threads: 1,
         }
     }
 }
@@ -159,8 +165,19 @@ impl AnonymizerEngine {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => StdRng::from_entropy(),
         };
-        let sink = SequentialSink::new(writer, rng, options.dialect, &self.secret);
-        self.run(input, sink, options)
+        let context = RowContext {
+            dialect: options.dialect,
+            secret: &self.secret,
+        };
+        // Without rules nothing is masked, so threads would only copy bytes.
+        if options.threads <= 1 || self.config.tables.is_empty() {
+            let sink = SequentialSink::new(writer, rng, context);
+            return self.run(input, sink, options);
+        }
+        thread::scope(|scope| {
+            let sink = ParallelSink::start(scope, options.threads, writer, rng, context);
+            self.run(input, sink, options)
+        })
     }
 
     /// Parses the input and sends every byte and row to `sink`.
@@ -608,5 +625,94 @@ mod tests {
     fn test_truncated_row_is_an_error() {
         let err = run(b"INSERT INTO t (a) VALUES (1), (2").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    const THREAD_RULES: &str = r#"
+        [tables.users]
+        columns = [
+            { name = "name", strategy = "faker_name" },
+            { name = "email", strategy = "hmac" },
+            { name = "age", strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 120.0], scale = 0 },
+            { name = "status", strategy = "randomized_response", epsilon = 1.0, categories = ["A", "B"] },
+        ]
+    "#;
+
+    /// Several segments of each kind: COPY, multi-row INSERT, a table
+    /// without rules and statements between them.
+    fn many_rows() -> Vec<u8> {
+        let mut dump = b"SET client_encoding = 'UTF8';\n".to_vec();
+        dump.extend_from_slice(b"COPY users (id, name, email, age, status) FROM stdin;\n");
+        for i in 0..3000 {
+            let line = format!("{i}\tName {i}\tu{i}@x.com\t{}\tA\n", i % 90);
+            dump.extend_from_slice(line.as_bytes());
+        }
+        dump.extend_from_slice(b"\\.\n\nINSERT INTO other (a) VALUES (1), (2);\n");
+        dump.extend_from_slice(b"INSERT INTO users (id, name, email, age, status) VALUES\n");
+        for i in 0..2500 {
+            let end = if i == 2499 { ";\n" } else { ",\n" };
+            let row = format!("({i}, 'N{i}', 'e{i}@x.com', {}, 'B'){end}", i % 70);
+            dump.extend_from_slice(row.as_bytes());
+        }
+        dump.extend_from_slice(b"COMMIT;\n");
+        dump
+    }
+
+    fn run_threads(
+        rules: &str,
+        input: &[u8],
+        threads: usize,
+        limit: Option<usize>,
+    ) -> (io::Result<RunReport>, Vec<u8>) {
+        let options = RunOptions {
+            seed: Some(11),
+            threads,
+            limit,
+            ..RunOptions::new(SqlDialect::Postgres)
+        };
+        let mut out = Vec::new();
+        let report = engine(rules).process_dump(input, &mut out, &options);
+        (report, out)
+    }
+
+    #[test]
+    fn test_output_is_the_same_for_any_number_of_threads() {
+        let input = many_rows();
+        let (report, expected) = run_threads(THREAD_RULES, &input, 1, None);
+        let report = report.unwrap();
+        assert_eq!(report.rows_masked, 5500);
+        assert_eq!(report.fields_masked, 4 * 5500);
+        assert!(!String::from_utf8_lossy(&expected).contains("Name 7\t"));
+        for threads in [2, 3, 8] {
+            let (parallel, out) = run_threads(THREAD_RULES, &input, threads, None);
+            assert_eq!(parallel.unwrap(), report, "{threads} threads");
+            assert!(out == expected, "{threads} threads");
+        }
+        for limit in [1, 1500, 4000] {
+            let (_, one) = run_threads(THREAD_RULES, &input, 1, Some(limit));
+            let (_, four) = run_threads(THREAD_RULES, &input, 4, Some(limit));
+            assert!(one == four, "limit {limit}");
+        }
+    }
+
+    #[test]
+    fn test_threads_without_rules_copy_the_input() {
+        let input = many_rows();
+        let (_, out) = run_threads("", &input, 4, None);
+        assert!(out == input);
+    }
+
+    #[test]
+    fn test_threads_stop_on_errors_after_writing_what_came_before() {
+        // The second data block has rules but no column list.
+        let mut input = many_rows();
+        input.extend_from_slice(b"INSERT INTO users VALUES (1, 'Ana');\n");
+        let (one, one_out) = run_threads(THREAD_RULES, &input, 1, None);
+        let (four, four_out) = run_threads(THREAD_RULES, &input, 4, None);
+        let (one, four) = (one.unwrap_err(), four.unwrap_err());
+        assert!(four.to_string().contains("no column list"), "{four}");
+        assert_eq!(one.to_string(), four.to_string());
+        assert!(one_out == four_out);
+        // Everything up to the refused block was written.
+        assert!(String::from_utf8_lossy(&four_out).contains("COMMIT"));
     }
 }

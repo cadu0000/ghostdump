@@ -39,6 +39,15 @@ pub struct MaskStats {
     pub outside_categories: usize,
 }
 
+impl MaskStats {
+    /// Adds the counters of another part of the run.
+    pub fn add(&mut self, other: &MaskStats) {
+        self.non_numeric += other.non_numeric;
+        self.masked_fields += other.masked_fields;
+        self.outside_categories += other.outside_categories;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Masker {
     Synthetic(Synthetic),
