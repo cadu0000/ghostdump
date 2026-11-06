@@ -63,4 +63,48 @@ Both are below 40%, so the chunked parser is **not** built for now: with rules, 
 
 ##  End-to-end runs
 
-See task #8: `scripts/bench.sh` runs the CLI over generated dumps of growing size and records throughput and peak memory in a CSV.
+`scripts/bench_grid.py` runs the release binary over generated dumps (`sql_generator.py`, seed 42) and writes one CSV row per run. Each dump is decompressed once, so gzip is not measured, and the output goes to `/dev/null`. Peak memory is `VmHWM`, polled from `/proc` while the process runs.
+
+```bash
+cargo build --release
+python3 scripts/bench_grid.py --sizes 100000,1000000 --runs 5 \
+    --baseline-binary path/to/old/ghostdump --out results.csv
+```
+
+Configurations:
+
+| Name | Rules |
+| --- | --- |
+| `no_rules` | none: a pass-through copy |
+| `hmac_only` | `hmac` on the four keys (`users.id`, `users.company_id`, `orders.id`, `orders.user_id`) |
+| `laplace_f64`, `laplace_exact` | `dp_laplace` on `users.salary`, with the sampler named |
+| `full` | the generated `rules.toml`: every rule of the dataset guide |
+
+`--baseline-binary` runs an older build with `no_rules` and with `full` written in its format (`sensitivity` instead of `bounds`).
+
+### Results (November 2026, reference machine above)
+
+Median of 5 runs after one warm-up; the raw runs are in [bench-results/2026-11-grid.csv](bench-results/2026-11-grid.csv). "Rows" counts data rows (users plus orders); "baseline" is the build of the first paper (`3849e9e`).
+
+**3,000,000 rows (1,000,000 users)**
+
+| Configuration | COPY rows/s | INSERT rows/s | Peak memory |
+| --- | --- | --- | --- |
+| `no_rules` | 1,687,000 | 868,000 | 5.7–5.8 MiB |
+| `hmac_only` | 572,000 | 360,000 | 5.7–5.9 MiB |
+| `laplace_f64` | 1,281,000 | 672,000 | 5.9–6.1 MiB |
+| `laplace_exact` | 1,218,000 | 642,000 | 5.7–5.8 MiB |
+| `full` | 418,000 | 290,000 | 5.7–5.8 MiB |
+| baseline, `no_rules` | 1,029,000 | 470,000 | 5.4 MiB |
+| baseline, `full` | 408,000 | 288,000 | 5.7 MiB |
+
+Findings:
+
+* **Memory stays flat.** Peak memory is the same, within 0.3 MiB, at 300,000 and at 3,000,000 rows, for every configuration: it does not grow with the dump.
+* **Pass-through copies are 1.6–1.8 times faster** than the first paper's build, which re-quoted every value; that build also changed the output, so its numbers are an upper bound for what it did.
+* **With every rule, throughput is the same as the first paper's build** (418,000 against 408,000 rows/s on COPY): the extra work (exact copy of unmasked bytes, typed values, fail-closed checks, compiled rules) costs nothing measurable.
+* **HMAC is the most expensive masker**, more than the Laplace samplers: four HMAC columns cost three times the time of one `dp_laplace` column.
+* **The exact sampler costs 5% on COPY and 4% on INSERT** against the `f64` one, with one `dp_laplace` column; the cost of exact sampling is small next to the rest of the pipeline.
+* The first paper reported about 307,000 rows/s and 4.7 MB with its rules on another machine; the numbers here are not directly comparable to it, only to each other.
+
+Larger sizes (10^7 and 10^8 users) run with the same command; they were not measured on this machine because generating and running them takes hours.
