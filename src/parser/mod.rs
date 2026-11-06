@@ -201,7 +201,11 @@ mod tests {
 
     fn assert_passes_through(dialect: SqlDialect, sql: &[u8]) {
         let (out, opened) = passthrough(dialect, sql);
-        assert!(!opened, "a data block was opened in {:?}", String::from_utf8_lossy(sql));
+        assert!(
+            !opened,
+            "a data block was opened in {:?}",
+            String::from_utf8_lossy(sql)
+        );
         assert_eq!(String::from_utf8_lossy(&out), String::from_utf8_lossy(sql));
     }
 
@@ -239,7 +243,9 @@ mod tests {
             match parser.handle_byte(byte) {
                 Some(SqlEvent::DefaultStatement(b)) => push_bytes(&mut seen, &[b]),
                 Some(SqlEvent::Passthrough(bytes)) => push_bytes(&mut seen, &bytes),
-                Some(SqlEvent::Header { raw_bytes, .. }) => seen.push(Seen::Header(text(&raw_bytes))),
+                Some(SqlEvent::Header { raw_bytes, .. }) => {
+                    seen.push(Seen::Header(text(&raw_bytes)))
+                }
                 Some(SqlEvent::Tuple(row, _)) => seen.push(Seen::Tuple(text(&row))),
                 Some(SqlEvent::Footer(bytes)) => seen.push(Seen::Footer(text(&bytes))),
                 Some(SqlEvent::Error(e)) => panic!("unexpected error: {e}"),
@@ -305,7 +311,9 @@ mod tests {
         let mut out = String::new();
         for item in &seen {
             match item {
-                Seen::Bytes(s) | Seen::Header(s) | Seen::Tuple(s) | Seen::Footer(s) => out.push_str(s),
+                Seen::Bytes(s) | Seen::Header(s) | Seen::Tuple(s) | Seen::Footer(s) => {
+                    out.push_str(s)
+                }
             }
         }
         if let Remainder::Bytes(rest) = rest {
@@ -327,7 +335,10 @@ mod tests {
         assert_eq!(seen[3], tuple("('x')"));
 
         // MySQL: the backslash escapes the quote.
-        let (seen, _) = parse(SqlDialect::Mysql, b"INSERT INTO t (a) VALUES ('it\\'s)'), ('x');");
+        let (seen, _) = parse(
+            SqlDialect::Mysql,
+            b"INSERT INTO t (a) VALUES ('it\\'s)'), ('x');",
+        );
         assert_eq!(seen[1], tuple("('it\\'s)')"));
     }
 
@@ -421,7 +432,10 @@ mod tests {
     fn test_comments_pass_through_unchanged() {
         let sql = b"-- INSERT INTO fake VALUES (1);\n/* COPY fake FROM stdin; ' */\nSELECT 1;\n";
         assert_passes_through(SqlDialect::Postgres, sql);
-        assert_passes_through(SqlDialect::Mysql, b"# INSERT INTO t VALUES (1);\nSELECT 1;\n");
+        assert_passes_through(
+            SqlDialect::Mysql,
+            b"# INSERT INTO t VALUES (1);\nSELECT 1;\n",
+        );
     }
 
     #[test]
