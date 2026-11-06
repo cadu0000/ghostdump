@@ -1,7 +1,6 @@
 //! Maskers compiled from the rules file: validated, with their parameters
 //! precomputed, and able to say which guarantee they offer.
 
-use cpf_cnpj::{cnpj, cpf};
 use fake::Fake;
 use fake::faker::internet::en::{IPv4, SafeEmail};
 use fake::faker::name::en::Name;
@@ -10,7 +9,7 @@ use rand::Rng;
 use rand::distributions::Alphanumeric;
 use rand::seq::SliceRandom;
 use sha2::Sha256;
-use uuid::Uuid;
+use uuid::Builder;
 
 use crate::codec::SqlValue;
 
@@ -110,16 +109,20 @@ impl Masker {
 }
 
 impl Synthetic {
+    /// Every generator draws from `rng`, so a seeded run is reproducible.
     fn generate(&self, rng: &mut impl Rng) -> String {
         match self {
-            Synthetic::FakerName => Name().fake::<String>(),
-            Synthetic::FakerEmail => SafeEmail().fake::<String>(),
-            Synthetic::Ipv4 => IPv4().fake::<String>(),
-            Synthetic::Uuid => Uuid::new_v4().to_string(),
+            Synthetic::FakerName => Name().fake_with_rng::<String, _>(rng),
+            Synthetic::FakerEmail => SafeEmail().fake_with_rng::<String, _>(rng),
+            Synthetic::Ipv4 => IPv4().fake_with_rng::<String, _>(rng),
+            // Version 4 and the RFC 4122 variant are set over 16 random bytes.
+            Synthetic::Uuid => Builder::from_random_bytes(rng.r#gen())
+                .into_uuid()
+                .to_string(),
             Synthetic::CreditCard => generate_fake_credit_card(rng),
             Synthetic::PhoneBr => generate_fake_phone_br(rng),
-            Synthetic::Cpf => cpf::generate(),
-            Synthetic::Cnpj => cnpj::generate(),
+            Synthetic::Cpf => generate_cpf(rng),
+            Synthetic::Cnpj => generate_cnpj(rng),
             Synthetic::Fixed(value) => value.clone(),
             Synthetic::Choice(options) => options.choose(rng).cloned().unwrap_or_default(),
             Synthetic::Alphanumeric(length) => rng
@@ -228,6 +231,62 @@ pub fn generate_fake_phone_br(rng: &mut impl Rng) -> String {
         rng.gen_range(0..=9999),
         rng.gen_range(0..=9999)
     )
+}
+
+/// A random valid CPF: nine digits and two check digits (mod 11).
+pub fn generate_cpf(rng: &mut impl Rng) -> String {
+    loop {
+        let mut digits: Vec<u32> = (0..9).map(|_| rng.gen_range(0..10)).collect();
+        // Nine equal digits pass the check digits but are not valid CPFs.
+        if digits.iter().all(|&digit| digit == digits[0]) {
+            continue;
+        }
+        for len in [9, 10] {
+            // Weights 10..2 for the first check digit, 11..2 for the second.
+            let sum: u32 = digits
+                .iter()
+                .zip((2..=len + 1).rev())
+                .map(|(digit, weight)| digit * weight)
+                .sum();
+            digits.push(check_digit(sum));
+        }
+        return to_text(&digits);
+    }
+}
+
+/// A random valid CNPJ: twelve digits and two check digits (mod 11).
+pub fn generate_cnpj(rng: &mut impl Rng) -> String {
+    loop {
+        let mut digits: Vec<u32> = (0..12).map(|_| rng.gen_range(0..10)).collect();
+        if digits.iter().all(|&digit| digit == digits[0]) {
+            continue;
+        }
+        for _ in 0..2 {
+            // Weights 2..9, repeated, from the rightmost digit.
+            let sum: u32 = digits
+                .iter()
+                .rev()
+                .zip((2..=9).cycle())
+                .map(|(digit, weight)| digit * weight)
+                .sum();
+            digits.push(check_digit(sum));
+        }
+        return to_text(&digits);
+    }
+}
+
+fn check_digit(sum: u32) -> u32 {
+    match sum % 11 {
+        0 | 1 => 0,
+        rest => 11 - rest,
+    }
+}
+
+fn to_text(digits: &[u32]) -> String {
+    digits
+        .iter()
+        .map(|&digit| char::from_digit(digit, 10).expect("a decimal digit"))
+        .collect()
 }
 
 pub fn hmac_hash(val: &str, secret: &str) -> String {
@@ -357,7 +416,8 @@ mod tests {
 
     #[test]
     fn test_synthetic_generators() {
-        assert!(Uuid::parse_str(&generate(Synthetic::Uuid)).is_ok());
+        let uuid = uuid::Uuid::parse_str(&generate(Synthetic::Uuid)).unwrap();
+        assert_eq!(uuid.get_version_num(), 4);
         assert_eq!(generate(Synthetic::Cpf).len(), 11);
         assert_eq!(generate(Synthetic::Cnpj).len(), 14);
         assert_eq!(generate(Synthetic::CreditCard).matches('-').count(), 3);
@@ -366,6 +426,31 @@ mod tests {
         assert_eq!(generate(Synthetic::Fixed("X".into())), "X");
         let choice = generate(Synthetic::Choice(vec!["A".into(), "B".into()]));
         assert!(choice == "A" || choice == "B");
+    }
+
+    #[test]
+    fn test_generators_are_reproducible_with_a_seed() {
+        for kind in [
+            Synthetic::FakerName,
+            Synthetic::FakerEmail,
+            Synthetic::Ipv4,
+            Synthetic::Uuid,
+            Synthetic::Cpf,
+            Synthetic::Cnpj,
+        ] {
+            assert_eq!(generate(kind.clone()), generate(kind));
+        }
+    }
+
+    #[test]
+    fn test_generated_documents_are_valid() {
+        let mut rng = rng();
+        for _ in 0..200 {
+            let cpf = generate_cpf(&mut rng);
+            assert!(cpf_cnpj::cpf::validate(&cpf), "{cpf}");
+            let cnpj = generate_cnpj(&mut rng);
+            assert!(cpf_cnpj::cnpj::validate(&cnpj), "{cnpj}");
+        }
     }
 
     #[test]
