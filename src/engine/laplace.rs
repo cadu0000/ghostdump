@@ -233,12 +233,24 @@ fn bernoulli(num: u128, den: u128, rng: &mut impl Rng) -> bool {
 
 /// Bernoulli(exp(-num / den)) for 0 <= num / den <= 1 (Canonne, Kamath and
 /// Steinke, 2020, algorithm 1). Only integer comparisons are involved.
-fn bernoulli_exp_le1(num: u128, den: u128, rng: &mut impl Rng) -> bool {
+pub(crate) fn bernoulli_exp_le1(num: u128, den: u128, rng: &mut impl Rng) -> bool {
     let mut k: u128 = 1;
     while bernoulli(num, den * k, rng) {
         k += 1;
     }
     k % 2 == 1
+}
+
+/// Bernoulli(exp(-num / den)) for any num / den >= 0, exactly: exp(-γ) is
+/// the product of exp(-1) for each unit of γ and exp(-frac(γ)) (Canonne,
+/// Kamath and Steinke, 2020).
+pub(crate) fn bernoulli_exp(num: u128, den: u128, rng: &mut impl Rng) -> bool {
+    for _ in 0..num / den {
+        if !bernoulli_exp_le1(1, 1, rng) {
+            return false;
+        }
+    }
+    bernoulli_exp_le1(num % den, den, rng)
 }
 
 /// A sample of the discrete Laplace distribution with parameter `t`:

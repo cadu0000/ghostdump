@@ -3,6 +3,7 @@
 
 use serde::Deserialize;
 
+use crate::engine::categorical::RandomizedResponse;
 use crate::engine::laplace::{LaplaceMechanism, max_f64_scale};
 use crate::engine::mask::{Masker, Synthetic};
 
@@ -50,6 +51,11 @@ pub enum StrategyConfig {
     RandomString {
         length: usize,
     },
+    /// k-ary randomized response over the declared categories.
+    RandomizedResponse {
+        epsilon: f64,
+        categories: Vec<String>,
+    },
 }
 
 /// `exact` (the default) samples on integers with no floating-point step;
@@ -90,6 +96,13 @@ impl StrategyConfig {
                 }
                 synthetic(Synthetic::Alphanumeric(*length))
             }
+            StrategyConfig::RandomizedResponse {
+                epsilon,
+                categories,
+            } => Ok(Masker::RandomizedResponse(RandomizedResponse::new(
+                *epsilon,
+                categories.clone(),
+            )?)),
             StrategyConfig::DpLaplace {
                 epsilon,
                 bounds,
@@ -207,6 +220,7 @@ mod tests {
             r#"strategy = "fixed", value = "x""#,
             r#"strategy = "random_choice", options = ["a"]"#,
             r#"strategy = "random_string", length = 4"#,
+            r#"strategy = "randomized_response", epsilon = 1.0, categories = ["A", "B"]"#,
             r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2"#,
             r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2, mechanism = "f64""#,
         ] {

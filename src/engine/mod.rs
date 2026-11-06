@@ -1,3 +1,4 @@
+pub mod categorical;
 pub mod config;
 pub mod laplace;
 pub mod mask;
@@ -52,6 +53,9 @@ pub struct RunReport {
     /// Values of `dp_laplace` columns that were not numbers. They were
     /// treated as the midpoint of their bounds, so the guarantee holds.
     pub non_numeric_dp_values: usize,
+    /// Values of `randomized_response` columns that were not among their
+    /// categories. They were replaced by a uniformly random category.
+    pub values_outside_categories: usize,
     /// Bytes read from the input.
     pub bytes_read: u64,
     /// Data statements (`INSERT`, `REPLACE`, `COPY`) seen.
@@ -311,10 +315,18 @@ impl AnonymizerEngine {
                 stats.non_numeric
             );
         }
+        if stats.outside_categories > 0 {
+            warn!(
+                "{} value(s) of randomized_response columns were not among their categories; \
+                 they were replaced by a uniformly random category",
+                stats.outside_categories
+            );
+        }
         Ok(RunReport {
             rows_processed,
             unterminated_data_block,
             non_numeric_dp_values: stats.non_numeric,
+            values_outside_categories: stats.outside_categories,
             bytes_read: bytes_read_total,
             data_blocks,
             rows_masked,
