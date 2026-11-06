@@ -153,6 +153,8 @@ Each value is clamped to `bounds = [lo, hi]` and receives Laplace noise of scale
 
 The noise is drawn by an exact sampler on integers (`mechanism = "exact"`, the default): values are handled in units of `scale` and no floating-point operation takes part, so the output carries no low-order artifacts. `mechanism = "f64"` selects the floating-point sampler, about 15 times cheaper per value but vulnerable to attacks on the low-order bits; it is kept to measure the cost of exact sampling. Bounds times 10^scale must stay below 2^53. See [docs/decisions/0001-laplace-sampler.md](docs/decisions/0001-laplace-sampler.md) for the reasons, including why OpenDP is not used.
 
+`consistent = true` draws the noise of each value from a keyed PRF (HMAC-SHA256 of the secret, the column and the clamped value) instead of the run's random generator. The same value in the same column then gets the same noisy output in every row and in every run. Repeated dumps no longer let anyone average the noise away (T releases cost ε, not T·ε), and a person whose value repeats in several rows spends ε once. The price: equal values produce equal outputs, which reveals which rows share a value, as `hmac` does. The guarantee becomes computational: it rests on the secret staying secret. Consistent noise needs the secret.
+
 ### 2. The Cryptographic Secret
 
 The secret key used to generate deterministic HMAC hashes. For security reasons, **never commit this to the repository**. It can be provided via CLI argument or environment variable:
