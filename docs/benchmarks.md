@@ -103,8 +103,8 @@ Findings:
 * **Memory stays flat.** Peak memory is the same, within 0.3 MiB, at 300,000 and at 3,000,000 rows, for every configuration: it does not grow with the dump.
 * **Pass-through copies are 1.6–1.8 times faster** than the first paper's build, which re-quoted every value; that build also changed the output, so its numbers are an upper bound for what it did.
 * **With every rule, throughput is the same as the first paper's build** (418,000 against 408,000 rows/s on COPY): the extra work (exact copy of unmasked bytes, typed values, fail-closed checks, compiled rules) costs nothing measurable.
-* **HMAC is the most expensive masker**, more than the Laplace samplers: four HMAC columns cost three times the time of one `dp_laplace` column.
-* **The exact sampler costs 5% on COPY and 4% on INSERT** against the `f64` one, with one `dp_laplace` column; the cost of exact sampling is small next to the rest of the pipeline.
+* **Per column, HMAC is the most expensive masker.** On COPY, the four HMAC columns add 3.5 s to the pass-through time (about 0.9 s each), while one `dp_laplace` column adds 0.56 s (`f64`) or 0.69 s (exact).
+* **The exact sampler costs about 5% end to end** (5.2% on COPY, 4.7% on INSERT) against the `f64` one, with one `dp_laplace` column; the cost of exact sampling is small next to the rest of the pipeline.
 * The first paper reported about 307,000 rows/s and 4.7 MB with its rules on another machine; the numbers here are not directly comparable to it, only to each other.
 
 Larger sizes (10^7 and 10^8 users) run with the same command; they were not measured on this machine because generating and running them takes hours.
