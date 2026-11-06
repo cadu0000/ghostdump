@@ -36,7 +36,8 @@ SCHEMA = {
                 "anon": {
                     "strategy": "dp_laplace",
                     "epsilon": 0.5,
-                    "sensitivity": 15000.0,
+                    "bounds": [0.0, 10000.0],
+                    "scale": 2,
                 },
             },
         ],
@@ -137,7 +138,9 @@ def generate_toml(filepath):
                     if isinstance(value, str):
                         f.write(f'  {key} = "{value}"\n')
                     elif isinstance(value, list):
-                        options = ", ".join(f'"{v}"' for v in value)
+                        options = ", ".join(
+                            f'"{v}"' if isinstance(v, str) else str(v) for v in value
+                        )
                         f.write(f"  {key} = [{options}]\n")
                     else:
                         f.write(f"  {key} = {value}\n")
