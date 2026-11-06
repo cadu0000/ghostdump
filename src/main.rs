@@ -2,14 +2,13 @@ use ghostdump::cli::{
     Args, DialectArg, MIN_SECRET_BYTES, SecretError, SecretLength, check_secret,
 };
 use ghostdump::engine::{AnonymizerEngine, RunOptions};
-use ghostdump::engine::config::Config;
+use ghostdump::engine::config::{CompiledConfig, Config};
 use ghostdump::io::{InputSource, OutputSource};
 use ghostdump::parser::detect_dialect;
 use ghostdump::parser::state::SqlDialect;
 
 use clap::Parser as ClapParser;
 use log::{Level, LevelFilter, debug, error, info, warn};
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::time::Instant;
 
@@ -25,6 +24,10 @@ fn main() {
             let config = Config::load_from_file(path).unwrap_or_else(|e| {
                 fatal(&format!("could not load the rules file: {}", e));
             });
+            // Every rule is checked before any data is read.
+            let config = config
+                .compile()
+                .unwrap_or_else(|e| fatal(&format!("invalid rule in {}: {}", path.display(), e)));
             debug!(
                 "loaded rules for {} table(s) from {}",
                 config.tables.len(),
@@ -36,9 +39,7 @@ fn main() {
             info!(
                 "No rules (-c) provided. GhostDump will perform an exact copy of the original data."
             );
-            Config {
-                tables: HashMap::new(),
-            }
+            CompiledConfig::empty()
         }
     };
 

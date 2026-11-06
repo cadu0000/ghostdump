@@ -1,4 +1,5 @@
 pub mod config;
+pub mod mask;
 pub mod strategy;
 
 use log::{debug, warn};
@@ -7,7 +8,8 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
 
 use crate::codec::{self, FieldMasker, SqlValue};
-use crate::engine::config::{ColumnConfig, Config, NullPolicy};
+use crate::engine::config::{CompiledColumn, CompiledConfig, NullPolicy};
+use crate::engine::mask::MaskStats;
 use crate::parser::state::{InsertFormat, SqlDialect};
 use crate::parser::{DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SqlEvent, SqlParser};
 
@@ -40,18 +42,26 @@ pub struct RunReport {
     pub rows_processed: usize,
     /// The input ended inside a data block, before its terminator.
     pub unterminated_data_block: bool,
+    /// Values of `dp_laplace` columns that were not numbers. They were
+    /// treated as the midpoint of their bounds, so the guarantee holds.
+    pub non_numeric_dp_values: usize,
 }
 
 /// For each position in a data block's column list, the masked column there, if any.
-type MaskingPlan<'a> = Vec<Option<&'a ColumnConfig>>;
+type MaskingPlan<'a> = Vec<Option<&'a CompiledColumn>>;
 
 pub struct AnonymizerEngine {
-    config: Config,
+    config: CompiledConfig,
     secret: String,
 }
 
 impl AnonymizerEngine {
-    pub fn new(config: Config, secret: String) -> Self {
+    pub fn new(config: CompiledConfig, secret: String) -> Self {
+        for (table, columns) in &config.tables {
+            for column in columns {
+                debug!("rule `{table}.{}`: {}", column.name, column.masker.describe());
+            }
+        }
         Self { config, secret }
     }
 
@@ -63,7 +73,7 @@ impl AnonymizerEngine {
 
         let plan: MaskingPlan = columns
             .iter()
-            .map(|name| table.columns.iter().find(|c| c.name == *name))
+            .map(|name| table.iter().find(|c| c.name == *name))
             .collect();
         plan.iter().any(Option::is_some).then_some(plan)
     }
@@ -136,6 +146,7 @@ impl AnonymizerEngine {
         let mut reached_limit = false;
         let mut unterminated_data_block = false;
 
+        let mut stats = MaskStats::default();
         let mut plan: Option<MaskingPlan> = None;
         let mut plan_metadata: Option<Arc<HeaderMetadata>> = None;
         let mut row_buffer = Vec::with_capacity(1024);
@@ -185,6 +196,7 @@ impl AnonymizerEngine {
                                     columns,
                                     rng: &mut rng,
                                     secret: &self.secret,
+                                    stats: &mut stats,
                                 };
                                 // Build the row in memory: one write instead of one per piece.
                                 row_buffer.clear();
@@ -245,9 +257,18 @@ impl AnonymizerEngine {
         }
 
         writer.flush()?;
+        if stats.non_numeric > 0 {
+            // One warning per run, without the values.
+            warn!(
+                "{} value(s) of dp_laplace columns were not numbers; they were treated as \
+                 the midpoint of their bounds",
+                stats.non_numeric
+            );
+        }
         Ok(RunReport {
             rows_processed,
             unterminated_data_block,
+            non_numeric_dp_values: stats.non_numeric,
         })
     }
 }
@@ -268,9 +289,10 @@ fn preview(header: &[u8]) -> String {
 }
 
 struct RowMasker<'a, R> {
-    columns: &'a [Option<&'a ColumnConfig>],
+    columns: &'a [Option<&'a CompiledColumn>],
     rng: &'a mut R,
     secret: &'a str,
+    stats: &'a mut MaskStats,
 }
 
 impl<R: Rng> FieldMasker for RowMasker<'_, R> {
@@ -285,13 +307,15 @@ impl<R: Rng> FieldMasker for RowMasker<'_, R> {
         if value.is_null() && config.null_policy == NullPolicy::Keep {
             return SqlValue::Null;
         }
-        config.strategy.apply(value, self.rng, self.secret)
+        config
+            .masker
+            .apply(value, self.rng, self.secret, self.stats)
     }
 }
 
 /// Logs which columns of a data block are masked. Only schema names are
 /// logged, never values.
-fn log_masking_plan(metadata: &HeaderMetadata, plan: Option<&[Option<&ColumnConfig>]>) {
+fn log_masking_plan(metadata: &HeaderMetadata, plan: Option<&[Option<&CompiledColumn>]>) {
     if !log::log_enabled!(log::Level::Debug) {
         return;
     }
@@ -311,15 +335,13 @@ fn log_masking_plan(metadata: &HeaderMetadata, plan: Option<&[Option<&ColumnConf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::engine::config::Config;
 
     fn engine(rules: &str) -> AnonymizerEngine {
         let config = if rules.is_empty() {
-            Config {
-                tables: HashMap::new(),
-            }
+            CompiledConfig::empty()
         } else {
-            toml::from_str(rules).unwrap()
+            toml::from_str::<Config>(rules).unwrap().compile().unwrap()
         };
         AnonymizerEngine::new(config, "test-secret-0123456789".into())
     }
@@ -339,7 +361,7 @@ mod tests {
         [tables.users]
         columns = [
             { name = "name", strategy = "fixed", value = "O'Conner" },
-            { name = "age", strategy = "dp_laplace", epsilon = 1.0, sensitivity = 1.0 },
+            { name = "age", strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 120.0], scale = 0 },
             { name = "secret", strategy = "nullify" },
         ]
     "#;
