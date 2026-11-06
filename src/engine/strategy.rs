@@ -3,7 +3,8 @@
 
 use serde::Deserialize;
 
-use crate::engine::laplace::LaplaceMechanism;
+use crate::engine::categorical::RandomizedResponse;
+use crate::engine::laplace::{LaplaceMechanism, max_f64_scale};
 use crate::engine::mask::{Masker, Synthetic};
 
 /// Most decimal places `dp_laplace` accepts in `scale`.
@@ -50,6 +51,11 @@ pub enum StrategyConfig {
     RandomString {
         length: usize,
     },
+    /// k-ary randomized response over the declared categories.
+    RandomizedResponse {
+        epsilon: f64,
+        categories: Vec<String>,
+    },
 }
 
 /// `exact` (the default) samples on integers with no floating-point step;
@@ -90,6 +96,13 @@ impl StrategyConfig {
                 }
                 synthetic(Synthetic::Alphanumeric(*length))
             }
+            StrategyConfig::RandomizedResponse {
+                epsilon,
+                categories,
+            } => Ok(Masker::RandomizedResponse(RandomizedResponse::new(
+                *epsilon,
+                categories.clone(),
+            )?)),
             StrategyConfig::DpLaplace {
                 epsilon,
                 bounds,
@@ -153,6 +166,18 @@ fn compile_laplace(
         return Err(format!("`scale` must be at most {MAX_SCALE}"));
     }
 
+    if sampler == LaplaceSampler::F64 {
+        let max = max_f64_scale(epsilon, lo, hi);
+        if scale > max {
+            return Err(format!(
+                "with mechanism = \"f64\", `scale` must be at most {max} for these bounds and \
+                 epsilon: finer output keeps the low-order bits of the floating-point noise, \
+                 which reveal the input (see docs/experiments/floating-point.md). Lower \
+                 `scale` or use the exact sampler"
+            ));
+        }
+    }
+
     let decimals = scale as usize;
     let mechanism = match sampler {
         LaplaceSampler::Exact => LaplaceMechanism::exact(epsilon, lo, hi, decimals, clamp_output)?,
@@ -195,6 +220,7 @@ mod tests {
             r#"strategy = "fixed", value = "x""#,
             r#"strategy = "random_choice", options = ["a"]"#,
             r#"strategy = "random_string", length = 4"#,
+            r#"strategy = "randomized_response", epsilon = 1.0, categories = ["A", "B"]"#,
             r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2"#,
             r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2, mechanism = "f64""#,
         ] {
@@ -245,6 +271,21 @@ mod tests {
         assert!(m.describe().contains("exact integer sampler"));
         let too_fine = r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 1e12], scale = 6"#;
         assert!(compile(too_fine).unwrap_err().contains("2^53"));
+    }
+
+    #[test]
+    fn test_f64_sampler_rejects_scales_that_expose_float_bits() {
+        let with_scale = |scale: u32, mechanism: &str| {
+            compile(&format!(
+                r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 100000.0], scale = {scale}, mechanism = "{mechanism}""#
+            ))
+        };
+        assert!(with_scale(6, "f64").is_ok());
+        let err = with_scale(12, "f64").unwrap_err();
+        assert!(err.contains("at most 6"), "{err}");
+        // The exact sampler has no floating-point bits to expose.
+        assert!(with_scale(6, "exact").is_ok());
+        assert_eq!(max_f64_scale(1.0, 0.0, 100_000.0), 6);
     }
 
     #[test]

@@ -55,6 +55,7 @@ This approach enables:
 * **Single-pass processing**: The SQL dump is parsed only once.
 * **High composability**: Easy integration with other Unix tools (`zcat`, `gzip`).
 * **Lazy masking strategies**: Transformations are applied only to mapped columns.
+* **Parallel masking** (`--threads N`): the reader groups rows into segments of at most 1,024 masked rows, N threads mask them, and the writer puts them back in input order. At most 2N segments are in flight, so memory stays bounded, and a seeded run writes the same output for any N.
 
 ---
 
@@ -113,7 +114,7 @@ GhostDump is currently under active development. The core parsing engine is func
 * [x] **UX & Metrics**: Real-time progress metrics (`-p`, `indicatif`) and an end-of-run summary (rows, masked fields, MiB/s).
 * [x] **Structured Logging**: Verbose debug mode (`--verbose`) and `GHOSTDUMP_LOG`.
 * [x] **Edge Cases**: Advanced handling of `NULL` values (`null_policy`).
-* [ ] **Parallel Processing**: Multi-threading for the masking step.
+* [x] **Parallel Processing**: Masking on a pool of threads (`--threads`), with the output in input order.
 
 ---
 
@@ -145,15 +146,19 @@ columns = [
 
 Only the declared columns are rewritten; every other byte of the dump, including the layout of `INSERT` statements and `COPY` blocks, is copied unchanged. Values keep their SQL type: numbers stay unquoted, generated text is escaped for the dialect, and `NULL` stays `NULL` by default. Add `null_policy = "generate"` to a column to mask `NULL` values too.
 
-Rules are checked before any data is read: a rule with a missing or invalid parameter stops GhostDump with a message that names the table and column.
+Rules are checked before any data is read: a rule with a missing or invalid parameter stops GhostDump with a message that names the table and column. Then GhostDump prints, on stderr, what the rules guarantee for each table: the ε a row spends over its `dp_laplace` columns, and which columns are 0-LDP or only pseudonymized.
 
 #### `dp_laplace`
 
 Each value is clamped to `bounds = [lo, hi]` and receives Laplace noise of scale `(hi - lo) / epsilon`, so every published value is ε-differentially private on its own (local differential privacy). The bounds must be chosen from knowledge of the domain, not from the data: values outside them lose accuracy, and bounds wider than needed add noise. `scale` fixes the number of decimal places written, so the output never reveals the precision of the input. `clamp_output = true` also keeps the noisy values inside the bounds (no negative salaries), at the cost of a bias near the edges. Values that are not numbers are treated as the midpoint of the bounds, never written as they are. The privacy budget adds up: a row with two `dp_laplace` columns spends the sum of their epsilons, and a person with several rows spends it once per row.
 
-The noise is drawn by an exact sampler on integers (`mechanism = "exact"`, the default): values are handled in units of `scale` and no floating-point operation takes part, so the output carries no low-order artifacts. `mechanism = "f64"` selects the floating-point sampler, about 15 times cheaper per value but vulnerable to attacks on the low-order bits; it is kept to measure the cost of exact sampling. Bounds times 10^scale must stay below 2^53. See [docs/decisions/0001-laplace-sampler.md](docs/decisions/0001-laplace-sampler.md) for the reasons, including why OpenDP is not used.
+The noise is drawn by an exact sampler on integers (`mechanism = "exact"`, the default): values are handled in units of `scale` and no floating-point operation takes part, so the output carries no low-order artifacts. `mechanism = "f64"` selects the floating-point sampler, about 15 times cheaper per value but vulnerable to attacks on the low-order bits; it is kept to measure the cost of exact sampling, and rejects a `scale` fine enough to expose the low-order bits of its noise. Bounds times 10^scale must stay below 2^53. See [docs/decisions/0001-laplace-sampler.md](docs/decisions/0001-laplace-sampler.md) for the reasons, including why OpenDP is not used.
 
 `consistent = true` draws the noise of each value from a keyed PRF (HMAC-SHA256 of the secret, the column and the clamped value) instead of the run's random generator. The same value in the same column then gets the same noisy output in every row and in every run. Repeated dumps no longer let anyone average the noise away (T releases cost ε, not T·ε), and a person whose value repeats in several rows spends ε once. The price: equal values produce equal outputs, which reveals which rows share a value, as `hmac` does. The guarantee becomes computational: it rests on the secret staying secret. Consistent noise needs the secret.
+
+#### `randomized_response`
+
+For categorical columns, `{ name = "status", strategy = "randomized_response", epsilon = 1.0, categories = ["ACTIVE", "PENDING", "INACTIVE"] }` keeps the true category with probability e^ε/(e^ε + k − 1) and otherwise writes another declared category, so each value is ε-differentially private on its own. Values outside the categories are replaced by a uniformly random category and counted in a warning. Unlike `random_choice`, which erases the distribution, the share of each category can be estimated without bias from the masked dump with (observed − q)/(p − q), where q = 1/(e^ε + k − 1); see [docs/experiments/utility.md](docs/experiments/utility.md). Sampling uses integer arithmetic only.
 
 ### 2. The Cryptographic Secret
 
@@ -218,6 +223,7 @@ zcat production_db.sql.gz | ghostdump -c rules.toml | gzip > dev_db_anon.sql.gz
 | `-l` | `--limit <ROWS>` | Stop after N data rows, closing the statement they belong to. Statements after that point (such as a final `COMMIT`) are not written. |
 | | `--dialect <NAME>` | `auto` (default), `postgres`, `mysql` or `sqlite`. |
 | | `--max-row-size <MiB>` | Largest data row accepted (default 256). |
+| `-j` | `--threads <N>` | Threads that mask rows (default 1). Reading, parsing and writing stay on one thread; the output is the same for any number of threads. See [benchmarks](docs/benchmarks.md) for the speedup. |
 
 ---
 
@@ -243,7 +249,7 @@ Continuous integration (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `c
 
 The statistical validation of the Laplace samplers is slow and ignored by default; run it with `cargo test --release -- --ignored`.
 
-For reproducible experiments, the hidden `--seed <N>` option fixes every random choice (generated values and Laplace noise). Anyone who knows the seed can recompute them, so never use it on real data.
+For reproducible experiments, the hidden `--seed <N>` option fixes every random choice (generated values and Laplace noise). Anyone who knows the seed can recompute them, so never use it on real data. A seeded run writes the same output for any `--threads`.
 
 ---
 
@@ -254,8 +260,9 @@ For reproducible experiments, the hidden `--seed <N>` option fixes every random 
 | [docs/guarantees.md](docs/guarantees.md) | What each strategy protects, under which conditions, and the propositions behind it |
 | [docs/experiments/utility.md](docs/experiments/utility.md) | Utility of masked dumps: local arms, SQL and estimator analysts, central-DP comparator (`scripts/utility_eval.py`) |
 | [docs/experiments/floating-point.md](docs/experiments/floating-point.md) | Floating-point distinguishing experiment on the Laplace samplers (`examples/fp_distinguisher.rs`) |
-| [docs/benchmarks.md](docs/benchmarks.md) | Microbenchmarks and end-to-end throughput and memory (`benches/`, `scripts/bench_grid.py`) |
+| [docs/benchmarks.md](docs/benchmarks.md) | Microbenchmarks, end-to-end throughput and memory, and parallel masking (`benches/`, `scripts/bench_grid.py`) |
 | [docs/decisions/0001-laplace-sampler.md](docs/decisions/0001-laplace-sampler.md) | Why the exact integer sampler, and why not OpenDP |
+| [docs/decisions/0002-parallel-masking.md](docs/decisions/0002-parallel-masking.md) | How `--threads` keeps the output ordered, reproducible and in bounded memory, and why mimalloc |
 | [docs/dataset-generation.md](docs/dataset-generation.md) | The seeded dataset generator and its rule sets |
 | [docs/future-work.md](docs/future-work.md) | Shuffling and other directions not taken |
 

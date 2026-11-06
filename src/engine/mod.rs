@@ -1,18 +1,20 @@
+pub mod categorical;
 pub mod config;
 pub mod laplace;
 pub mod mask;
+pub mod sink;
 pub mod strategy;
 
 use log::{debug, warn};
+use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use std::collections::BTreeMap;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
+use std::thread;
 
-use crate::codec::{self, FieldMasker, SqlValue};
-use crate::engine::config::{CompiledColumn, CompiledConfig, NullPolicy};
-use crate::engine::mask::MaskStats;
+use crate::engine::config::{CompiledColumn, CompiledConfig};
+use crate::engine::sink::{MaskingPlan, ParallelSink, RowContext, SequentialSink, Sink};
 use crate::parser::state::{InsertFormat, SqlDialect};
 use crate::parser::{DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SqlEvent, SqlParser};
 
@@ -29,6 +31,10 @@ pub struct RunOptions {
     /// Seed for every random choice, for reproducible experiments. Anyone who
     /// knows it can recompute the generated values and the noise.
     pub seed: Option<u64>,
+    /// Threads that mask rows; the calling thread reads, parses and writes.
+    /// With 1, rows are masked on the calling thread. The output is the same
+    /// for any number, given a seed.
+    pub threads: usize,
 }
 
 impl RunOptions {
@@ -39,6 +45,7 @@ impl RunOptions {
             limit: None,
             max_row_bytes: DEFAULT_MAX_ROW_BYTES,
             seed: None,
+            threads: 1,
         }
     }
 }
@@ -52,6 +59,9 @@ pub struct RunReport {
     /// Values of `dp_laplace` columns that were not numbers. They were
     /// treated as the midpoint of their bounds, so the guarantee holds.
     pub non_numeric_dp_values: usize,
+    /// Values of `randomized_response` columns that were not among their
+    /// categories. They were replaced by a uniformly random category.
+    pub values_outside_categories: usize,
     /// Bytes read from the input.
     pub bytes_read: u64,
     /// Data statements (`INSERT`, `REPLACE`, `COPY`) seen.
@@ -64,9 +74,6 @@ pub struct RunReport {
     /// it could not be read). Schema names only, never values.
     pub rows_by_table: BTreeMap<String, usize>,
 }
-
-/// For each position in a data block's column list, the masked column there, if any.
-type MaskingPlan<'a> = Vec<Option<&'a CompiledColumn>>;
 
 pub struct AnonymizerEngine {
     config: CompiledConfig,
@@ -147,26 +154,47 @@ impl AnonymizerEngine {
         output: impl Write,
         options: &RunOptions,
     ) -> io::Result<RunReport> {
-        let RunOptions {
-            dialect,
-            dry_run,
-            limit,
-            max_row_bytes,
-            seed,
-        } = *options;
         debug!("engine start: {options:?}");
-        let mut reader = BufReader::new(input);
-        let mut writer: Box<dyn Write> = if dry_run {
+        let writer: Box<dyn Write> = if options.dry_run {
             Box::new(io::sink())
         } else {
             Box::new(BufWriter::new(output))
         };
-        let mut parser = SqlParser::new(dialect).with_max_row_bytes(max_row_bytes);
         // ChaCha-based and seeded from the operating system unless a seed is given.
-        let mut rng = match seed {
+        let rng = match options.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => StdRng::from_entropy(),
         };
+        let context = RowContext {
+            dialect: options.dialect,
+            secret: &self.secret,
+        };
+        // Without rules nothing is masked, so threads would only copy bytes.
+        if options.threads <= 1 || self.config.tables.is_empty() {
+            let sink = SequentialSink::new(writer, rng, context);
+            return self.run(input, sink, options);
+        }
+        thread::scope(|scope| {
+            let sink = ParallelSink::start(scope, options.threads, writer, rng, context);
+            self.run(input, sink, options)
+        })
+    }
+
+    /// Parses the input and sends every byte and row to `sink`.
+    fn run<'a>(
+        &'a self,
+        input: impl Read,
+        mut sink: impl Sink<'a>,
+        options: &RunOptions,
+    ) -> io::Result<RunReport> {
+        let RunOptions {
+            dialect,
+            limit,
+            max_row_bytes,
+            ..
+        } = *options;
+        let mut reader = BufReader::new(input);
+        let mut parser = SqlParser::new(dialect).with_max_row_bytes(max_row_bytes);
 
         let mut buffer = [0u8; 64 * 1024];
         let mut rows_processed = 0;
@@ -181,10 +209,8 @@ impl AnonymizerEngine {
         let mut reached_limit = false;
         let mut unterminated_data_block = false;
 
-        let mut stats = MaskStats::default();
-        let mut plan: Option<MaskingPlan> = None;
+        let mut plan: Option<Arc<MaskingPlan>> = None;
         let mut plan_metadata: Option<Arc<HeaderMetadata>> = None;
-        let mut row_buffer = Vec::with_capacity(1024);
 
         'leitura: loop {
             let bytes_read = reader.read(&mut buffer)?;
@@ -198,8 +224,8 @@ impl AnonymizerEngine {
                     continue;
                 };
                 match event {
-                    SqlEvent::DefaultStatement(b) => writer.write_all(&[b])?,
-                    SqlEvent::Passthrough(bytes) => writer.write_all(&bytes)?,
+                    SqlEvent::DefaultStatement(b) => sink.write(&[b])?,
+                    SqlEvent::Passthrough(bytes) => sink.write(&bytes)?,
 
                     SqlEvent::Header {
                         raw_bytes,
@@ -220,37 +246,19 @@ impl AnonymizerEngine {
                                 current_rows = 0;
                             }
                             plan = match self.plan_block(metadata.as_deref(), opaque, &raw_bytes) {
-                                Ok(plan) => plan,
-                                Err(e) => {
-                                    writer.flush()?;
-                                    return Err(e);
-                                }
+                                Ok(plan) => plan.map(Arc::new),
+                                Err(e) => return stop(sink, e),
                             };
                             plan_metadata = metadata;
                         }
-                        writer.write_all(&raw_bytes)?;
+                        sink.write(&raw_bytes)?;
                     }
 
                     SqlEvent::Tuple(row, format) => {
                         match &plan {
-                            None => writer.write_all(&row)?,
+                            None => sink.write(&row)?,
                             Some(columns) => {
-                                let mut masker = RowMasker {
-                                    columns,
-                                    rng: &mut rng,
-                                    secret: &self.secret,
-                                    stats: &mut stats,
-                                };
-                                // Build the row in memory: one write instead of one per piece.
-                                row_buffer.clear();
-                                codec::rewrite_row(
-                                    &row,
-                                    format,
-                                    dialect,
-                                    &mut masker,
-                                    &mut row_buffer,
-                                )?;
-                                writer.write_all(&row_buffer)?;
+                                sink.mask(row, format, columns)?;
                                 rows_masked += 1;
                             }
                         }
@@ -262,7 +270,7 @@ impl AnonymizerEngine {
                             && rows_processed >= l
                         {
                             // Close the statement, so the output still loads.
-                            writer.write_all(match format {
+                            sink.write(match format {
                                 InsertFormat::Values => b";\n",
                                 InsertFormat::Copy => b"\\.\n",
                             })?;
@@ -271,11 +279,8 @@ impl AnonymizerEngine {
                         }
                     }
 
-                    SqlEvent::Footer(footer_bytes) => writer.write_all(&footer_bytes)?,
-                    SqlEvent::Error(e) => {
-                        writer.flush()?;
-                        return Err(refuse(e.to_string()));
-                    }
+                    SqlEvent::Footer(footer_bytes) => sink.write(&footer_bytes)?,
+                    SqlEvent::Error(e) => return stop(sink, refuse(e.to_string())),
                 }
             }
         }
@@ -283,7 +288,7 @@ impl AnonymizerEngine {
         // With `--limit` the output stops on purpose, in the middle of the input.
         if !reached_limit {
             match parser.finish() {
-                Remainder::Bytes(rest) => writer.write_all(&rest)?,
+                Remainder::Bytes(rest) => sink.write(&rest)?,
                 Remainder::UnterminatedData { partial_row: false } => {
                     warn!(
                         "the input ended inside a data block, before its terminator (`;` or `\\.`)"
@@ -291,17 +296,19 @@ impl AnonymizerEngine {
                     unterminated_data_block = true;
                 }
                 Remainder::UnterminatedData { partial_row: true } => {
-                    writer.flush()?;
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "the input ended in the middle of a data row (truncated dump?). \
-                         The incomplete row was not written, because it could not be masked.",
-                    ));
+                    return stop(
+                        sink,
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "the input ended in the middle of a data row (truncated dump?). \
+                             The incomplete row was not written, because it could not be masked.",
+                        ),
+                    );
                 }
             }
         }
 
-        writer.flush()?;
+        let stats = sink.finish()?;
         count_rows(&mut rows_by_table, &current_table, current_rows);
         if stats.non_numeric > 0 {
             // One warning per run, without the values.
@@ -311,10 +318,18 @@ impl AnonymizerEngine {
                 stats.non_numeric
             );
         }
+        if stats.outside_categories > 0 {
+            warn!(
+                "{} value(s) of randomized_response columns were not among their categories; \
+                 they were replaced by a uniformly random category",
+                stats.outside_categories
+            );
+        }
         Ok(RunReport {
             rows_processed,
             unterminated_data_block,
             non_numeric_dp_values: stats.non_numeric,
+            values_outside_categories: stats.outside_categories,
             bytes_read: bytes_read_total,
             data_blocks,
             rows_masked,
@@ -345,30 +360,10 @@ fn preview(header: &[u8]) -> String {
     }
 }
 
-struct RowMasker<'a, R> {
-    columns: &'a [Option<&'a CompiledColumn>],
-    rng: &'a mut R,
-    secret: &'a str,
-    stats: &'a mut MaskStats,
-}
-
-impl<R: Rng> FieldMasker for RowMasker<'_, R> {
-    fn masks(&self, column: usize) -> bool {
-        matches!(self.columns.get(column), Some(Some(_)))
-    }
-
-    fn mask(&mut self, column: usize, value: SqlValue) -> SqlValue {
-        let Some(Some(config)) = self.columns.get(column) else {
-            return value;
-        };
-        self.stats.masked_fields += 1;
-        if value.is_null() && config.null_policy == NullPolicy::Keep {
-            return SqlValue::Null;
-        }
-        config
-            .masker
-            .apply(value, self.rng, self.secret, self.stats)
-    }
+/// Writes what came before an error that stops the run, then returns it.
+fn stop<'a>(sink: impl Sink<'a>, error: io::Error) -> io::Result<RunReport> {
+    sink.finish()?;
+    Err(error)
 }
 
 /// Logs which columns of a data block are masked. Only schema names are
@@ -630,5 +625,94 @@ mod tests {
     fn test_truncated_row_is_an_error() {
         let err = run(b"INSERT INTO t (a) VALUES (1), (2").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    const THREAD_RULES: &str = r#"
+        [tables.users]
+        columns = [
+            { name = "name", strategy = "faker_name" },
+            { name = "email", strategy = "hmac" },
+            { name = "age", strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 120.0], scale = 0 },
+            { name = "status", strategy = "randomized_response", epsilon = 1.0, categories = ["A", "B"] },
+        ]
+    "#;
+
+    /// Several segments of each kind: COPY, multi-row INSERT, a table
+    /// without rules and statements between them.
+    fn many_rows() -> Vec<u8> {
+        let mut dump = b"SET client_encoding = 'UTF8';\n".to_vec();
+        dump.extend_from_slice(b"COPY users (id, name, email, age, status) FROM stdin;\n");
+        for i in 0..3000 {
+            let line = format!("{i}\tName {i}\tu{i}@x.com\t{}\tA\n", i % 90);
+            dump.extend_from_slice(line.as_bytes());
+        }
+        dump.extend_from_slice(b"\\.\n\nINSERT INTO other (a) VALUES (1), (2);\n");
+        dump.extend_from_slice(b"INSERT INTO users (id, name, email, age, status) VALUES\n");
+        for i in 0..2500 {
+            let end = if i == 2499 { ";\n" } else { ",\n" };
+            let row = format!("({i}, 'N{i}', 'e{i}@x.com', {}, 'B'){end}", i % 70);
+            dump.extend_from_slice(row.as_bytes());
+        }
+        dump.extend_from_slice(b"COMMIT;\n");
+        dump
+    }
+
+    fn run_threads(
+        rules: &str,
+        input: &[u8],
+        threads: usize,
+        limit: Option<usize>,
+    ) -> (io::Result<RunReport>, Vec<u8>) {
+        let options = RunOptions {
+            seed: Some(11),
+            threads,
+            limit,
+            ..RunOptions::new(SqlDialect::Postgres)
+        };
+        let mut out = Vec::new();
+        let report = engine(rules).process_dump(input, &mut out, &options);
+        (report, out)
+    }
+
+    #[test]
+    fn test_output_is_the_same_for_any_number_of_threads() {
+        let input = many_rows();
+        let (report, expected) = run_threads(THREAD_RULES, &input, 1, None);
+        let report = report.unwrap();
+        assert_eq!(report.rows_masked, 5500);
+        assert_eq!(report.fields_masked, 4 * 5500);
+        assert!(!String::from_utf8_lossy(&expected).contains("Name 7\t"));
+        for threads in [2, 3, 8] {
+            let (parallel, out) = run_threads(THREAD_RULES, &input, threads, None);
+            assert_eq!(parallel.unwrap(), report, "{threads} threads");
+            assert!(out == expected, "{threads} threads");
+        }
+        for limit in [1, 1500, 4000] {
+            let (_, one) = run_threads(THREAD_RULES, &input, 1, Some(limit));
+            let (_, four) = run_threads(THREAD_RULES, &input, 4, Some(limit));
+            assert!(one == four, "limit {limit}");
+        }
+    }
+
+    #[test]
+    fn test_threads_without_rules_copy_the_input() {
+        let input = many_rows();
+        let (_, out) = run_threads("", &input, 4, None);
+        assert!(out == input);
+    }
+
+    #[test]
+    fn test_threads_stop_on_errors_after_writing_what_came_before() {
+        // The second data block has rules but no column list.
+        let mut input = many_rows();
+        input.extend_from_slice(b"INSERT INTO users VALUES (1, 'Ana');\n");
+        let (one, one_out) = run_threads(THREAD_RULES, &input, 1, None);
+        let (four, four_out) = run_threads(THREAD_RULES, &input, 4, None);
+        let (one, four) = (one.unwrap_err(), four.unwrap_err());
+        assert!(four.to_string().contains("no column list"), "{four}");
+        assert_eq!(one.to_string(), four.to_string());
+        assert!(one_out == four_out);
+        // Everything up to the refused block was written.
+        assert!(String::from_utf8_lossy(&four_out).contains("COMMIT"));
     }
 }

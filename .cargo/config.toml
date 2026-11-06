@@ -1,0 +1,7 @@
+# By default mimalloc commits whole arenas on Linux, which raises the peak
+# memory of a run from about 6 to 15 MiB, and to about 50 MiB with --threads.
+# Committing on demand keeps it at 7 to 13 MiB at the same speed (see
+# docs/benchmarks.md). A CFLAGS variable set in the environment replaces this
+# one; the variable MIMALLOC_ARENA_EAGER_COMMIT still overrides it at run time.
+[env]
+CFLAGS = "-DMI_DEFAULT_ARENA_EAGER_COMMIT=0"

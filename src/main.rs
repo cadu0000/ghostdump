@@ -12,6 +12,11 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::time::Instant;
 
+// With glibc's allocator, the threads of --threads end up sharing the main
+// thread's arena and wait on its lock (see docs/benchmarks.md).
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // Every message goes to stderr: stdout may carry the sanitized dump.
 fn main() {
     let args = Args::parse();
@@ -33,6 +38,7 @@ fn main() {
                 config.tables.len(),
                 path.display()
             );
+            log_guarantees(&config);
             config
         }
         None => {
@@ -66,8 +72,10 @@ fn main() {
         limit: args.limit,
         max_row_bytes: args.max_row_size.saturating_mul(1024 * 1024),
         seed: args.seed,
+        threads: args.threads.get(),
         ..RunOptions::new(dialect)
     };
+    debug!("masking threads: {}", options.threads);
 
     if args.seed.is_some() {
         warn!(
@@ -109,6 +117,20 @@ fn main() {
             rows_per_sec,
             mib / seconds,
             mib
+        );
+    }
+}
+
+/// What the rules protect, one line per table. ε adds up over the rows of
+/// a person and over repeated releases, which GhostDump cannot see.
+fn log_guarantees(config: &CompiledConfig) {
+    for table in config.guarantees() {
+        info!("privacy: {table}");
+    }
+    if config.guarantees().iter().any(|t| !t.ldp.is_empty()) {
+        info!(
+            "privacy: ε adds up over the rows of one person and over repeated releases \
+             (see docs/guarantees.md)"
         );
     }
 }

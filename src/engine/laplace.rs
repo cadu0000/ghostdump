@@ -198,6 +198,20 @@ impl LaplaceMechanism {
     }
 }
 
+/// The most decimal places the `f64` sampler may write for these
+/// parameters. Rounding hides the low-order bits of the noise only if the
+/// grid is much coarser than the spacing of doubles at the magnitude of the
+/// output: here, at least 1024 doubles wide at |bound| + 10·b, which covers
+/// the noise except with probability e^-10. With bounds [0, 100000] and
+/// ε = 1 this allows 6 places; 12 places leak (see
+/// docs/experiments/floating-point.md).
+pub fn max_f64_scale(epsilon: f64, lo: f64, hi: f64) -> u32 {
+    let magnitude = lo.abs().max(hi.abs()) + 10.0 * (hi - lo) / epsilon;
+    let spacing = 2f64.powi(magnitude.log2().floor() as i32 - 52);
+    let grid = 1024.0 * spacing;
+    (-grid.log10()).floor().max(0.0) as u32
+}
+
 /// A Laplace sample with the given scale: an exponential magnitude with a
 /// random sign. `1 - U` lies in (0, 1], so the logarithm is always finite.
 ///
@@ -219,12 +233,24 @@ fn bernoulli(num: u128, den: u128, rng: &mut impl Rng) -> bool {
 
 /// Bernoulli(exp(-num / den)) for 0 <= num / den <= 1 (Canonne, Kamath and
 /// Steinke, 2020, algorithm 1). Only integer comparisons are involved.
-fn bernoulli_exp_le1(num: u128, den: u128, rng: &mut impl Rng) -> bool {
+pub(crate) fn bernoulli_exp_le1(num: u128, den: u128, rng: &mut impl Rng) -> bool {
     let mut k: u128 = 1;
     while bernoulli(num, den * k, rng) {
         k += 1;
     }
     k % 2 == 1
+}
+
+/// Bernoulli(exp(-num / den)) for any num / den >= 0, exactly: exp(-γ) is
+/// the product of exp(-1) for each unit of γ and exp(-frac(γ)) (Canonne,
+/// Kamath and Steinke, 2020).
+pub(crate) fn bernoulli_exp(num: u128, den: u128, rng: &mut impl Rng) -> bool {
+    for _ in 0..num / den {
+        if !bernoulli_exp_le1(1, 1, rng) {
+            return false;
+        }
+    }
+    bernoulli_exp_le1(num % den, den, rng)
 }
 
 /// A sample of the discrete Laplace distribution with parameter `t`:

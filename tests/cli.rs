@@ -26,6 +26,7 @@ const CONSISTENT_RULES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/consistent_rules.toml"
 );
+const RR_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rr_rules.toml");
 const DP_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dp_rules.toml");
 
 /// Runs ghostdump with `args`, the secret (if any) in the environment, and
@@ -232,6 +233,26 @@ fn seeded_run_matches_the_golden_output() {
 }
 
 #[test]
+fn threads_give_the_golden_output() {
+    let expected = include_bytes!("fixtures/pg_data_masked.sql");
+    for threads in ["2", "4"] {
+        let output = run(
+            &["-c", PG_RULES, "--seed", "42", "--threads", threads],
+            Some(GOLDEN_SECRET),
+            PG_DATA,
+        );
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+        assert!(output.stdout == expected, "{threads} threads");
+    }
+}
+
+#[test]
+fn zero_threads_are_rejected() {
+    let output = run(&["--threads", "0"], None, b"");
+    assert!(!output.status.success());
+}
+
+#[test]
 fn noise_is_reproducible_only_with_a_seed() {
     let dump = b"INSERT INTO users (salary) VALUES (10), (20), (30);\n";
     let seeded = |seed: &str| run(&["-c", DP_RULES, "--seed", seed], None, dump).stdout;
@@ -272,4 +293,35 @@ fn consistent_noise_repeats_across_runs_and_rows() {
 
     let without_secret = run(&["-c", CONSISTENT_RULES], None, dump);
     assert!(!without_secret.status.success());
+}
+
+#[test]
+fn startup_summary_states_the_privacy_budget() {
+    let output = run(&["-c", PG_RULES], Some(GOLDEN_SECRET), PG_DATA);
+    let stderr = stderr(&output);
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("privacy: table `users`: ε = 1.0000 per row (salary ε = 1.0000)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("pseudonymized, no DP: email"), "{stderr}");
+}
+
+#[test]
+fn randomized_response_writes_only_declared_categories() {
+    let dump = b"INSERT INTO users (id, status) VALUES (1, 'ACTIVE'), (2, 'BANNED'), (3, NULL);\n";
+    let output = run(&["-c", RR_RULES, "--seed", "3"], None, dump);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(!stdout.contains("BANNED"), "{stdout}");
+    assert!(stdout.contains("(3, NULL)"), "{stdout}");
+    let categories = ["'ACTIVE'", "'PENDING'", "'INACTIVE'"];
+    for row in ["(1, ", "(2, "] {
+        let start = stdout.find(row).unwrap() + row.len();
+        let value = &stdout[start..start + stdout[start..].find(')').unwrap()];
+        assert!(categories.contains(&value), "{value}");
+    }
+    assert!(stderr(&output).contains("1 value(s) of randomized_response columns"));
 }

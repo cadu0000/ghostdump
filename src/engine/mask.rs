@@ -12,6 +12,7 @@ use sha2::Sha256;
 use uuid::Builder;
 
 use crate::codec::SqlValue;
+use crate::engine::categorical::RandomizedResponse;
 use crate::engine::laplace::LaplaceMechanism;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -34,6 +35,17 @@ pub struct MaskStats {
     pub non_numeric: usize,
     /// Fields that went through a rule (NULLs kept by `null_policy` included).
     pub masked_fields: usize,
+    /// Values of `randomized_response` columns outside their categories.
+    pub outside_categories: usize,
+}
+
+impl MaskStats {
+    /// Adds the counters of another part of the run.
+    pub fn add(&mut self, other: &MaskStats) {
+        self.non_numeric += other.non_numeric;
+        self.masked_fields += other.masked_fields;
+        self.outside_categories += other.outside_categories;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +54,7 @@ pub enum Masker {
     Hmac,
     Nullify,
     Laplace(LaplaceMechanism),
+    RandomizedResponse(RandomizedResponse),
 }
 
 /// Generators whose output does not depend on the original value.
@@ -79,6 +92,7 @@ impl Masker {
                 None => SqlValue::Null,
             },
             Masker::Laplace(mechanism) => mechanism.apply(value, rng, secret, stats),
+            Masker::RandomizedResponse(rr) => rr.apply(value, rng, stats),
         }
     }
 
@@ -88,6 +102,9 @@ impl Masker {
             Masker::Hmac => Guarantee::Pseudonymization,
             Masker::Laplace(m) => Guarantee::Ldp {
                 epsilon: m.epsilon(),
+            },
+            Masker::RandomizedResponse(rr) => Guarantee::Ldp {
+                epsilon: rr.epsilon(),
             },
         }
     }
@@ -116,6 +133,7 @@ impl Masker {
                 "pseudonymized with HMAC-SHA256 (deterministic, not differentially private)".into()
             }
             Masker::Laplace(m) => m.describe(),
+            Masker::RandomizedResponse(rr) => rr.describe(),
         }
     }
 }
