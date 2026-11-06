@@ -273,3 +273,16 @@ fn consistent_noise_repeats_across_runs_and_rows() {
     let without_secret = run(&["-c", CONSISTENT_RULES], None, dump);
     assert!(!without_secret.status.success());
 }
+
+#[test]
+fn startup_summary_states_the_privacy_budget() {
+    let output = run(&["-c", PG_RULES], Some(GOLDEN_SECRET), PG_DATA);
+    let stderr = stderr(&output);
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("privacy: table `users`: ε = 1.0000 per row (salary ε = 1.0000)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("pseudonymized, no DP: email"), "{stderr}");
+}
