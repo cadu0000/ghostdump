@@ -29,3 +29,7 @@ memchr = "2"
 [dev-dependencies]
 cpf_cnpj = "0.3"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "microbench"
+harness = false
