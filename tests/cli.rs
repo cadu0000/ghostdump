@@ -5,9 +5,18 @@ use std::process::{Command, Output, Stdio};
 
 const PASSTHROUGH: &[u8] = include_bytes!("fixtures/passthrough.sql");
 const PG_DATA: &[u8] = include_bytes!("fixtures/pg_data.sql");
-const HMAC_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/hmac_rules.toml");
-const MYSQL_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mysql_rules.toml");
-const INVALID_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/invalid_rules.toml");
+const HMAC_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/hmac_rules.toml"
+);
+const MYSQL_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/mysql_rules.toml"
+);
+const INVALID_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/invalid_rules.toml"
+);
 const DP_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dp_rules.toml");
 
 /// Runs ghostdump with `args`, the secret (if any) in the environment, and
@@ -146,7 +155,10 @@ fn mysqldump_with_column_names_is_masked() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(stdout.contains("(1,'Masked O\\'Name',NULL),(2,'Masked O\\'Name',NULL);"), "{stdout}");
+    assert!(
+        stdout.contains("(1,'Masked O\\'Name',NULL),(2,'Masked O\\'Name',NULL);"),
+        "{stdout}"
+    );
     assert!(!stdout.contains("ana@example.com"));
     assert!(stdout.contains("UNLOCK TABLES;"));
 }
@@ -159,7 +171,10 @@ fn mysqldump_default_format_is_refused() {
 
     assert!(!output.status.success());
     assert!(stderr(&output).contains("--complete-insert"));
-    assert!(!stdout.contains("Ana") && !stdout.contains("example.com"), "{stdout}");
+    assert!(
+        !stdout.contains("Ana") && !stdout.contains("example.com"),
+        "{stdout}"
+    );
 }
 
 #[test]
