@@ -151,6 +151,8 @@ Rules are checked before any data is read: a rule with a missing or invalid para
 
 Each value is clamped to `bounds = [lo, hi]` and receives Laplace noise of scale `(hi - lo) / epsilon`, so every published value is ε-differentially private on its own (local differential privacy). The bounds must be chosen from knowledge of the domain, not from the data: values outside them lose accuracy, and bounds wider than needed add noise. `scale` fixes the number of decimal places written, so the output never reveals the precision of the input. `clamp_output = true` also keeps the noisy values inside the bounds (no negative salaries), at the cost of a bias near the edges. Values that are not numbers are treated as the midpoint of the bounds, never written as they are. The privacy budget adds up: a row with two `dp_laplace` columns spends the sum of their epsilons, and a person with several rows spends it once per row.
 
+The noise is drawn by an exact sampler on integers (`mechanism = "exact"`, the default): values are handled in units of `scale` and no floating-point operation takes part, so the output carries no low-order artifacts. `mechanism = "f64"` selects the floating-point sampler, about 15 times cheaper per value but vulnerable to attacks on the low-order bits; it is kept to measure the cost of exact sampling. Bounds times 10^scale must stay below 2^53. See [docs/decisions/0001-laplace-sampler.md](docs/decisions/0001-laplace-sampler.md) for the reasons, including why OpenDP is not used.
+
 ### 2. The Cryptographic Secret
 
 The secret key used to generate deterministic HMAC hashes. For security reasons, **never commit this to the repository**. It can be provided via CLI argument or environment variable:
@@ -234,6 +236,8 @@ cargo test -- --nocapture
 ```
 
 Continuous integration (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on every push and pull request. The integration tests in `tests/` run the binary on fixture dumps and compare its output with expected files.
+
+The statistical validation of the Laplace samplers is slow and ignored by default; run it with `cargo test --release -- --ignored`.
 
 For reproducible experiments, the hidden `--seed <N>` option fixes every random choice (generated values and Laplace noise). Anyone who knows the seed can recompute them, so never use it on real data.
 
