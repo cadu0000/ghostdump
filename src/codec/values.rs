@@ -195,10 +195,7 @@ mod tests {
             fields("(1, 'it\\'s, ok', 2)", SqlDialect::Mysql),
             ["1", "'it\\'s, ok'", "2"]
         );
-        assert_eq!(
-            fields("('C:\\', 2)", SqlDialect::Postgres),
-            ["'C:\\'", "2"]
-        );
+        assert_eq!(fields("('C:\\', 2)", SqlDialect::Postgres), ["'C:\\'", "2"]);
     }
 
     #[test]
@@ -231,12 +228,23 @@ mod tests {
 
     #[test]
     fn test_encode_then_decode_round_trips() {
-        let samples = ["plain", "O'Hara", "back\\slash", "new\nline", "\\'mix''", ""];
+        let samples = [
+            "plain",
+            "O'Hara",
+            "back\\slash",
+            "new\nline",
+            "\\'mix''",
+            "",
+        ];
         for dialect in [SqlDialect::Postgres, SqlDialect::Mysql, SqlDialect::Sqlite] {
             for sample in samples {
                 let value = SqlValue::Text(sample.into());
                 let text = encoded(&value, dialect);
-                assert_eq!(decode(text.as_bytes(), dialect), value, "{dialect:?} {text}");
+                assert_eq!(
+                    decode(text.as_bytes(), dialect),
+                    value,
+                    "{dialect:?} {text}"
+                );
             }
         }
     }
