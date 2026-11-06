@@ -26,6 +26,7 @@ const CONSISTENT_RULES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/consistent_rules.toml"
 );
+const RR_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rr_rules.toml");
 const DP_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dp_rules.toml");
 
 /// Runs ghostdump with `args`, the secret (if any) in the environment, and
@@ -285,4 +286,22 @@ fn startup_summary_states_the_privacy_budget() {
         "{stderr}"
     );
     assert!(stderr.contains("pseudonymized, no DP: email"), "{stderr}");
+}
+
+#[test]
+fn randomized_response_writes_only_declared_categories() {
+    let dump = b"INSERT INTO users (id, status) VALUES (1, 'ACTIVE'), (2, 'BANNED'), (3, NULL);\n";
+    let output = run(&["-c", RR_RULES, "--seed", "3"], None, dump);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(!stdout.contains("BANNED"), "{stdout}");
+    assert!(stdout.contains("(3, NULL)"), "{stdout}");
+    let categories = ["'ACTIVE'", "'PENDING'", "'INACTIVE'"];
+    for row in ["(1, ", "(2, "] {
+        let start = stdout.find(row).unwrap() + row.len();
+        let value = &stdout[start..start + stdout[start..].find(')').unwrap()];
+        assert!(categories.contains(&value), "{value}");
+    }
+    assert!(stderr(&output).contains("1 value(s) of randomized_response columns"));
 }
