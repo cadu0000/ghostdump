@@ -22,6 +22,10 @@ const PG_RULES: &str = concat!(
     "/tests/fixtures/pg_data_rules.toml"
 );
 const GOLDEN_SECRET: &str = "golden-test-secret-0123456789";
+const CONSISTENT_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/consistent_rules.toml"
+);
 const DP_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dp_rules.toml");
 
 /// Runs ghostdump with `args`, the secret (if any) in the environment, and
@@ -244,4 +248,28 @@ fn progress_flag_keeps_stdout_clean() {
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert_eq!(output.stdout, PG_DATA);
+}
+
+#[test]
+fn consistent_noise_repeats_across_runs_and_rows() {
+    let dump = b"INSERT INTO users (salary) VALUES (10), (20), (10);\n";
+    let first = run(&["-c", CONSISTENT_RULES], Some(GOLDEN_SECRET), dump);
+    let second = run(&["-c", CONSISTENT_RULES], Some(GOLDEN_SECRET), dump);
+
+    assert!(first.status.success(), "stderr: {}", stderr(&first));
+    assert_eq!(first.stdout, second.stdout);
+    let text = String::from_utf8_lossy(&first.stdout);
+    let values: Vec<&str> = text
+        .trim_end()
+        .trim_end_matches(");")
+        .split("VALUES (")
+        .nth(1)
+        .unwrap()
+        .split("), (")
+        .collect();
+    assert_eq!(values[0], values[2], "{text}");
+    assert_ne!(values[0], values[1], "{text}");
+
+    let without_secret = run(&["-c", CONSISTENT_RULES], None, dump);
+    assert!(!without_secret.status.success());
 }
