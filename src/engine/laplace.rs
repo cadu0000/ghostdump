@@ -198,6 +198,20 @@ impl LaplaceMechanism {
     }
 }
 
+/// The most decimal places the `f64` sampler may write for these
+/// parameters. Rounding hides the low-order bits of the noise only if the
+/// grid is much coarser than the spacing of doubles at the magnitude of the
+/// output: here, at least 1024 doubles wide at |bound| + 10·b, which covers
+/// the noise except with probability e^-10. With bounds [0, 100000] and
+/// ε = 1 this allows 6 places; 12 places leak (see
+/// docs/experiments/floating-point.md).
+pub fn max_f64_scale(epsilon: f64, lo: f64, hi: f64) -> u32 {
+    let magnitude = lo.abs().max(hi.abs()) + 10.0 * (hi - lo) / epsilon;
+    let spacing = 2f64.powi(magnitude.log2().floor() as i32 - 52);
+    let grid = 1024.0 * spacing;
+    (-grid.log10()).floor().max(0.0) as u32
+}
+
 /// A Laplace sample with the given scale: an exponential magnitude with a
 /// random sign. `1 - U` lies in (0, 1], so the logarithm is always finite.
 ///
