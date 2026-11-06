@@ -2,18 +2,18 @@ pub mod categorical;
 pub mod config;
 pub mod laplace;
 pub mod mask;
+pub mod sink;
 pub mod strategy;
 
 use log::{debug, warn};
+use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use std::collections::BTreeMap;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
 
-use crate::codec::{self, FieldMasker, SqlValue};
-use crate::engine::config::{CompiledColumn, CompiledConfig, NullPolicy};
-use crate::engine::mask::MaskStats;
+use crate::engine::config::{CompiledColumn, CompiledConfig};
+use crate::engine::sink::{MaskingPlan, SequentialSink, Sink};
 use crate::parser::state::{InsertFormat, SqlDialect};
 use crate::parser::{DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SqlEvent, SqlParser};
 
@@ -68,9 +68,6 @@ pub struct RunReport {
     /// it could not be read). Schema names only, never values.
     pub rows_by_table: BTreeMap<String, usize>,
 }
-
-/// For each position in a data block's column list, the masked column there, if any.
-type MaskingPlan<'a> = Vec<Option<&'a CompiledColumn>>;
 
 pub struct AnonymizerEngine {
     config: CompiledConfig,
@@ -151,26 +148,36 @@ impl AnonymizerEngine {
         output: impl Write,
         options: &RunOptions,
     ) -> io::Result<RunReport> {
-        let RunOptions {
-            dialect,
-            dry_run,
-            limit,
-            max_row_bytes,
-            seed,
-        } = *options;
         debug!("engine start: {options:?}");
-        let mut reader = BufReader::new(input);
-        let mut writer: Box<dyn Write> = if dry_run {
+        let writer: Box<dyn Write> = if options.dry_run {
             Box::new(io::sink())
         } else {
             Box::new(BufWriter::new(output))
         };
-        let mut parser = SqlParser::new(dialect).with_max_row_bytes(max_row_bytes);
         // ChaCha-based and seeded from the operating system unless a seed is given.
-        let mut rng = match seed {
+        let rng = match options.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => StdRng::from_entropy(),
         };
+        let sink = SequentialSink::new(writer, rng, options.dialect, &self.secret);
+        self.run(input, sink, options)
+    }
+
+    /// Parses the input and sends every byte and row to `sink`.
+    fn run<'a>(
+        &'a self,
+        input: impl Read,
+        mut sink: impl Sink<'a>,
+        options: &RunOptions,
+    ) -> io::Result<RunReport> {
+        let RunOptions {
+            dialect,
+            limit,
+            max_row_bytes,
+            ..
+        } = *options;
+        let mut reader = BufReader::new(input);
+        let mut parser = SqlParser::new(dialect).with_max_row_bytes(max_row_bytes);
 
         let mut buffer = [0u8; 64 * 1024];
         let mut rows_processed = 0;
@@ -185,10 +192,8 @@ impl AnonymizerEngine {
         let mut reached_limit = false;
         let mut unterminated_data_block = false;
 
-        let mut stats = MaskStats::default();
-        let mut plan: Option<MaskingPlan> = None;
+        let mut plan: Option<Arc<MaskingPlan>> = None;
         let mut plan_metadata: Option<Arc<HeaderMetadata>> = None;
-        let mut row_buffer = Vec::with_capacity(1024);
 
         'leitura: loop {
             let bytes_read = reader.read(&mut buffer)?;
@@ -202,8 +207,8 @@ impl AnonymizerEngine {
                     continue;
                 };
                 match event {
-                    SqlEvent::DefaultStatement(b) => writer.write_all(&[b])?,
-                    SqlEvent::Passthrough(bytes) => writer.write_all(&bytes)?,
+                    SqlEvent::DefaultStatement(b) => sink.write(&[b])?,
+                    SqlEvent::Passthrough(bytes) => sink.write(&bytes)?,
 
                     SqlEvent::Header {
                         raw_bytes,
@@ -224,37 +229,19 @@ impl AnonymizerEngine {
                                 current_rows = 0;
                             }
                             plan = match self.plan_block(metadata.as_deref(), opaque, &raw_bytes) {
-                                Ok(plan) => plan,
-                                Err(e) => {
-                                    writer.flush()?;
-                                    return Err(e);
-                                }
+                                Ok(plan) => plan.map(Arc::new),
+                                Err(e) => return stop(sink, e),
                             };
                             plan_metadata = metadata;
                         }
-                        writer.write_all(&raw_bytes)?;
+                        sink.write(&raw_bytes)?;
                     }
 
                     SqlEvent::Tuple(row, format) => {
                         match &plan {
-                            None => writer.write_all(&row)?,
+                            None => sink.write(&row)?,
                             Some(columns) => {
-                                let mut masker = RowMasker {
-                                    columns,
-                                    rng: &mut rng,
-                                    secret: &self.secret,
-                                    stats: &mut stats,
-                                };
-                                // Build the row in memory: one write instead of one per piece.
-                                row_buffer.clear();
-                                codec::rewrite_row(
-                                    &row,
-                                    format,
-                                    dialect,
-                                    &mut masker,
-                                    &mut row_buffer,
-                                )?;
-                                writer.write_all(&row_buffer)?;
+                                sink.mask(row, format, columns)?;
                                 rows_masked += 1;
                             }
                         }
@@ -266,7 +253,7 @@ impl AnonymizerEngine {
                             && rows_processed >= l
                         {
                             // Close the statement, so the output still loads.
-                            writer.write_all(match format {
+                            sink.write(match format {
                                 InsertFormat::Values => b";\n",
                                 InsertFormat::Copy => b"\\.\n",
                             })?;
@@ -275,11 +262,8 @@ impl AnonymizerEngine {
                         }
                     }
 
-                    SqlEvent::Footer(footer_bytes) => writer.write_all(&footer_bytes)?,
-                    SqlEvent::Error(e) => {
-                        writer.flush()?;
-                        return Err(refuse(e.to_string()));
-                    }
+                    SqlEvent::Footer(footer_bytes) => sink.write(&footer_bytes)?,
+                    SqlEvent::Error(e) => return stop(sink, refuse(e.to_string())),
                 }
             }
         }
@@ -287,7 +271,7 @@ impl AnonymizerEngine {
         // With `--limit` the output stops on purpose, in the middle of the input.
         if !reached_limit {
             match parser.finish() {
-                Remainder::Bytes(rest) => writer.write_all(&rest)?,
+                Remainder::Bytes(rest) => sink.write(&rest)?,
                 Remainder::UnterminatedData { partial_row: false } => {
                     warn!(
                         "the input ended inside a data block, before its terminator (`;` or `\\.`)"
@@ -295,17 +279,19 @@ impl AnonymizerEngine {
                     unterminated_data_block = true;
                 }
                 Remainder::UnterminatedData { partial_row: true } => {
-                    writer.flush()?;
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "the input ended in the middle of a data row (truncated dump?). \
-                         The incomplete row was not written, because it could not be masked.",
-                    ));
+                    return stop(
+                        sink,
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "the input ended in the middle of a data row (truncated dump?). \
+                             The incomplete row was not written, because it could not be masked.",
+                        ),
+                    );
                 }
             }
         }
 
-        writer.flush()?;
+        let stats = sink.finish()?;
         count_rows(&mut rows_by_table, &current_table, current_rows);
         if stats.non_numeric > 0 {
             // One warning per run, without the values.
@@ -357,30 +343,10 @@ fn preview(header: &[u8]) -> String {
     }
 }
 
-struct RowMasker<'a, R> {
-    columns: &'a [Option<&'a CompiledColumn>],
-    rng: &'a mut R,
-    secret: &'a str,
-    stats: &'a mut MaskStats,
-}
-
-impl<R: Rng> FieldMasker for RowMasker<'_, R> {
-    fn masks(&self, column: usize) -> bool {
-        matches!(self.columns.get(column), Some(Some(_)))
-    }
-
-    fn mask(&mut self, column: usize, value: SqlValue) -> SqlValue {
-        let Some(Some(config)) = self.columns.get(column) else {
-            return value;
-        };
-        self.stats.masked_fields += 1;
-        if value.is_null() && config.null_policy == NullPolicy::Keep {
-            return SqlValue::Null;
-        }
-        config
-            .masker
-            .apply(value, self.rng, self.secret, self.stats)
-    }
+/// Writes what came before an error that stops the run, then returns it.
+fn stop<'a>(sink: impl Sink<'a>, error: io::Error) -> io::Result<RunReport> {
+    sink.finish()?;
+    Err(error)
 }
 
 /// Logs which columns of a data block are masked. Only schema names are
