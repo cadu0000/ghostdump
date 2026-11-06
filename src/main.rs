@@ -6,8 +6,10 @@ use ghostdump::parser::detect_dialect;
 use ghostdump::parser::state::SqlDialect;
 
 use clap::Parser as ClapParser;
+use indicatif::{ProgressBar, ProgressStyle};
 use log::{Level, LevelFilter, debug, error, info, warn};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::time::Instant;
 
 // Every message goes to stderr: stdout may carry the sanitized dump.
@@ -49,6 +51,11 @@ fn main() {
 
     let input = InputSource::new(args.input.clone())
         .unwrap_or_else(|e| fatal(&format!("could not open the input: {}", e)));
+    let progress = args.progress.then(|| progress_bar(args.input.as_deref()));
+    let input: Box<dyn Read> = match &progress {
+        Some(bar) => Box::new(bar.wrap_read(input)),
+        None => Box::new(input),
+    };
     let mut input = BufReader::with_capacity(64 * 1024, input);
     let dialect = resolve_dialect(args.dialect, &mut input);
     let output = OutputSource::new(args.output.clone())
@@ -78,6 +85,9 @@ fn main() {
         .process_dump(input, output, &options)
         .unwrap_or_else(|e| fatal(&e.to_string()));
     let duration = start_time.elapsed();
+    if let Some(bar) = &progress {
+        bar.finish_and_clear();
+    }
 
     info!("Processing completed successfully!");
     info!("Rows processed: {}", report.rows_processed);
@@ -133,6 +143,30 @@ fn init_logger(verbose: bool) {
             writeln!(buf, "{}: {}", prefix, record.args())
         })
         .init();
+}
+
+/// A progress bar on stderr, updated as the input is read. With a plain
+/// input file it shows the share read and an ETA; for stdin or a `.gz` file,
+/// whose decompressed size is unknown, it shows bytes read and the rate.
+/// indicatif draws nothing when stderr is not a terminal.
+fn progress_bar(input: Option<&Path>) -> ProgressBar {
+    let total = input
+        .filter(|path| !path.to_string_lossy().to_lowercase().ends_with(".gz"))
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len());
+    let (bar, template) = match total {
+        Some(total) => (
+            ProgressBar::new(total),
+            "{spinner} [{elapsed_precise}] {wide_bar} {binary_bytes}/{binary_total_bytes} \
+             {binary_bytes_per_sec} ETA {eta}",
+        ),
+        None => (
+            ProgressBar::new_spinner(),
+            "{spinner} [{elapsed_precise}] {binary_bytes} read, {binary_bytes_per_sec}",
+        ),
+    };
+    bar.set_style(ProgressStyle::with_template(template).expect("a valid template"));
+    bar
 }
 
 fn resolve_dialect(choice: DialectArg, input: &mut impl BufRead) -> SqlDialect {
