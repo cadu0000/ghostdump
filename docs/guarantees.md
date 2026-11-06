@@ -56,7 +56,7 @@ These are properties of the pipeline, not of a mechanism. Each is enforced by th
 
 ## Assumptions
 
-* **Randomness.** Noise and generated values come from `rand`'s `StdRng` (ChaCha12) seeded by the operating system. Its unpredictability is computational. `--seed` makes the run reproducible and removes the protection of the noise: it is meant for experiments only, and GhostDump warns when it is used.
+* **Randomness.** Noise and generated values come from `rand`'s `StdRng` (ChaCha12). The run's generator is seeded by the operating system; each segment of rows (at most 1,024 masked rows) draws from its own generator, seeded with 256 bits from the run's one, so the output does not depend on `--threads`. Its unpredictability is computational. `--seed` makes the run reproducible and removes the protection of the noise: it is meant for experiments only, and GhostDump warns when it is used.
 * **Implementation.** The exact sampler follows Canonne, Kamath and Steinke (2020). It is our implementation, not an audited library: its distribution is checked against the exact probabilities, by goodness of fit, by a periodicity test and by negative controls (`laplace::validation`, run in CI). The decision and the alternatives are in [decisions/0001-laplace-sampler.md](decisions/0001-laplace-sampler.md).
 * **Bounds.** The bounds must be chosen without looking at the data. Bounds computed from the data (the "oracle" arm of the utility evaluation) are not private.
 
