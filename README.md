@@ -108,7 +108,7 @@ GhostDump is currently under active development. The core parsing engine is func
 * [x] **Zero-Memory Proxy**: Streaming architecture implementation.
 * [x] **CLI Foundation**: Robust argument parsing using `clap`.
 * [x] **Masking Strategies**: Deterministic HMAC and Faker-based PII anonymization.
-* [ ] **Differential Privacy**: Laplace mechanism implementation.
+* [x] **Differential Privacy**: Laplace mechanism with bounds, clamping and fixed precision.
 * [x] **Rule Engine Integration**: Connect the `rules.toml` to the FSM.
 * [ ] **UX & Metrics**: Real-time progress metrics (`indicatif`).
 * [x] **Structured Logging**: Verbose debug mode (`--verbose`) and `GHOSTDUMP_LOG`.
@@ -138,12 +138,18 @@ columns = [
     { name = "password_hash", strategy = "fixed", value = "$2a$12$R9h/cIPz0gi..." },
     
     # Local Differential Privacy (Laplace Mechanism for numerics)
-    { name = "salary", strategy = "dp_laplace", epsilon = 0.5, sensitivity = 15000.0 }
+    { name = "salary", strategy = "dp_laplace", epsilon = 0.5, bounds = [0.0, 15000.0], scale = 2 }
 ]
 
 ```
 
-Only the declared columns are rewritten; every other byte of the dump, including the layout of `INSERT` statements and `COPY` blocks, is copied unchanged. Values keep their SQL type: numbers stay unquoted, generated text is escaped for the dialect, and `NULL` stays `NULL` by default. Add `null_policy = "generate"` to a column to replace `NULL` values too (with strategies that do not depend on the original value).
+Only the declared columns are rewritten; every other byte of the dump, including the layout of `INSERT` statements and `COPY` blocks, is copied unchanged. Values keep their SQL type: numbers stay unquoted, generated text is escaped for the dialect, and `NULL` stays `NULL` by default. Add `null_policy = "generate"` to a column to mask `NULL` values too.
+
+Rules are checked before any data is read: a rule with a missing or invalid parameter stops GhostDump with a message that names the table and column.
+
+#### `dp_laplace`
+
+Each value is clamped to `bounds = [lo, hi]` and receives Laplace noise of scale `(hi - lo) / epsilon`, so every published value is ε-differentially private on its own (local differential privacy). The bounds must be chosen from knowledge of the domain, not from the data: values outside them lose accuracy, and bounds wider than needed add noise. `scale` fixes the number of decimal places written, so the output never reveals the precision of the input. `clamp_output = true` also keeps the noisy values inside the bounds (no negative salaries), at the cost of a bias near the edges. Values that are not numbers are treated as the midpoint of the bounds, never written as they are. The privacy budget adds up: a row with two `dp_laplace` columns spends the sum of their epsilons, and a person with several rows spends it once per row.
 
 ### 2. The Cryptographic Secret
 
