@@ -58,8 +58,16 @@ fn main() {
         dry_run: args.dry_run,
         limit: args.limit,
         max_row_bytes: args.max_row_size.saturating_mul(1024 * 1024),
+        seed: args.seed,
         ..RunOptions::new(dialect)
     };
+
+    if args.seed.is_some() {
+        warn!(
+            "--seed makes every random choice reproducible: anyone with the seed can recompute \
+             the generated values and the noise. Use it for experiments, never on real data."
+        );
+    }
 
     if args.dry_run {
         info!("Dry-Run mode enabled. Data will be processed, but nothing will be written to disk.");

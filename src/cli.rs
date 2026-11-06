@@ -78,6 +78,11 @@ pub struct Args {
         help = "Tamanho máximo de uma linha de dados, em MiB"
     )]
     pub max_row_size: usize,
+
+    /// Fixes every random choice, for reproducible experiments. Hidden: a
+    /// known seed lets anyone recompute the generated values and the noise.
+    #[arg(long, hide = true, value_name = "N")]
+    pub seed: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]

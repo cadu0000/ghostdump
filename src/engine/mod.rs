@@ -3,7 +3,8 @@ pub mod mask;
 pub mod strategy;
 
 use log::{debug, warn};
-use rand::{Rng, thread_rng};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
 
@@ -23,6 +24,9 @@ pub struct RunOptions {
     pub limit: Option<usize>,
     /// Longer rows stop the run with an error.
     pub max_row_bytes: usize,
+    /// Seed for every random choice, for reproducible experiments. Anyone who
+    /// knows it can recompute the generated values and the noise.
+    pub seed: Option<u64>,
 }
 
 impl RunOptions {
@@ -32,6 +36,7 @@ impl RunOptions {
             dry_run: false,
             limit: None,
             max_row_bytes: DEFAULT_MAX_ROW_BYTES,
+            seed: None,
         }
     }
 }
@@ -134,6 +139,7 @@ impl AnonymizerEngine {
             dry_run,
             limit,
             max_row_bytes,
+            seed,
         } = *options;
         debug!("engine start: {options:?}");
         let mut reader = BufReader::new(input);
@@ -143,7 +149,11 @@ impl AnonymizerEngine {
             Box::new(BufWriter::new(output))
         };
         let mut parser = SqlParser::new(dialect).with_max_row_bytes(max_row_bytes);
-        let mut rng = thread_rng();
+        // ChaCha-based and seeded from the operating system unless a seed is given.
+        let mut rng = match seed {
+            Some(seed) => StdRng::seed_from_u64(seed),
+            None => StdRng::from_entropy(),
+        };
 
         let mut buffer = [0u8; 64 * 1024];
         let mut rows_processed = 0;
