@@ -1,8 +1,6 @@
-use ghostdump::cli::{
-    Args, DialectArg, MIN_SECRET_BYTES, SecretError, SecretLength, check_secret,
-};
-use ghostdump::engine::{AnonymizerEngine, RunOptions};
+use ghostdump::cli::{Args, DialectArg, MIN_SECRET_BYTES, SecretError, SecretLength, check_secret};
 use ghostdump::engine::config::{CompiledConfig, Config};
+use ghostdump::engine::{AnonymizerEngine, RunOptions};
 use ghostdump::io::{InputSource, OutputSource};
 use ghostdump::parser::detect_dialect;
 use ghostdump::parser::state::SqlDialect;
