@@ -32,11 +32,12 @@ SCHEMA = {
     "users": {
         "multiplier": 1.0,
         "columns": [
-            {"name": "id", "type": "user_id", "anon": {"strategy": "random_uuid"}},
+            # Keys are pseudonymized with HMAC, so joins with orders survive.
+            {"name": "id", "type": "user_id", "anon": {"strategy": "hmac"}},
             {
                 "name": "company_id",
                 "type": "company_id",
-                "anon": {"strategy": "random_uuid"},
+                "anon": {"strategy": "hmac"},
             },
             {"name": "name", "type": "name", "anon": {"strategy": "faker_name"}},
             {"name": "email", "type": "email", "anon": {"strategy": "faker_email"}},
@@ -68,11 +69,11 @@ SCHEMA = {
     "orders": {
         "multiplier": 2.0,
         "columns": [
-            {"name": "id", "type": "order_id", "anon": {"strategy": "random_uuid"}},
+            {"name": "id", "type": "order_id", "anon": {"strategy": "hmac"}},
             {
                 "name": "user_id",
                 "type": "order_user",
-                "anon": {"strategy": "random_uuid"},
+                "anon": {"strategy": "hmac"},
             },
             {
                 "name": "credit_card",
@@ -226,8 +227,11 @@ class TextWriter:
 # ==========================================
 # TOML GENERATOR
 # ==========================================
-def generate_toml(filepath):
+def generate_toml(filepath, bounds=None):
+    """Writes the rules. `bounds` maps a column name to the `[lo, hi]` used
+    instead of the a priori bounds of SCHEMA."""
     print(f"[*] Generating TOML config: {filepath}")
+    bounds = bounds or {}
 
     with open(filepath, "w") as f:
         for table_name, table_data in SCHEMA.items():
@@ -243,6 +247,8 @@ def generate_toml(filepath):
                 f.write(f'  name = "{col["name"]}"\n')
 
                 for key, value in anon.items():
+                    if key == "bounds" and col["name"] in bounds:
+                        value = bounds[col["name"]]
                     if isinstance(value, str):
                         f.write(f'  {key} = "{value}"\n')
                     elif isinstance(value, list):
@@ -347,6 +353,7 @@ if __name__ == "__main__":
 
     sql_path = output_dir / "dump.sql.gz"
     toml_path = output_dir / "rules.toml"
+    oracle_path = output_dir / "rules_oracle.toml"
     stats_path = output_dir / "stats.txt"
     truth_path = output_dir / "ground_truth.json"
 
@@ -356,14 +363,22 @@ if __name__ == "__main__":
     generate_toml(toml_path)
     generate_sql(sql_path, args.rows, args.mode, stats_path, generator, truth)
 
+    tables = truth.finish()
     with open(truth_path, "w") as t:
         summary = {
             "seed": args.seed,
             "rows": args.rows,
             "mode": args.mode,
-            "tables": truth.finish(),
+            "tables": tables,
         }
         json.dump(summary, t, indent=2, sort_keys=True)
+
+    # Oracle bounds: the real range of the data. They are not differentially
+    # private (they come from the data); the evaluation uses them only as the
+    # best case to compare the a priori bounds against.
+    salary = tables["users"]["salary"]
+    oracle = {"salary": [math.floor(salary["min"]), math.ceil(salary["max"])]}
+    generate_toml(oracle_path, oracle)
 
     print("\n[✓] Generation completed successfully")
     print(f"    Output directory: {output_dir}")
