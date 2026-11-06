@@ -81,11 +81,25 @@ fn main() {
 
     info!("Processing completed successfully!");
     info!("Rows processed: {}", report.rows_processed);
+    info!(
+        "Masked: {} field(s) in {} row(s), in {} data statement(s)",
+        report.fields_masked, report.rows_masked, report.data_blocks
+    );
+    for (table, rows) in &report.rows_by_table {
+        debug!("table `{table}`: {rows} row(s)");
+    }
     info!("Total time: {:.2?}", duration);
 
-    if duration.as_secs_f64() > 0.0 {
-        let rows_per_sec = (report.rows_processed as f64 / duration.as_secs_f64()) as u64;
-        info!("Speed: {} rows/second", rows_per_sec);
+    let seconds = duration.as_secs_f64();
+    if seconds > 0.0 {
+        let rows_per_sec = (report.rows_processed as f64 / seconds) as u64;
+        let mib = report.bytes_read as f64 / (1024.0 * 1024.0);
+        info!(
+            "Speed: {} rows/second, {:.1} MiB/s ({:.1} MiB read)",
+            rows_per_sec,
+            mib / seconds,
+            mib
+        );
     }
 }
 

@@ -6,6 +6,7 @@ pub mod strategy;
 use log::{debug, warn};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::collections::BTreeMap;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
 
@@ -51,6 +52,17 @@ pub struct RunReport {
     /// Values of `dp_laplace` columns that were not numbers. They were
     /// treated as the midpoint of their bounds, so the guarantee holds.
     pub non_numeric_dp_values: usize,
+    /// Bytes read from the input.
+    pub bytes_read: u64,
+    /// Data statements (`INSERT`, `REPLACE`, `COPY`) seen.
+    pub data_blocks: usize,
+    /// Rows rewritten because their table has rules.
+    pub rows_masked: usize,
+    /// Fields that went through a rule.
+    pub fields_masked: usize,
+    /// Data rows per table, by the name in the statement (`<unknown>` when
+    /// it could not be read). Schema names only, never values.
+    pub rows_by_table: BTreeMap<String, usize>,
 }
 
 /// For each position in a data block's column list, the masked column there, if any.
@@ -158,6 +170,14 @@ impl AnonymizerEngine {
 
         let mut buffer = [0u8; 64 * 1024];
         let mut rows_processed = 0;
+        let mut bytes_read_total = 0u64;
+        let mut data_blocks = 0;
+        let mut rows_masked = 0;
+        let mut rows_by_table: BTreeMap<String, usize> = BTreeMap::new();
+        // Rows of the current table, added to `rows_by_table` when the table
+        // changes, so that rows are counted without a map lookup each.
+        let mut current_table = String::new();
+        let mut current_rows = 0usize;
         let mut reached_limit = false;
         let mut unterminated_data_block = false;
 
@@ -171,6 +191,7 @@ impl AnonymizerEngine {
             if bytes_read == 0 {
                 break;
             }
+            bytes_read_total += bytes_read as u64;
 
             for &byte in &buffer[..bytes_read] {
                 let Some(event) = parser.handle_byte(byte) else {
@@ -190,7 +211,14 @@ impl AnonymizerEngine {
                             (Some(new), Some(old)) => Arc::ptr_eq(new, old),
                             _ => false,
                         };
+                        data_blocks += 1;
                         if !same {
+                            let table = metadata.as_deref().map_or("<unknown>", |m| &m.table);
+                            if table != current_table {
+                                count_rows(&mut rows_by_table, &current_table, current_rows);
+                                current_table = table.to_string();
+                                current_rows = 0;
+                            }
                             plan = match self.plan_block(metadata.as_deref(), opaque, &raw_bytes) {
                                 Ok(plan) => plan,
                                 Err(e) => {
@@ -223,10 +251,12 @@ impl AnonymizerEngine {
                                     &mut row_buffer,
                                 )?;
                                 writer.write_all(&row_buffer)?;
+                                rows_masked += 1;
                             }
                         }
 
                         rows_processed += 1;
+                        current_rows += 1;
 
                         if let Some(l) = limit
                             && rows_processed >= l
@@ -272,6 +302,7 @@ impl AnonymizerEngine {
         }
 
         writer.flush()?;
+        count_rows(&mut rows_by_table, &current_table, current_rows);
         if stats.non_numeric > 0 {
             // One warning per run, without the values.
             warn!(
@@ -284,7 +315,18 @@ impl AnonymizerEngine {
             rows_processed,
             unterminated_data_block,
             non_numeric_dp_values: stats.non_numeric,
+            bytes_read: bytes_read_total,
+            data_blocks,
+            rows_masked,
+            fields_masked: stats.masked_fields,
+            rows_by_table,
         })
+    }
+}
+
+fn count_rows(rows_by_table: &mut BTreeMap<String, usize>, table: &str, rows: usize) {
+    if rows > 0 {
+        *rows_by_table.entry(table.to_string()).or_default() += rows;
     }
 }
 
@@ -319,6 +361,7 @@ impl<R: Rng> FieldMasker for RowMasker<'_, R> {
         let Some(Some(config)) = self.columns.get(column) else {
             return value;
         };
+        self.stats.masked_fields += 1;
         if value.is_null() && config.null_policy == NullPolicy::Keep {
             return SqlValue::Null;
         }
@@ -561,6 +604,26 @@ mod tests {
             .process_dump(&input[..], io::sink(), &options)
             .unwrap_err();
         assert!(err.to_string().contains("longer than 8 bytes"), "{err}");
+    }
+
+    #[test]
+    fn test_run_report_counts() {
+        let input = b"INSERT INTO users (id, name) VALUES (1, 'a'), (2, NULL);\n\
+            INSERT INTO users (id, name) VALUES (3, 'c');\n\
+            COPY public.other (x) FROM stdin;\n1\n2\n\\.\n";
+        let mut out = Vec::new();
+        let report = engine(NAME_RULES)
+            .process_dump(&input[..], &mut out, &RunOptions::new(SqlDialect::Postgres))
+            .unwrap();
+        assert_eq!(report.rows_processed, 5);
+        assert_eq!(report.bytes_read, input.len() as u64);
+        assert_eq!(report.data_blocks, 3);
+        assert_eq!(report.rows_masked, 3);
+        assert_eq!(report.fields_masked, 3);
+        assert_eq!(
+            report.rows_by_table,
+            BTreeMap::from([("other".to_string(), 2), ("users".to_string(), 3)])
+        );
     }
 
     #[test]

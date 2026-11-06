@@ -32,6 +32,8 @@ pub enum Guarantee {
 pub struct MaskStats {
     /// Values of `dp_laplace` columns that were not numbers.
     pub non_numeric: usize,
+    /// Fields that went through a rule (NULLs kept by `null_policy` included).
+    pub masked_fields: usize,
 }
 
 #[derive(Debug, Clone)]
