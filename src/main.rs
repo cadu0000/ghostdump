@@ -12,6 +12,11 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::time::Instant;
 
+// With glibc's allocator, the threads of --threads end up sharing the main
+// thread's arena and wait on its lock (see docs/benchmarks.md).
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // Every message goes to stderr: stdout may carry the sanitized dump.
 fn main() {
     let args = Args::parse();
