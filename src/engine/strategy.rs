@@ -24,6 +24,9 @@ pub enum StrategyConfig {
         /// Also clamp the noisy output to the bounds.
         #[serde(default)]
         clamp_output: bool,
+        /// Which sampler draws the noise.
+        #[serde(default)]
+        mechanism: LaplaceSampler,
     },
     FakerName,
     FakerEmail,
@@ -43,6 +46,16 @@ pub enum StrategyConfig {
     RandomString {
         length: usize,
     },
+}
+
+/// `exact` (the default) samples on integers with no floating-point step;
+/// `f64` is the floating-point sampler, kept for comparison.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaplaceSampler {
+    #[default]
+    Exact,
+    F64,
 }
 
 impl StrategyConfig {
@@ -79,7 +92,15 @@ impl StrategyConfig {
                 sensitivity,
                 scale,
                 clamp_output,
-            } => compile_laplace(*epsilon, *bounds, *sensitivity, *scale, *clamp_output),
+                mechanism,
+            } => compile_laplace(
+                *epsilon,
+                *bounds,
+                *sensitivity,
+                *scale,
+                *clamp_output,
+                *mechanism,
+            ),
         }
     }
 }
@@ -90,6 +111,7 @@ fn compile_laplace(
     sensitivity: Option<f64>,
     scale: Option<u32>,
     clamp_output: bool,
+    sampler: LaplaceSampler,
 ) -> Result<Masker, String> {
     if sensitivity.is_some() {
         return Err(
@@ -124,13 +146,12 @@ fn compile_laplace(
         return Err(format!("`scale` must be at most {MAX_SCALE}"));
     }
 
-    Ok(Masker::Laplace(LaplaceMechanism::new(
-        epsilon,
-        lo,
-        hi,
-        scale as usize,
-        clamp_output,
-    )))
+    let decimals = scale as usize;
+    let mechanism = match sampler {
+        LaplaceSampler::Exact => LaplaceMechanism::exact(epsilon, lo, hi, decimals, clamp_output)?,
+        LaplaceSampler::F64 => LaplaceMechanism::new(epsilon, lo, hi, decimals, clamp_output),
+    };
+    Ok(Masker::Laplace(mechanism))
 }
 
 #[cfg(test)]
@@ -163,6 +184,7 @@ mod tests {
             r#"strategy = "random_choice", options = ["a"]"#,
             r#"strategy = "random_string", length = 4"#,
             r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2"#,
+            r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2, mechanism = "f64""#,
         ] {
             assert!(compile(column).is_ok(), "{column}");
         }
@@ -200,6 +222,17 @@ mod tests {
             let err = compile(column).unwrap_err();
             assert!(err.contains(message), "{column}: {err}");
         }
+    }
+
+    #[test]
+    fn test_exact_sampler_is_the_default() {
+        let column = r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2"#;
+        let Ok(Masker::Laplace(m)) = compile(column) else {
+            panic!("dp_laplace compiles");
+        };
+        assert!(m.describe().contains("exact integer sampler"));
+        let too_fine = r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 1e12], scale = 6"#;
+        assert!(compile(too_fine).unwrap_err().contains("2^53"));
     }
 
     #[test]

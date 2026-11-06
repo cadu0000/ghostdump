@@ -12,28 +12,55 @@ use crate::engine::mask::MaskStats;
 /// scale `(hi - lo) / ε`, and is written with a fixed number of decimals.
 /// Every output is then ε-LDP whatever the input.
 ///
-/// The sampler uses `f64` arithmetic, which is vulnerable to floating-point
-/// attacks (Mironov, 2012); the guarantee assumes exact arithmetic.
+/// Two samplers are available. `Exact` works on integers in units of the
+/// published precision and involves no floating-point step. `F64` samples
+/// in floating point, which is vulnerable to attacks on the low-order bits
+/// (Mironov, 2012): its guarantee assumes exact arithmetic. It is kept to
+/// measure the cost of exact sampling.
 #[derive(Debug, Clone)]
 pub struct LaplaceMechanism {
     epsilon: f64,
     lo: f64,
     hi: f64,
-    noise_scale: f64,
     decimals: usize,
     clamp_output: bool,
+    sampler: Sampler,
+}
+
+#[derive(Debug, Clone)]
+enum Sampler {
+    F64 { noise_scale: f64 },
+    Exact(ExactDomain),
 }
 
 impl LaplaceMechanism {
+    /// The `f64` sampler.
     pub fn new(epsilon: f64, lo: f64, hi: f64, decimals: usize, clamp_output: bool) -> Self {
         Self {
             epsilon,
             lo,
             hi,
-            noise_scale: (hi - lo) / epsilon,
             decimals,
             clamp_output,
+            sampler: Sampler::F64 {
+                noise_scale: (hi - lo) / epsilon,
+            },
         }
+    }
+
+    /// The exact integer sampler; fails when the bounds, `scale` and ε do
+    /// not fit its integer domain.
+    pub fn exact(
+        epsilon: f64,
+        lo: f64,
+        hi: f64,
+        decimals: usize,
+        clamp_output: bool,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            sampler: Sampler::Exact(ExactDomain::new(epsilon, lo, hi, decimals)?),
+            ..Self::new(epsilon, lo, hi, decimals, clamp_output)
+        })
     }
 
     pub(crate) fn apply(
@@ -50,7 +77,12 @@ impl LaplaceMechanism {
             stats.non_numeric += 1;
         }
 
-        let text = self.format(self.noisy(parsed, rng));
+        let text = match &self.sampler {
+            Sampler::F64 { noise_scale } => self.format(self.noisy(parsed, *noise_scale, rng)),
+            Sampler::Exact(domain) => {
+                domain.format(domain.noisy(domain.to_units(parsed), self.clamp_output, rng))
+            }
+        };
         // A number stays unquoted when it came unquoted.
         match value {
             SqlValue::Text(_) => SqlValue::Text(text),
@@ -58,23 +90,34 @@ impl LaplaceMechanism {
         }
     }
 
+    /// The ε spent per value: the configured one for `F64`, and Δ/t (never
+    /// above it) for `Exact`.
     pub fn epsilon(&self) -> f64 {
-        self.epsilon
+        match &self.sampler {
+            Sampler::F64 { .. } => self.epsilon,
+            Sampler::Exact(domain) => domain.effective_epsilon(),
+        }
     }
 
     /// One line for the debug log and the guarantees table.
     pub fn describe(&self) -> String {
+        let sampler = match &self.sampler {
+            Sampler::F64 { .. } => "f64 sampler: assumes exact arithmetic".to_string(),
+            Sampler::Exact(_) => format!("exact integer sampler, configured ε = {}", self.epsilon),
+        };
         format!(
-            "Laplace noise, ε-LDP per value with ε = {}, bounds [{}, {}], scale {} \
-             (f64 sampler: assumes exact arithmetic)",
-            self.epsilon, self.lo, self.hi, self.decimals
+            "Laplace noise, ε-LDP per value with ε = {}, bounds [{}, {}], scale {} ({sampler})",
+            self.epsilon(),
+            self.lo,
+            self.hi,
+            self.decimals
         )
     }
 
     /// `None` stands for a value that is not a number.
-    fn noisy(&self, value: Option<f64>, rng: &mut impl Rng) -> f64 {
+    fn noisy(&self, value: Option<f64>, noise_scale: f64, rng: &mut impl Rng) -> f64 {
         let clamped = value.map_or((self.lo + self.hi) / 2.0, |v| v.clamp(self.lo, self.hi));
-        let noisy = clamped + laplace_noise(self.noise_scale, rng);
+        let noisy = clamped + laplace_noise(noise_scale, rng);
         if self.clamp_output {
             noisy.clamp(self.lo, self.hi)
         } else {
@@ -415,5 +458,26 @@ mod tests {
             let out = domain.noisy(50, true, &mut rng);
             assert!((0..=100).contains(&out), "{out}");
         }
+    }
+
+    #[test]
+    fn test_exact_mechanism_writes_integer_units() {
+        let m = LaplaceMechanism::exact(1.0, 0.0, 100.0, 2, false).unwrap();
+        let mut rng = rng();
+        for input in ["5", "5.123456", "Batman"] {
+            let (out, _) = apply(&m, SqlValue::Raw(input.into()), &mut rng);
+            let text = out.as_str().unwrap().to_string();
+            assert_eq!(text.split('.').nth(1).map(str::len), Some(2), "{text}");
+        }
+        assert!(m.epsilon() <= 1.0);
+        assert!(m.describe().contains("exact integer sampler"));
+    }
+
+    #[test]
+    fn test_exact_mechanism_clamps_before_noise() {
+        let m = LaplaceMechanism::exact(1.0, 0.0, 100.0, 2, false).unwrap();
+        let (far, _) = apply(&m, SqlValue::Raw("1000000".into()), &mut rng());
+        let (edge, _) = apply(&m, SqlValue::Raw("100".into()), &mut rng());
+        assert_eq!(far, edge);
     }
 }
