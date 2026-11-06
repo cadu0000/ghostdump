@@ -17,6 +17,11 @@ const INVALID_RULES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/invalid_rules.toml"
 );
+const PG_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/pg_data_rules.toml"
+);
+const GOLDEN_SECRET: &str = "golden-test-secret-0123456789";
 const DP_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dp_rules.toml");
 
 /// Runs ghostdump with `args`, the secret (if any) in the environment, and
@@ -196,4 +201,39 @@ fn non_numeric_dp_values_are_counted_once() {
     assert!(output.status.success(), "stderr: {stderr}");
     assert_eq!(stderr.matches("were not numbers").count(), 1, "{stderr}");
     assert!(stderr.contains("2 value(s)"), "{stderr}");
+}
+
+/// Regenerate after an intended change (a new `fake` version, for example):
+///
+/// ```sh
+/// GHOSTDUMP_SECRET=golden-test-secret-0123456789 ghostdump --seed 42 \
+///     -c tests/fixtures/pg_data_rules.toml -i tests/fixtures/pg_data.sql \
+///     > tests/fixtures/pg_data_masked.sql
+/// ```
+#[test]
+fn seeded_run_matches_the_golden_output() {
+    let expected = include_bytes!("fixtures/pg_data_masked.sql");
+    let output = run(
+        &["-c", PG_RULES, "--seed", "42"],
+        Some(GOLDEN_SECRET),
+        PG_DATA,
+    );
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).contains("--seed makes every random choice reproducible"));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(expected)
+    );
+}
+
+#[test]
+fn noise_is_reproducible_only_with_a_seed() {
+    let dump = b"INSERT INTO users (salary) VALUES (10), (20), (30);\n";
+    let seeded = |seed: &str| run(&["-c", DP_RULES, "--seed", seed], None, dump).stdout;
+    let unseeded = || run(&["-c", DP_RULES], None, dump).stdout;
+
+    assert_eq!(seeded("7"), seeded("7"));
+    assert_ne!(seeded("7"), seeded("8"));
+    assert_ne!(unseeded(), unseeded());
 }
