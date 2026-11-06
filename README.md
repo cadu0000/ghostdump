@@ -237,6 +237,8 @@ cargo test -- --nocapture
 
 Continuous integration (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on every push and pull request. The integration tests in `tests/` run the binary on fixture dumps and compare its output with expected files.
 
+`tests/properties.rs` holds property-based tests (proptest): on inputs built from SQL fragments and arbitrary bytes, the parser reports every byte, a run without rules is an exact copy or a clean error, and masking keeps the rows and the unmasked columns. `cargo test` runs 256 cases per property; for a deeper search, run `PROPTEST_CASES=100000 cargo test --release --test properties`.
+
 The statistical validation of the Laplace samplers is slow and ignored by default; run it with `cargo test --release -- --ignored`.
 
 For reproducible experiments, the hidden `--seed <N>` option fixes every random choice (generated values and Laplace noise). Anyone who knows the seed can recompute them, so never use it on real data.
