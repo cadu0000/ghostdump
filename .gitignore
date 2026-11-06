@@ -16,3 +16,5 @@
 .DS_Store
 
 *.pdb
+# Output of scripts/sql_generator.py
+/generated/
