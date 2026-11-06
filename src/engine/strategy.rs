@@ -3,7 +3,8 @@
 
 use serde::Deserialize;
 
-use crate::engine::mask::{LaplaceMechanism, Masker, Synthetic};
+use crate::engine::laplace::LaplaceMechanism;
+use crate::engine::mask::{Masker, Synthetic};
 
 /// Most decimal places `dp_laplace` accepts in `scale`.
 const MAX_SCALE: u32 = 12;

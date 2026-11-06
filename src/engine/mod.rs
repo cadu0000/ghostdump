@@ -1,4 +1,5 @@
 pub mod config;
+pub mod laplace;
 pub mod mask;
 pub mod strategy;
 
