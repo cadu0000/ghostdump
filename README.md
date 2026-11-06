@@ -110,7 +110,7 @@ GhostDump is currently under active development. The core parsing engine is func
 * [x] **Masking Strategies**: Deterministic HMAC and Faker-based PII anonymization.
 * [x] **Differential Privacy**: Laplace mechanism with bounds, clamping and fixed precision.
 * [x] **Rule Engine Integration**: Connect the `rules.toml` to the FSM.
-* [ ] **UX & Metrics**: Real-time progress metrics (`indicatif`).
+* [x] **UX & Metrics**: Real-time progress metrics (`-p`, `indicatif`) and an end-of-run summary (rows, masked fields, MiB/s).
 * [x] **Structured Logging**: Verbose debug mode (`--verbose`) and `GHOSTDUMP_LOG`.
 * [x] **Edge Cases**: Advanced handling of `NULL` values (`null_policy`).
 * [ ] **Parallel Processing**: Multi-threading for the masking step.
@@ -210,7 +210,7 @@ zcat production_db.sql.gz | ghostdump -c rules.toml | gzip > dev_db_anon.sql.gz
 | `-i` | `--input <FILE>` | Path to the input SQL dump file. |
 | `-o` | `--output <FILE>` | Path to the output SQL dump file. |
 | `-s` | `--secret <STR>` | Cryptographic secret for HMAC, required when the rules use `hmac` (Can also use `GHOSTDUMP_SECRET` env var). |
-| `-p` | `--progress` | Displays real-time progress metrics (MB/s, ETA). |
+| `-p` | `--progress` | Displays a progress bar on stderr: share read and ETA for a plain input file, bytes read and rate for stdin or `.gz`. Hidden when stderr is not a terminal. |
 | `-v` | `--verbose` | Enables detailed debug logging for troubleshooting. |
 | `-d` | `--dry-run` | Processes input without writing output (Validation mode). |
 | `-l` | `--limit <ROWS>` | Stop after N data rows, closing the statement they belong to. Statements after that point (such as a final `COMMIT`) are not written. |
