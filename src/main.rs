@@ -33,6 +33,7 @@ fn main() {
                 config.tables.len(),
                 path.display()
             );
+            log_guarantees(&config);
             config
         }
         None => {
@@ -109,6 +110,20 @@ fn main() {
             rows_per_sec,
             mib / seconds,
             mib
+        );
+    }
+}
+
+/// What the rules protect, one line per table. ε adds up over the rows of
+/// a person and over repeated releases, which GhostDump cannot see.
+fn log_guarantees(config: &CompiledConfig) {
+    for table in config.guarantees() {
+        info!("privacy: {table}");
+    }
+    if config.guarantees().iter().any(|t| !t.ldp.is_empty()) {
+        info!(
+            "privacy: ε adds up over the rows of one person and over repeated releases \
+             (see docs/guarantees.md)"
         );
     }
 }
