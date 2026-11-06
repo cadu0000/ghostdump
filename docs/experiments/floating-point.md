@@ -62,7 +62,7 @@ Arms:
 
 ## Consequences
 
-* The guarantee of the `f64` arm holds only under two conditions: exact arithmetic is not assumed of the program, but the output must be rounded to a grid much coarser than the spacing of doubles at the output's magnitude. GhostDump does not check this; `scale` up to 12 is accepted. The exact sampler, the default, needs neither condition.
+* The `f64` arm keeps its guarantee only if the output is rounded to a grid much coarser than the spacing of doubles at the output's magnitude. GhostDump does not check this condition: it accepts `scale` up to 12. The exact sampler, the default, does not depend on it.
 * These results support the decision recorded in [decisions/0001-laplace-sampler.md](../decisions/0001-laplace-sampler.md) and feed the conditions of the guarantees table.
 * Limitation: the reachability test assumes the attacker knows the sampler and its parameters, which is the standard assumption (Kerckhoffs). It does not need the seed.
 
