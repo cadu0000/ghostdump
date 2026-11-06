@@ -59,6 +59,8 @@ The criterion set in the plan: build the chunked parser if, with the full rule s
 
 Both are below 40%, so the chunked parser is **not** built for now: with rules, masking dominates. Without rules the parser is almost the whole cost (122 of 126 MiB/s), so the chunked parser would mainly speed up pass-through copies. The question can be reopened if the evaluation needs faster runs without rules.
 
+**Reopened by parallel masking.** With `--threads`, masking runs beside the parser instead of after it, so the parser bounds every run, with or without rules (see [Parallel masking](#parallel-masking)).
+
 ---
 
 ##  End-to-end runs
@@ -108,3 +110,65 @@ Findings:
 * The first paper reported about 307,000 rows/s and 4.7 MB with its rules on another machine; the numbers here are not directly comparable to it, only to each other.
 
 Larger sizes (10^7 and 10^8 users) run with the same command; they were not measured on this machine because generating and running them takes hours.
+
+---
+
+##  Parallel masking
+
+`--threads N` masks rows on N threads while the calling thread reads, parses and writes; the design is in [decisions/0002-parallel-masking.md](decisions/0002-parallel-masking.md). The grid takes a list of thread counts:
+
+```bash
+python3 scripts/bench_grid.py --sizes 100000,1000000 --runs 5 --threads 1,2,3,4 --out results.csv
+```
+
+Runs without rules use one thread: with nothing to mask, the CLI ignores the option.
+
+### Results (November 2026, reference machine above)
+
+Median of 5 runs after one warm-up, 3,000,000 rows, in rows per second; the raw runs are in [bench-results/2026-11-threads.csv](bench-results/2026-11-threads.csv). In brackets, the share of the speed of a copy without rules, which is 1,734,000 rows/s on COPY and 990,000 on INSERT.
+
+**COPY**
+
+| Configuration | 1 thread | 2 threads | 3 threads | 4 threads |
+| --- | --- | --- | --- | --- |
+| `hmac_only` | 597,000 (34%) | 1,522,000 (88%) | 1,716,000 (99%) | 1,588,000 (92%) |
+| `laplace_f64` | 1,453,000 (84%) | 1,739,000 (100%) | 1,715,000 (99%) | 1,831,000 (106%) |
+| `laplace_exact` | 1,311,000 (76%) | 1,676,000 (97%) | 1,801,000 (104%) | 1,773,000 (102%) |
+| `full` | 446,000 (26%) | 1,151,000 (66%) | 1,612,000 (93%) | 1,468,000 (85%) |
+
+**INSERT**
+
+| Configuration | 1 thread | 2 threads | 3 threads | 4 threads |
+| --- | --- | --- | --- | --- |
+| `hmac_only` | 398,000 (40%) | 999,000 (101%) | 983,000 (99%) | 995,000 (101%) |
+| `laplace_f64` | 769,000 (78%) | 1,002,000 (101%) | 1,022,000 (103%) | 1,019,000 (103%) |
+| `laplace_exact` | 751,000 (76%) | 1,018,000 (103%) | 1,008,000 (102%) | 1,012,000 (102%) |
+| `full` | 316,000 (32%) | 885,000 (89%) | 989,000 (100%) | 939,000 (95%) |
+
+**Peak memory**, over both formats and every rule set:
+
+| Threads | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| 300,000 and 3,000,000 rows | 6.6–6.9 MiB | 9.5–11.2 MiB | 10.7–11.9 MiB | 10.7–13.6 MiB |
+
+Findings:
+
+* **Two or three threads hide the cost of masking.** With three threads every rule set runs at 93–104% of the speed of a copy without rules; on INSERT two are enough. The full rule set goes from 446,000 to 1,612,000 rows/s on COPY (3.6 times) and from 316,000 to 989,000 on INSERT (3.1 times). Shares above 100% are noise on a shared machine.
+* **The parser is now the limit.** The reading thread parses every byte, so no number of threads goes past the copy without rules. Four threads are no better than three here: four maskers and the reading thread are more threads than the machine's 4 vCPUs.
+* **Memory stays bounded.** Peak memory grows with the number of threads (segments in flight and one allocator heap per thread) but not with the dump: 300,000 and 3,000,000 rows differ by less than 2 MiB, in both directions.
+* **One thread costs what it did before.** With `--threads 1`, the default, rows are masked on the reading thread as before. Against the table of the previous section, `full` on COPY runs at 446,000 rows/s instead of 418,000 and peaks at 6.6 MiB instead of 5.7–5.8 MiB; both differences come from the allocator change described next.
+
+### Allocator
+
+With glibc's allocator, threads do not help. Same runs, `full` rule set, 3,000,000 rows, median of 5 runs, in seconds; the glibc build is the same source without the `#[global_allocator]` lines in `src/main.rs`. Raw runs in [bench-results/2026-11-allocator.csv](bench-results/2026-11-allocator.csv).
+
+| Allocator | Format | 1 thread | 2 threads | 3 threads | 4 threads |
+| --- | --- | --- | --- | --- | --- |
+| glibc | COPY | 7.20 | 6.64 | 7.63 | 5.66 |
+| mimalloc | COPY | 6.71 | 2.54 | 1.82 | 2.22 |
+| glibc | INSERT | 9.97 | 12.51 | 10.39 | 10.09 |
+| mimalloc | INSERT | 9.55 | 3.44 | 3.09 | 3.16 |
+
+The cause is glibc's per-thread cache (tcache), which keeps freed chunks of any arena. When a masking thread frees a chunk that the reading thread allocated (thread start-up does this), the chunk goes to the masking thread's cache and is handed out again. A later `realloc` of it locks the reading thread's arena and allocates the new chunk there, so such chunks keep circulating, and every masking thread ends up waiting on that one lock. The maskers call `realloc` often: the `fake` crate builds names and e-mails with `format!` and `replace`. On COPY with 4 threads, a run made about 250,000 context switches and used almost twice the CPU time of one thread (13.8 s against 7.1 s, user plus system); with `GLIBC_TUNABLES=glibc.malloc.tcache_count=0` the same binary took 2.5–2.7 s instead of 6.3–6.6 s.
+
+GhostDump therefore uses mimalloc, whose heaps are per thread, as the global allocator of the binary (the library and the Criterion benchmarks keep the system allocator). By default mimalloc commits whole arenas on Linux, which peaked at 15.5 MiB with one thread and 38–66 MiB with threads; `.cargo/config.toml` builds it to commit on demand (`MI_DEFAULT_ARENA_EAGER_COMMIT=0`), which gives the peaks above at the same speed. Setting the option at run time comes too late, because the first arena is reserved before `main`. The cost is a C dependency built by `cc` and 157 KiB of binary.
