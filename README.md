@@ -145,7 +145,7 @@ columns = [
 
 Only the declared columns are rewritten; every other byte of the dump, including the layout of `INSERT` statements and `COPY` blocks, is copied unchanged. Values keep their SQL type: numbers stay unquoted, generated text is escaped for the dialect, and `NULL` stays `NULL` by default. Add `null_policy = "generate"` to a column to mask `NULL` values too.
 
-Rules are checked before any data is read: a rule with a missing or invalid parameter stops GhostDump with a message that names the table and column.
+Rules are checked before any data is read: a rule with a missing or invalid parameter stops GhostDump with a message that names the table and column. Then GhostDump prints, on stderr, what the rules guarantee for each table: the ε a row spends over its `dp_laplace` columns, and which columns are 0-LDP or only pseudonymized.
 
 #### `dp_laplace`
 
