@@ -53,7 +53,12 @@ BOUNDS_SHARE = 0.1
 HIST_EDGES = [i * 1000.0 for i in range(21)]  # 20 bins over [0, 20000)
 EM_TRUE_BINS = 50
 EM_OBS_BINS = 240
-EM_ITERATIONS = 200
+# EM stops when the estimated distribution moves less than EM_TOLERANCE (L1)
+# in one iteration, or after EM_MAX_ITERATIONS. With noise much wider than
+# the bounds, EM converges slowly: a fixed small number of iterations leaves
+# the estimate near its uniform start.
+EM_TOLERANCE = 1e-5
+EM_MAX_ITERATIONS = 5000
 
 QUERIES = [
     "mean",
@@ -205,7 +210,7 @@ def deconvolve(noisy, bounds, b):
     observed = [(counts[m], kernel[m]) for m in range(EM_OBS_BINS) if counts[m]]
     total = len(noisy)
     p = [1.0 / EM_TRUE_BINS] * EM_TRUE_BINS
-    for _ in range(EM_ITERATIONS):
+    for _ in range(EM_MAX_ITERATIONS):
         acc = [0.0] * EM_TRUE_BINS
         for count, row in observed:
             denom = sum(pj * k for pj, k in zip(p, row))
@@ -214,7 +219,11 @@ def deconvolve(noisy, bounds, b):
             factor = count / denom
             for j in range(EM_TRUE_BINS):
                 acc[j] += row[j] * factor
-        p = [pj * a / total for pj, a in zip(p, acc)]
+        new = [pj * a / total for pj, a in zip(p, acc)]
+        moved = sum(abs(a - b) for a, b in zip(new, p))
+        p = new
+        if moved < EM_TOLERANCE:
+            break
     return centres, width, p
 
 
