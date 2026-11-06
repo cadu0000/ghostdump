@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -79,6 +80,15 @@ pub struct Args {
     )]
     pub max_row_size: usize,
 
+    #[arg(
+        short = 'j',
+        long,
+        value_name = "N",
+        default_value = "1",
+        help = "Threads que mascaram as linhas; a leitura e a escrita ficam na thread principal"
+    )]
+    pub threads: NonZeroUsize,
+
     /// Fixes every random choice, for reproducible experiments. Hidden: a
     /// known seed lets anyone recompute the generated values and the noise.
     #[arg(long, hide = true, value_name = "N")]
@@ -131,6 +141,14 @@ mod tests {
         assert_eq!(check_secret(None), Err(SecretError::Missing));
         assert_eq!(check_secret(Some("")), Err(SecretError::Empty));
         assert_eq!(check_secret(Some("   ")), Err(SecretError::Empty));
+    }
+
+    #[test]
+    fn test_threads() {
+        let parse = |args: &[&str]| Args::try_parse_from([&["ghostdump"], args].concat());
+        assert_eq!(parse(&[]).unwrap().threads.get(), 1);
+        assert_eq!(parse(&["-j", "4"]).unwrap().threads.get(), 4);
+        assert!(parse(&["--threads", "0"]).is_err());
     }
 
     #[test]

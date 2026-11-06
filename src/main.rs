@@ -67,8 +67,10 @@ fn main() {
         limit: args.limit,
         max_row_bytes: args.max_row_size.saturating_mul(1024 * 1024),
         seed: args.seed,
+        threads: args.threads.get(),
         ..RunOptions::new(dialect)
     };
+    debug!("masking threads: {}", options.threads);
 
     if args.seed.is_some() {
         warn!(
