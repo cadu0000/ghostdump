@@ -55,6 +55,7 @@ This approach enables:
 * **Single-pass processing**: The SQL dump is parsed only once.
 * **High composability**: Easy integration with other Unix tools (`zcat`, `gzip`).
 * **Lazy masking strategies**: Transformations are applied only to mapped columns.
+* **Parallel masking** (`--threads N`): the reader groups rows into segments of at most 1,024 masked rows, N threads mask them, and the writer puts them back in input order. At most 2N segments are in flight, so memory stays bounded, and a seeded run writes the same output for any N.
 
 ---
 
@@ -113,7 +114,7 @@ GhostDump is currently under active development. The core parsing engine is func
 * [x] **UX & Metrics**: Real-time progress metrics (`-p`, `indicatif`) and an end-of-run summary (rows, masked fields, MiB/s).
 * [x] **Structured Logging**: Verbose debug mode (`--verbose`) and `GHOSTDUMP_LOG`.
 * [x] **Edge Cases**: Advanced handling of `NULL` values (`null_policy`).
-* [ ] **Parallel Processing**: Multi-threading for the masking step.
+* [x] **Parallel Processing**: Masking on a pool of threads (`--threads`), with the output in input order.
 
 ---
 
@@ -222,6 +223,7 @@ zcat production_db.sql.gz | ghostdump -c rules.toml | gzip > dev_db_anon.sql.gz
 | `-l` | `--limit <ROWS>` | Stop after N data rows, closing the statement they belong to. Statements after that point (such as a final `COMMIT`) are not written. |
 | | `--dialect <NAME>` | `auto` (default), `postgres`, `mysql` or `sqlite`. |
 | | `--max-row-size <MiB>` | Largest data row accepted (default 256). |
+| `-j` | `--threads <N>` | Threads that mask rows (default 1). Reading, parsing and writing stay on one thread; the output is the same for any number of threads. See [benchmarks](docs/benchmarks.md) for the speedup. |
 
 ---
 
@@ -247,7 +249,7 @@ Continuous integration (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `c
 
 The statistical validation of the Laplace samplers is slow and ignored by default; run it with `cargo test --release -- --ignored`.
 
-For reproducible experiments, the hidden `--seed <N>` option fixes every random choice (generated values and Laplace noise). Anyone who knows the seed can recompute them, so never use it on real data.
+For reproducible experiments, the hidden `--seed <N>` option fixes every random choice (generated values and Laplace noise). Anyone who knows the seed can recompute them, so never use it on real data. A seeded run writes the same output for any `--threads`.
 
 ---
 
@@ -258,8 +260,9 @@ For reproducible experiments, the hidden `--seed <N>` option fixes every random 
 | [docs/guarantees.md](docs/guarantees.md) | What each strategy protects, under which conditions, and the propositions behind it |
 | [docs/experiments/utility.md](docs/experiments/utility.md) | Utility of masked dumps: local arms, SQL and estimator analysts, central-DP comparator (`scripts/utility_eval.py`) |
 | [docs/experiments/floating-point.md](docs/experiments/floating-point.md) | Floating-point distinguishing experiment on the Laplace samplers (`examples/fp_distinguisher.rs`) |
-| [docs/benchmarks.md](docs/benchmarks.md) | Microbenchmarks and end-to-end throughput and memory (`benches/`, `scripts/bench_grid.py`) |
+| [docs/benchmarks.md](docs/benchmarks.md) | Microbenchmarks, end-to-end throughput and memory, and parallel masking (`benches/`, `scripts/bench_grid.py`) |
 | [docs/decisions/0001-laplace-sampler.md](docs/decisions/0001-laplace-sampler.md) | Why the exact integer sampler, and why not OpenDP |
+| [docs/decisions/0002-parallel-masking.md](docs/decisions/0002-parallel-masking.md) | How `--threads` keeps the output ordered, reproducible and in bounded memory, and why mimalloc |
 | [docs/dataset-generation.md](docs/dataset-generation.md) | The seeded dataset generator and its rule sets |
 | [docs/future-work.md](docs/future-work.md) | Shuffling and other directions not taken |
 
