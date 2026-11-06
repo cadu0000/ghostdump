@@ -20,6 +20,11 @@ questions of RQ-δ:
 Every combination of n, ε, arm and repetition writes one CSV row per query.
 A summary of mean errors is printed as a Markdown table.
 
+With `--task categorical`, the same is done for a categorical column
+(`status`, 70/20/10): `random_choice` against `randomized_response` read
+straight (SQL shares) and through the unbiased frequency estimator, and
+central DP (Laplace on the counts).
+
 Example:
 
     cargo build --release
@@ -93,7 +98,7 @@ def write_dump(path, salaries):
         f.write("\\.\n")
 
 
-def read_masked(path):
+def read_masked(path, convert=float):
     values = []
     with open(path) as f:
         in_copy = False
@@ -104,25 +109,30 @@ def read_masked(path):
                 in_copy = False
             elif in_copy:
                 field = line.rstrip("\n").split("\t")[1]
-                values.append(None if field == "\\N" else float(field))
+                values.append(None if field == "\\N" else convert(field))
     return values
 
 
 def run_ghostdump(binary, dump, epsilon, bounds, seed, workdir):
-    rules = workdir / "rules.toml"
     lo, hi = bounds
-    rules.write_text(
-        "[tables.users]\ncolumns = [\n"
-        f'    {{ name = "salary", strategy = "dp_laplace", epsilon = {epsilon!r}, '
-        f"bounds = [{lo!r}, {hi!r}], scale = 2 }},\n]\n"
+    rule = (
+        f'{{ name = "salary", strategy = "dp_laplace", epsilon = {epsilon!r}, '
+        f"bounds = [{lo!r}, {hi!r}], scale = 2 }}"
     )
+    return read_masked(mask(binary, dump, rule, seed, workdir))
+
+
+def mask(binary, dump, rule, seed, workdir):
+    """Runs GhostDump with one rule on the `users` table; returns the output path."""
+    rules = workdir / "rules.toml"
+    rules.write_text(f"[tables.users]\ncolumns = [\n    {rule},\n]\n")
     out = workdir / "masked.sql"
     subprocess.run(
         [str(binary), "-c", str(rules), "-i", str(dump), "-o", str(out), "--seed", str(seed)],
         check=True,
         env=dict(os.environ, GHOSTDUMP_LOG="error"),
     )
-    return read_masked(out)
+    return out
 
 
 # ==========================================
@@ -341,6 +351,7 @@ def dp_bounds(rng, values, epsilon_share):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--task", choices=["numeric", "categorical"], default="numeric")
     parser.add_argument("--sizes", default="10000,100000")
     parser.add_argument("--epsilons", default="0.5,1,2")
     parser.add_argument("--reps", type=int, default=10)
@@ -351,50 +362,176 @@ def main():
     parser.add_argument("--out", default="utility_results.csv")
     args = parser.parse_args()
 
-    rows = []
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
-        for n in (int(x) for x in args.sizes.split(",")):
-            salaries = make_salaries(n, args.seed)
-            dump = workdir / "dump.sql"
-            write_dump(dump, salaries)
-            true_sorted = sorted(v for v in salaries if v is not None)
-            ranges = range_queries(true_sorted)
-            truth = answer_naive(salaries, ranges)
-            oracle = (math.floor(true_sorted[0]), math.ceil(true_sorted[-1]))
-
-            for epsilon in (float(e) for e in args.epsilons.split(",")):
-                for rep in range(args.reps):
-                    rng = random.Random(f"{args.seed}-{n}-{epsilon}-{rep}")
-                    arms = {
-                        "a_priori": (A_PRIORI, epsilon),
-                        "dp_bounds": (
-                            dp_bounds(rng, salaries, BOUNDS_SHARE * epsilon),
-                            (1 - BOUNDS_SHARE) * epsilon,
-                        ),
-                        "oracle": (oracle, epsilon),
-                    }
-                    for arm, (bounds, value_epsilon) in arms.items():
-                        noisy = run_ghostdump(
-                            args.binary, dump, value_epsilon, bounds, rep + 1, workdir
-                        )
-                        b = (bounds[1] - bounds[0]) / value_epsilon
-                        for analyst, answers in (
-                            ("naive", answer_naive(noisy, ranges)),
-                            ("estimator", answer_estimator(noisy, bounds, b, ranges)),
-                        ):
-                            rows += result_rows(n, epsilon, arm, analyst, rep, bounds, answers, truth)
-                    for arm, bounds in (("central_a_priori", A_PRIORI), ("central_oracle", oracle)):
-                        answers = answer_central(rng, salaries, bounds, epsilon, ranges)
-                        rows += result_rows(n, epsilon, arm, "central", rep, bounds, answers, truth)
-                print(f"n = {n}, ε = {epsilon}: done", file=sys.stderr)
+        if args.task == "numeric":
+            rows = run_numeric(args, workdir)
+        else:
+            rows = run_categorical(args, workdir)
 
     with open(args.out, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    print_summary(rows)
+    print_summary(rows, QUERIES if args.task == "numeric" else CATEGORICAL_QUERIES)
     print(f"\n{len(rows)} rows written to {args.out}", file=sys.stderr)
+
+
+def run_numeric(args, workdir):
+    rows = []
+    for n in (int(x) for x in args.sizes.split(",")):
+        salaries = make_salaries(n, args.seed)
+        dump = workdir / "dump.sql"
+        write_dump(dump, salaries)
+        true_sorted = sorted(v for v in salaries if v is not None)
+        ranges = range_queries(true_sorted)
+        truth = answer_naive(salaries, ranges)
+        oracle = (math.floor(true_sorted[0]), math.ceil(true_sorted[-1]))
+
+        for epsilon in (float(e) for e in args.epsilons.split(",")):
+            for rep in range(args.reps):
+                rng = random.Random(f"{args.seed}-{n}-{epsilon}-{rep}")
+                arms = {
+                    "a_priori": (A_PRIORI, epsilon),
+                    "dp_bounds": (
+                        dp_bounds(rng, salaries, BOUNDS_SHARE * epsilon),
+                        (1 - BOUNDS_SHARE) * epsilon,
+                    ),
+                    "oracle": (oracle, epsilon),
+                }
+                for arm, (bounds, value_epsilon) in arms.items():
+                    noisy = run_ghostdump(
+                        args.binary, dump, value_epsilon, bounds, rep + 1, workdir
+                    )
+                    b = (bounds[1] - bounds[0]) / value_epsilon
+                    for analyst, answers in (
+                        ("naive", answer_naive(noisy, ranges)),
+                        ("estimator", answer_estimator(noisy, bounds, b, ranges)),
+                    ):
+                        rows += result_rows(n, epsilon, arm, analyst, rep, bounds, answers, truth)
+                for arm, bounds in (("central_a_priori", A_PRIORI), ("central_oracle", oracle)):
+                    answers = answer_central(rng, salaries, bounds, epsilon, ranges)
+                    rows += result_rows(n, epsilon, arm, "central", rep, bounds, answers, truth)
+            print(f"n = {n}, ε = {epsilon}: done", file=sys.stderr)
+    return rows
+
+
+# ==========================================
+# CATEGORICAL COLUMN
+# ==========================================
+CATEGORIES = ["ACTIVE", "PENDING", "INACTIVE"]
+CATEGORICAL_QUERIES = [f"share_{c}" for c in CATEGORIES] + ["tv"]
+
+
+def make_statuses(n, seed):
+    generator = Generator(seed, n, {})
+    column = {"name": "status", "type": "status"}
+    return [generator.value(column, i) for i in range(1, n + 1)]
+
+
+def write_category_dump(path, values):
+    with open(path, "w") as f:
+        f.write("CREATE TABLE users (id integer, status text);\n")
+        f.write("COPY users (id, status) FROM stdin;\n")
+        for i, value in enumerate(values, 1):
+            f.write(f"{i}\t{value}\n")
+        f.write("\\.\n")
+
+
+def shares(values):
+    counts = {c: 0 for c in CATEGORIES}
+    for v in values:
+        if v in counts:
+            counts[v] += 1
+    total = sum(counts.values()) or 1
+    return [counts[c] / total for c in CATEGORIES]
+
+
+def project(estimates):
+    """Clips negative shares to 0 and renormalizes (post-processing)."""
+    clipped = [max(0.0, e) for e in estimates]
+    total = sum(clipped) or 1.0
+    return [c / total for c in clipped]
+
+
+def rr_estimator(observed, epsilon):
+    """Unbiased frequency estimate for k-ary randomized response:
+    (observed − q) / (p − q), with p = e^ε/(e^ε+k−1) and q = 1/(e^ε+k−1)."""
+    k = len(CATEGORIES)
+    e = math.exp(epsilon)
+    p, q = e / (e + k - 1), 1 / (e + k - 1)
+    return project([(o - q) / (p - q) for o in observed])
+
+
+def central_shares(rng, values, epsilon):
+    """Laplace noise on each count; replacing one value changes two counts
+    by one, so the L1 sensitivity is 2."""
+    n = len(values)
+    return project([s * n + laplace(rng, 2.0 / epsilon) for s in shares(values)])
+
+
+def categorical_rows(n, epsilon, arm, analyst, rep, estimate, truth):
+    out = []
+    errors = {f"share_{c}": e - t for c, e, t in zip(CATEGORIES, estimate, truth)}
+    errors["tv"] = total_variation(estimate, truth)
+    for query, error in errors.items():
+        out.append(
+            {
+                "n": n,
+                "epsilon": epsilon,
+                "arm": arm,
+                "analyst": analyst,
+                "rep": rep,
+                "lo": "",
+                "hi": "",
+                "query": query,
+                "estimate": "",
+                "truth": "",
+                "error": round(error, 6),
+            }
+        )
+    return out
+
+
+def run_categorical(args, workdir):
+    rows = []
+    options = ", ".join(f'"{c}"' for c in CATEGORIES)
+    for n in (int(x) for x in args.sizes.split(",")):
+        statuses = make_statuses(n, args.seed)
+        dump = workdir / "dump.sql"
+        write_category_dump(dump, statuses)
+        truth = shares(statuses)
+        for epsilon in (float(e) for e in args.epsilons.split(",")):
+            for rep in range(args.reps):
+                rng = random.Random(f"{args.seed}-{n}-{epsilon}-{rep}-categorical")
+                choice = mask(
+                    args.binary,
+                    dump,
+                    f'{{ name = "status", strategy = "random_choice", options = [{options}] }}',
+                    rep + 1,
+                    workdir,
+                )
+                observed = shares(read_masked(choice, str))
+                rows += categorical_rows(n, epsilon, "random_choice", "naive", rep, observed, truth)
+
+                rr = mask(
+                    args.binary,
+                    dump,
+                    f'{{ name = "status", strategy = "randomized_response", '
+                    f"epsilon = {epsilon!r}, categories = [{options}] }}",
+                    rep + 1,
+                    workdir,
+                )
+                observed = shares(read_masked(rr, str))
+                rows += categorical_rows(n, epsilon, "randomized_response", "naive", rep, observed, truth)
+                rows += categorical_rows(
+                    n, epsilon, "randomized_response", "estimator", rep, rr_estimator(observed, epsilon), truth
+                )
+                rows += categorical_rows(
+                    n, epsilon, "central", "central", rep, central_shares(rng, statuses, epsilon), truth
+                )
+            print(f"n = {n}, ε = {epsilon}: done", file=sys.stderr)
+    return rows
 
 
 def result_rows(n, epsilon, arm, analyst, rep, bounds, answers, truth):
@@ -418,22 +555,26 @@ def result_rows(n, epsilon, arm, analyst, rep, bounds, answers, truth):
     return out
 
 
-def print_summary(rows):
-    """Mean absolute error per configuration and query (signed mean error for
-    `mean`, which shows the bias)."""
+def print_summary(rows, queries):
+    """Mean absolute error per configuration and query. A query named `mean`
+    is shown signed, so that bias shows."""
     groups = {}
     for r in rows:
         key = (r["n"], r["epsilon"], r["arm"], r["analyst"])
         groups.setdefault(key, {}).setdefault(r["query"], []).append(r["error"])
-    header = ["n", "ε", "arm", "analyst", "mean (signed)"] + [q for q in QUERIES if q != "mean"]
+    header = ["n", "ε", "arm", "analyst"] + [
+        "mean (signed)" if q == "mean" else q for q in queries
+    ]
     print("| " + " | ".join(header) + " |")
     print("|" + "---|" * len(header))
     for (n, eps, arm, analyst), by_query in sorted(groups.items()):
-        cells = [str(n), str(eps), arm, analyst, f"{statistics.fmean(by_query['mean']):+.4f}"]
-        for q in QUERIES:
+        cells = [str(n), str(eps), arm, analyst]
+        for q in queries:
+            errors = by_query[q]
             if q == "mean":
-                continue
-            cells.append(f"{statistics.fmean(abs(e) for e in by_query[q]):.4f}")
+                cells.append(f"{statistics.fmean(errors):+.4f}")
+            else:
+                cells.append(f"{statistics.fmean(abs(e) for e in errors):.4f}")
         print("| " + " | ".join(cells) + " |")
 
 
