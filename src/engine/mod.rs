@@ -59,7 +59,11 @@ impl AnonymizerEngine {
     pub fn new(config: CompiledConfig, secret: String) -> Self {
         for (table, columns) in &config.tables {
             for column in columns {
-                debug!("rule `{table}.{}`: {}", column.name, column.masker.describe());
+                debug!(
+                    "rule `{table}.{}`: {}",
+                    column.name,
+                    column.masker.describe()
+                );
             }
         }
         Self { config, secret }
@@ -326,7 +330,10 @@ fn log_masking_plan(metadata: &HeaderMetadata, plan: Option<&[Option<&CompiledCo
         .map(|column| column.name.as_str())
         .collect();
     if masked.is_empty() {
-        debug!("table `{}`: no masked columns, rows are copied", metadata.table);
+        debug!(
+            "table `{}`: no masked columns, rows are copied",
+            metadata.table
+        );
     } else {
         debug!("table `{}`: masking {}", metadata.table, masked.join(", "));
     }
@@ -389,7 +396,9 @@ mod tests {
         let input = b"INSERT INTO users (id, name, age, secret, note) VALUES (1, 'Ana', 30, 'senha123', 'tem (parenteses)');\n";
         let out = run_with(NAME_RULES, SqlDialect::Postgres, input).unwrap();
 
-        assert!(out.starts_with("INSERT INTO users (id, name, age, secret, note) VALUES (1, 'O''Conner', "));
+        assert!(out.starts_with(
+            "INSERT INTO users (id, name, age, secret, note) VALUES (1, 'O''Conner', "
+        ));
         assert!(out.ends_with(", NULL, 'tem (parenteses)');\n"), "{out}");
         assert!(!out.contains("senha123"));
         // The number stays unquoted.
@@ -399,7 +408,8 @@ mod tests {
 
     #[test]
     fn test_copy_masking() {
-        let input = b"COPY public.users (id, name, secret) FROM stdin;\n1\tAna\tx\n2\t\\N\t\\N\n\\.\n";
+        let input =
+            b"COPY public.users (id, name, secret) FROM stdin;\n1\tAna\tx\n2\t\\N\t\\N\n\\.\n";
         let out = run_with(NAME_RULES, SqlDialect::Postgres, input).unwrap();
         assert_eq!(
             out,
@@ -416,13 +426,23 @@ mod tests {
                 { name = "b", strategy = "fixed", value = "y", null_policy = "generate" },
             ]
         "#;
-        let out = run_with(rules, SqlDialect::Postgres, b"INSERT INTO t (a, b) VALUES (NULL, NULL);").unwrap();
+        let out = run_with(
+            rules,
+            SqlDialect::Postgres,
+            b"INSERT INTO t (a, b) VALUES (NULL, NULL);",
+        )
+        .unwrap();
         assert_eq!(out, "INSERT INTO t (a, b) VALUES (NULL, 'y');");
     }
 
     #[test]
     fn test_mysql_escaping() {
-        let out = run_with(NAME_RULES, SqlDialect::Mysql, b"INSERT INTO users (name) VALUES ('Bob');").unwrap();
+        let out = run_with(
+            NAME_RULES,
+            SqlDialect::Mysql,
+            b"INSERT INTO users (name) VALUES ('Bob');",
+        )
+        .unwrap();
         assert_eq!(out, "INSERT INTO users (name) VALUES ('O\\'Conner');");
     }
 
@@ -432,8 +452,18 @@ mod tests {
             [tables.t]
             columns = [{ name = "a", strategy = "hmac" }]
         "#;
-        let insert = run_with(rules, SqlDialect::Postgres, b"INSERT INTO t (a) VALUES ('O''Hara');").unwrap();
-        let copy = run_with(rules, SqlDialect::Postgres, b"COPY t (a) FROM stdin;\nO'Hara\n\\.\n").unwrap();
+        let insert = run_with(
+            rules,
+            SqlDialect::Postgres,
+            b"INSERT INTO t (a) VALUES ('O''Hara');",
+        )
+        .unwrap();
+        let copy = run_with(
+            rules,
+            SqlDialect::Postgres,
+            b"COPY t (a) FROM stdin;\nO'Hara\n\\.\n",
+        )
+        .unwrap();
 
         let from_insert = insert.split('\'').nth(1).unwrap().to_string();
         let from_copy = copy.lines().nth(1).unwrap().to_string();
@@ -470,7 +500,10 @@ mod tests {
     fn test_unreadable_table_name_fails_closed_with_rules() {
         let input = b"INSERT INTO \"my table\" (a) VALUES (1);";
         let err = run_with(NAME_RULES, SqlDialect::Postgres, input).unwrap_err();
-        assert!(err.to_string().contains("could not read the table name"), "{err}");
+        assert!(
+            err.to_string().contains("could not read the table name"),
+            "{err}"
+        );
         assert!(run(input).is_ok());
     }
 
@@ -513,7 +546,9 @@ mod tests {
             ..RunOptions::new(SqlDialect::Postgres)
         };
         let input = b"COPY t (a) FROM stdin;\n0123456789\n\\.\n";
-        let err = engine("").process_dump(&input[..], io::sink(), &options).unwrap_err();
+        let err = engine("")
+            .process_dump(&input[..], io::sink(), &options)
+            .unwrap_err();
         assert!(err.to_string().contains("longer than 8 bytes"), "{err}");
     }
 

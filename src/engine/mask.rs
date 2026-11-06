@@ -240,9 +240,9 @@ pub fn hmac_hash(val: &str, secret: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
     use rand::rngs::StdRng;
     use rand::rngs::mock::StepRng;
-    use rand::SeedableRng;
 
     fn rng() -> StdRng {
         StdRng::seed_from_u64(42)
@@ -298,8 +298,14 @@ mod tests {
     fn test_literal_type_is_preserved() {
         let m = mechanism(false);
         let mut rng = rng();
-        assert!(matches!(apply(&m, SqlValue::Raw("1".into()), &mut rng).0, SqlValue::Raw(_)));
-        assert!(matches!(apply(&m, SqlValue::Text("1".into()), &mut rng).0, SqlValue::Text(_)));
+        assert!(matches!(
+            apply(&m, SqlValue::Raw("1".into()), &mut rng).0,
+            SqlValue::Raw(_)
+        ));
+        assert!(matches!(
+            apply(&m, SqlValue::Text("1".into()), &mut rng).0,
+            SqlValue::Text(_)
+        ));
     }
 
     #[test]

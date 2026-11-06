@@ -155,7 +155,10 @@ mod tests {
         let err = config.compile().unwrap_err();
         assert_eq!(err.table, "users");
         assert_eq!(err.column, "salary");
-        assert!(err.to_string().starts_with("table `users`, column `salary`: "));
+        assert!(
+            err.to_string()
+                .starts_with("table `users`, column `salary`: ")
+        );
     }
 
     #[test]
