@@ -157,9 +157,44 @@ The full table, with the 50% and 2% ranges, the median and the sum, is printed b
 4. **The true range is not the best bound.** `oracle` has no clamping bias, but the true maximum of a heavy-tailed column is far out (43,161 against a 99th percentile near 12,800), so the noise is 3.3 times wider than with `dp_bounds`. Its mean error falls with n (1.2% at 10⁶), but its range, percentile and histogram errors are 3–20 times those of `dp_bounds`. Choosing bounds is a bias–variance trade-off (Amin et al., 2019), and quantiles beat the extremes.
 5. **δ2: the local model costs orders of magnitude on everything but the mean.** With the true bounds, central DP answers every query within 1% at n = 10⁴ and within 0.2% at n = 10⁶. At n = 10⁶ and ε = 1, the best local answers are 5–9% off for the 10% range count, 0.8–3% for the 90th percentile, and 0.06–0.09 in histogram distance. In theory the local error falls as 1/√n and the central one as 1/n (Duchi et al., 2018). For the mean with a priori bounds, the gap disappears behind the shared clamping bias (−1.8% in both).
 
+## Categorical column
+
+Run with `--task categorical`. The column is the generator's `status`: `ACTIVE` 70%, `PENDING` 20%, `INACTIVE` 10%. The same sizes, ε values and repetitions as above; raw results in [bench-results/2026-11-categorical.csv](../bench-results/2026-11-categorical.csv).
+
+* `random_choice` replaces each value with a uniform category (0-LDP).
+* `randomized_response` keeps the true category with probability e^ε/(e^ε + k − 1) (ε-LDP). The SQL analyst reads the shares straight from the dump; the estimator applies the unbiased correction (observed − q)/(p − q), clipped at 0 and renormalized, which is post-processing.
+* Central DP adds Laplace noise of scale 2/ε to each count (replacing one value changes two counts).
+
+The error is the total variation distance between the estimated and the true distribution of the three categories.
+
+**Total variation distance, ε = 1**
+
+| Strategy | Analyst | n = 10,000 | n = 100,000 | n = 1,000,000 |
+|---|---|---|---|---|
+| `random_choice` | SQL | 0.3689 | 0.3667 | 0.3668 |
+| `randomized_response` | SQL | 0.2346 | 0.2327 | 0.2333 |
+| `randomized_response` | estimator | 0.0133 | 0.0044 | 0.0015 |
+| central DP | — | 0.0002 | 0.0000 | 0.0000 |
+
+**Total variation distance, n = 1,000,000**
+
+| Strategy | Analyst | ε = 0.5 | ε = 1 | ε = 2 |
+|---|---|---|---|---|
+| `random_choice` | SQL | 0.3668 | 0.3668 | 0.3668 |
+| `randomized_response` | SQL | 0.3017 | 0.2333 | 0.1171 |
+| `randomized_response` | estimator | 0.0029 | 0.0015 | 0.0006 |
+| central DP | — | 0.0000 | 0.0000 | 0.0000 |
+
+Findings:
+
+1. **`random_choice` erases the distribution.** Every category comes out near 1/3, so the dump says nothing about the column (distance 0.37 at every n and ε). It is the right choice only when the column must carry no information.
+2. **Randomized response read with SQL is biased toward uniform.** The shares are pulled toward 1/3 by a factor (p − q) that depends only on ε: distance 0.30 at ε = 0.5, 0.23 at ε = 1, 0.12 at ε = 2, whatever n.
+3. **With the estimator, randomized response recovers the distribution.** The distance falls as 1/√n: at ε = 0.5, 0.038 at n = 10⁴ and 0.0029 at n = 10⁶. Unlike the numeric column, there are no bounds to choose, so there is no bias floor.
+4. **The central gap is smaller than for numeric queries but still large.** Central DP stays below 0.0005 everywhere; the best local answer at n = 10⁶ is 0.0006–0.0029.
+
 ## Limitations
 
-* One numeric column of synthetic data; real data (ACS PUMS) was planned but not reachable from the development environment.
+* One numeric and one categorical column of synthetic data; real data (ACS PUMS) was planned but not reachable from the development environment.
 * The estimator is a plain EM deconvolution without regularization, stopped when the estimate changes by less than 10⁻⁵; better estimators exist. With noise much wider than the bounds it converges slowly, and an early version that stopped after 200 iterations reported errors that were too high for the `oracle` arm.
 * The central comparator gives each query the full ε; a fair comparison of a whole release would split ε across queries, which would raise the central errors.
 * No synthetic-data comparator (MST, AIM) was run.

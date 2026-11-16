@@ -16,8 +16,9 @@ What each strategy protects, under which conditions, and what it leaves exposed.
 | `fixed`, `faker_*`, `random_*`, `random_uuid`, `cpf`, `cnpj`, `fake_credit_card` | **0-LDP**: output independent of the value | none (the generators never read the value) | number of rows; which rows are NULL with `null_policy = "keep"` | `mask::tests::test_synthetic_generators`, `test_generated_documents_are_valid` |
 | `hmac` | **no DP**: deterministic keyed pseudonym | secret of 32+ random bytes, never disclosed | equal values give equal pseudonyms: joins across tables and dumps, value frequencies; with the secret, brute force over small domains (IDs, CPF) | `mask::tests::test_hmac_is_deterministic_and_keyed`, `cli::hmac_rules_require_a_secret`, `cli::blank_secret_is_rejected`, `cli::short_secret_only_warns` |
 | `dp_laplace`, exact sampler (default) | **ε-LDP** per value (P1) | the sampler is implemented correctly; the random generator is unpredictable | NULL pattern with `null_policy = "keep"` | `laplace::tests::test_exact_domain_spends_at_most_epsilon`, `test_exact_mechanism_clamps_before_noise`, `test_text_and_null_take_the_midpoint`; `laplace::validation::*` |
-| `dp_laplace`, `mechanism = "f64"` | **ε-LDP** per value, conditional | as above, **and** `scale` coarse enough that rounding hides the spacing of doubles at the output's magnitude | as above | `laplace::tests::test_inputs_are_clamped_before_noise`; [floating-point experiment](experiments/floating-point.md) |
+| `dp_laplace`, `mechanism = "f64"` | **ε-LDP** per value, conditional | as above, **and** `scale` coarse enough that rounding hides the spacing of doubles at the output's magnitude (enforced at startup; rare tail outputs beyond 10·b are not covered) | as above | `strategy::tests::test_f64_sampler_rejects_scales_that_expose_float_bits`, `laplace::tests::test_inputs_are_clamped_before_noise`; [floating-point experiment](experiments/floating-point.md) |
 | `dp_laplace`, `consistent = true` | **ε-LDP** per distinct value, computational (P4) | as above, and the secret is never disclosed | equal values give equal outputs (which rows share a value); NULL pattern as above | `laplace::tests::test_consistent_noise_depends_only_on_value_column_and_secret`, `cli::consistent_noise_repeats_across_runs_and_rows` |
+| `randomized_response` | **ε-LDP** per value (P5) | the categories are declared in the rule; the random generator is unpredictable | NULL pattern with `null_policy = "keep"`; the set of categories | `categorical::tests::test_true_category_is_kept_with_the_right_probability`, `test_unknown_values_and_null_become_uniform`, `cli::randomized_response_writes_only_declared_categories` |
 | Column without a rule | **none** | — | the value, and what can be inferred from it about protected columns (P3) | — |
 | Whole dump | **Σε per row** over the `dp_laplace` columns; k·Σε for a person in k rows; T·k·Σε over T releases with fresh noise (P2) | k and T known to the publisher: GhostDump cannot see them without state | presence and order of rows, table sizes, schema; columns without rules and `hmac` columns can re-identify a row, without breaking the ε of its `dp_laplace` columns | — |
 
@@ -39,6 +40,8 @@ The same argument, with densities, shows that x ↦ clamp(x) + Lap((hi − lo)/�
 
 **P4 (consistent noise).** With `consistent = true`, the noise of a value is drawn from a generator seeded by HMAC-SHA256(secret, column, clamped value). For an adversary who does not know the secret, and assuming HMAC-SHA256 is a pseudorandom function, the output for one value is computationally indistinguishable from P1's, so it is ε-LDP in the computational sense. Repeating a release, or a value repeated in several rows of one person, adds no privacy loss for that value: the output is the same each time. The price is that the output is a deterministic function of the value: rows with equal values get equal outputs, and no DP guarantee covers that equality pattern (as with `hmac`).
 
+**P5 (randomized response).** Let the rule declare k categories. A value in the categories is written unchanged with probability p = e^ε/(e^ε + k − 1) and as each other category with probability q = 1/(e^ε + k − 1); any other input (an unknown value, or NULL with `generate`) is written as a uniform category, with probability 1/k each. Then the mechanism is ε-LDP: for any two inputs and any output, the ratio of probabilities is at most p/q = e^ε between two categories, and between a category and the uniform case it lies between k/(e^ε + k − 1) ≥ e^−ε and k·e^ε/(e^ε + k − 1) ≤ e^ε. Sampling is exact: a uniform candidate is accepted if it is the true category, and otherwise with probability e^−ε, drawn with integer arithmetic from the exact rational value of ε (Canonne, Kamath and Steinke, 2020). Accepted candidates then follow p and q exactly. The unbiased frequency estimate (observed − q)/(p − q) is post-processing.
+
 ## Structural invariants
 
 These are properties of the pipeline, not of a mechanism. Each is enforced by the code and checked by tests rather than proved.
@@ -53,7 +56,7 @@ These are properties of the pipeline, not of a mechanism. Each is enforced by th
 
 ## Assumptions
 
-* **Randomness.** Noise and generated values come from `rand`'s `StdRng` (ChaCha12) seeded by the operating system. Its unpredictability is computational. `--seed` makes the run reproducible and removes the protection of the noise: it is meant for experiments only, and GhostDump warns when it is used.
+* **Randomness.** Noise and generated values come from `rand`'s `StdRng` (ChaCha12). The run's generator is seeded by the operating system; each segment of rows (at most 1,024 masked rows) draws from its own generator, seeded with 256 bits from the run's one, so the output does not depend on `--threads`. Its unpredictability is computational. `--seed` makes the run reproducible and removes the protection of the noise: it is meant for experiments only, and GhostDump warns when it is used.
 * **Implementation.** The exact sampler follows Canonne, Kamath and Steinke (2020). It is our implementation, not an audited library: its distribution is checked against the exact probabilities, by goodness of fit, by a periodicity test and by negative controls (`laplace::validation`, run in CI). The decision and the alternatives are in [decisions/0001-laplace-sampler.md](decisions/0001-laplace-sampler.md).
 * **Bounds.** The bounds must be chosen without looking at the data. Bounds computed from the data (the "oracle" arm of the utility evaluation) are not private.
 
@@ -62,5 +65,7 @@ These are properties of the pipeline, not of a mechanism. Each is enforced by th
 * Canonne, C.; Kamath, G.; Steinke, T. (2020). The discrete Gaussian for differential privacy. *NeurIPS*.
 * Desfontaines, D.; Pejó, B. (2020). SoK: Differential privacies. *PoPETs*.
 * Dwork, C.; Roth, A. (2014). *The Algorithmic Foundations of Differential Privacy*.
+* Kairouz, P.; Bonawitz, K.; Ramage, D. (2016). Discrete distribution estimation under local privacy. *ICML*.
 * Kifer, D.; Machanavajjhala, A. (2011). No free lunch in data privacy. *SIGMOD*.
 * Mironov, I. (2012). On significance of the least significant bits for differential privacy. *CCS*.
+* Warner, S. L. (1965). Randomized response: a survey technique for eliminating evasive answer bias. *JASA*.

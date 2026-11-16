@@ -1,0 +1,4 @@
+[tables.users]
+columns = [
+    { name = "status", strategy = "randomized_response", epsilon = 1.0, categories = ["ACTIVE", "PENDING", "INACTIVE"] },
+]

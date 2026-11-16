@@ -14,6 +14,10 @@ Example:
 To compare with an older build, pass --baseline-binary; it is run with the
 configurations it understands (no rules, and the full rule set written with
 `sensitivity`, the parameter older versions used).
+
+--threads takes a list of thread counts (passed as --threads to the current
+build). Runs without rules use one thread only: with no rules nothing is
+masked, so the CLI ignores the option.
 """
 
 import argparse
@@ -87,7 +91,7 @@ def read_hwm(pid):
     return None
 
 
-def run_once(binary, config, dump):
+def run_once(binary, config, dump, threads=None):
     """Runs the CLI once; returns (seconds, peak RSS in KiB).
 
     The peak is VmHWM, which belongs to the program after exec. The
@@ -97,6 +101,8 @@ def run_once(binary, config, dump):
     command = [str(binary), "-i", str(dump), "-o", os.devnull]
     if config is not None:
         command += ["-c", str(config)]
+    if threads is not None:
+        command += ["--threads", str(threads)]
     env = dict(os.environ, GHOSTDUMP_SECRET=SECRET, GHOSTDUMP_LOG="error")
     # A file, not a pipe: a build that logs one line per value would fill a
     # pipe and block before exiting.
@@ -166,6 +172,9 @@ def main():
         "--binary", default=str(PROJECT_ROOT / "target" / "release" / "ghostdump")
     )
     parser.add_argument("--baseline-binary", help="an older build to compare with")
+    parser.add_argument(
+        "--threads", default="1", help="comma-separated thread counts for the current build"
+    )
     parser.add_argument("--workdir", default=str(PROJECT_ROOT / "generated" / "bench"))
     parser.add_argument("--out", default="bench_results.csv")
     args = parser.parse_args()
@@ -176,6 +185,7 @@ def main():
     if args.baseline_binary:
         binaries.append(("baseline", Path(args.baseline_binary)))
     wanted = args.configs.split(",")
+    thread_counts = [int(n) for n in args.threads.split(",")]
 
     rows_out = []
     for rows in (int(n) for n in args.sizes.split(",")):
@@ -190,25 +200,30 @@ def main():
                 for name, config in configs.items():
                     if name not in wanted:
                         continue
-                    for _ in range(args.warmup):
-                        run_once(binary, config, dump)
-                    for run in range(1, args.runs + 1):
-                        seconds, rss = run_once(binary, config, dump)
-                        rows_out.append(
-                            {
-                                "binary": label,
-                                "config": name,
-                                "users": rows,
-                                "data_rows": data_rows,
-                                "format": fmt,
-                                "run": run,
-                                "seconds": f"{seconds:.4f}",
-                                "rows_per_second": round(data_rows / seconds),
-                                "mib_per_second": f"{mib / seconds:.1f}",
-                                "max_rss_kib": rss,
-                            }
-                        )
-                    print_summary(rows_out[-args.runs :])
+                    for threads in thread_counts if label == "current" else [None]:
+                        # Without rules nothing is masked and --threads is ignored.
+                        if config is None and threads not in (None, 1):
+                            continue
+                        for _ in range(args.warmup):
+                            run_once(binary, config, dump, threads)
+                        for run in range(1, args.runs + 1):
+                            seconds, rss = run_once(binary, config, dump, threads)
+                            rows_out.append(
+                                {
+                                    "binary": label,
+                                    "config": name,
+                                    "threads": threads or 1,
+                                    "users": rows,
+                                    "data_rows": data_rows,
+                                    "format": fmt,
+                                    "run": run,
+                                    "seconds": f"{seconds:.4f}",
+                                    "rows_per_second": round(data_rows / seconds),
+                                    "mib_per_second": f"{mib / seconds:.1f}",
+                                    "max_rss_kib": rss,
+                                }
+                            )
+                        print_summary(rows_out[-args.runs :])
 
     with open(args.out, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows_out[0]))
@@ -224,7 +239,7 @@ def print_summary(runs):
     rss = max(r["max_rss_kib"] for r in runs)
     print(
         f"{first['binary']:8} {first['format']:6} {first['data_rows']:>10} rows "
-        f"{first['config']:14} median {median:8.3f} s (IQR {q3 - q1:.3f}) "
+        f"{first['config']:14} {first['threads']:>2} thr median {median:8.3f} s (IQR {q3 - q1:.3f}) "
         f"{first['data_rows'] / median:>12,.0f} rows/s  peak {rss / 1024:6.1f} MiB"
     )
 

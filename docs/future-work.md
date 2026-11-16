@@ -18,8 +18,7 @@ A useful first step would be analytical: compute the amplified ε for windows of
 
 ## Other directions
 
-* **Parallel masking (issue #10).** Masking dominates the cost with rules (see [benchmarks](benchmarks.md)): with HMAC on four columns, throughput drops from 1.7 to 0.57 million rows per second. A bounded queue of row batches between the parser and a pool of maskers, with ordered output, keeps memory constant. Each worker would need its own random generator, which the masker API already allows (the generator is passed per call).
-* **Chunked parser (task CHK).** Not needed while masking dominates (the parser takes 33–38% of the time with rules); it would mainly speed up copies without rules. See the decision in [benchmarks](benchmarks.md).
+* **Chunked parser (task CHK).** With `--threads`, masking runs beside the parser, and with three threads every rule set runs at 93–104% of the speed of a copy without rules (see [benchmarks](benchmarks.md#parallel-masking)). The parser, on the reading thread, is now the bottleneck of every run, so a faster parser is the next step for throughput. Parsing on several threads would also need safe cut points: a chunk can start inside a string literal or a dollar-quoted body.
 * **Real data (ACS PUMS).** The utility evaluation uses synthetic data with known distributions. A converter from ACS PUMS (folktables) to SQL dumps was planned but needs access to census.gov, which the development environment did not have.
 
 ## References

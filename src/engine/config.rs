@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
-use crate::engine::mask::Masker;
+use crate::engine::mask::{Guarantee, Masker};
 use crate::engine::strategy::StrategyConfig;
 
 #[derive(Debug, Deserialize)]
@@ -106,7 +106,85 @@ impl Config {
     }
 }
 
+/// What the rules of one table guarantee, for the summary printed at startup.
+#[derive(Debug, PartialEq)]
+pub struct TableGuarantees {
+    pub table: String,
+    /// Columns with ε-LDP and their ε.
+    pub ldp: Vec<(String, f64)>,
+    /// Columns whose output does not depend on the value (0-LDP).
+    pub input_independent: Vec<String>,
+    /// Columns pseudonymized with a keyed hash (no DP).
+    pub pseudonymized: Vec<String>,
+}
+
+impl TableGuarantees {
+    /// ε spent by one row: the sum over its ε-LDP columns.
+    pub fn epsilon_per_row(&self) -> f64 {
+        self.ldp.iter().map(|(_, epsilon)| epsilon).sum()
+    }
+}
+
+impl fmt::Display for TableGuarantees {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "table `{}`: ", self.table)?;
+        if self.ldp.is_empty() {
+            write!(f, "no ε-LDP column")?;
+        } else {
+            let columns: Vec<String> = self
+                .ldp
+                .iter()
+                .map(|(name, epsilon)| format!("{name} ε = {epsilon:.4}"))
+                .collect();
+            write!(
+                f,
+                "ε = {:.4} per row ({})",
+                self.epsilon_per_row(),
+                columns.join(", ")
+            )?;
+        }
+        if !self.input_independent.is_empty() {
+            write!(f, "; 0-LDP: {}", self.input_independent.join(", "))?;
+        }
+        if !self.pseudonymized.is_empty() {
+            write!(
+                f,
+                "; pseudonymized, no DP: {}",
+                self.pseudonymized.join(", ")
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl CompiledConfig {
+    /// The guarantees of each table's rules, sorted by table name.
+    pub fn guarantees(&self) -> Vec<TableGuarantees> {
+        let mut tables: Vec<TableGuarantees> = self
+            .tables
+            .iter()
+            .map(|(table, columns)| {
+                let mut summary = TableGuarantees {
+                    table: table.clone(),
+                    ldp: Vec::new(),
+                    input_independent: Vec::new(),
+                    pseudonymized: Vec::new(),
+                };
+                for column in columns {
+                    let name = column.name.clone();
+                    match column.masker.guarantee() {
+                        Guarantee::Ldp { epsilon } => summary.ldp.push((name, epsilon)),
+                        Guarantee::InputIndependent => summary.input_independent.push(name),
+                        Guarantee::Pseudonymization => summary.pseudonymized.push(name),
+                    }
+                }
+                summary
+            })
+            .collect();
+        tables.sort_by(|a, b| a.table.cmp(&b.table));
+        tables
+    }
+
     /// No rules: the dump is copied as it is.
     pub fn empty() -> Self {
         Self {
@@ -173,5 +251,29 @@ mod tests {
         .unwrap();
         assert!(config.compile().unwrap().uses_secret());
         assert!(!CompiledConfig::empty().uses_secret());
+    }
+
+    #[test]
+    fn test_guarantees_summary() {
+        let config: Config = toml::from_str(
+            r#"
+            [tables.users]
+            columns = [
+                { name = "id", strategy = "hmac" },
+                { name = "name", strategy = "faker_name" },
+                { name = "salary", strategy = "dp_laplace", epsilon = 0.5, bounds = [0.0, 1000.0], scale = 2 },
+                { name = "age", strategy = "dp_laplace", epsilon = 0.25, bounds = [0.0, 120.0], scale = 0, mechanism = "f64" },
+            ]
+            "#,
+        )
+        .unwrap();
+        let summary = config.compile().unwrap().guarantees();
+        assert_eq!(summary.len(), 1);
+        assert!((summary[0].epsilon_per_row() - 0.75).abs() < 1e-9);
+        assert_eq!(
+            summary[0].to_string(),
+            "table `users`: ε = 0.7500 per row (salary ε = 0.5000, age ε = 0.2500); \
+             0-LDP: name; pseudonymized, no DP: id"
+        );
     }
 }

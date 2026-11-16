@@ -139,6 +139,30 @@ proptest! {
         let _ = engine(rules).process_dump(&input[..], io::sink(), &options);
     }
 
+    /// Masking on several threads writes the same bytes, and stops with the
+    /// same error, as masking on the calling thread.
+    #[test]
+    fn threads_do_not_change_the_output(dialect in dialect(), input in sql_like()) {
+        let rules = r#"
+            [tables.t]
+            columns = [
+                { name = "a", strategy = "hmac" },
+                { name = "b", strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2, null_policy = "generate" },
+            ]
+        "#;
+        let engine = engine(rules);
+        let run = |threads| {
+            let options = RunOptions { seed: Some(1), threads, ..RunOptions::new(dialect) };
+            let mut out = Vec::new();
+            let result = engine.process_dump(&input[..], &mut out, &options);
+            (result.map_err(|e| e.to_string()), out)
+        };
+        let (one, one_out) = run(1);
+        let (three, three_out) = run(3);
+        prop_assert_eq!(one, three);
+        prop_assert_eq!(one_out, three_out);
+    }
+
     /// Masking one column keeps the other columns byte for byte and the
     /// number of rows, for values with quotes, backslashes and NULLs.
     #[test]
