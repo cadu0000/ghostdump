@@ -28,6 +28,10 @@ const CONSISTENT_RULES: &str = concat!(
 );
 const RR_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rr_rules.toml");
 const DP_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dp_rules.toml");
+const TYPO_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/typo_rules.toml"
+);
 
 /// Runs ghostdump with `args`, the secret (if any) in the environment, and
 /// `stdin` as input.
@@ -324,4 +328,26 @@ fn randomized_response_writes_only_declared_categories() {
         assert!(categories.contains(&value), "{value}");
     }
     assert!(stderr(&output).contains("1 value(s) of randomized_response columns"));
+}
+
+#[test]
+fn unused_rules_warn_and_fail_with_strict() {
+    let dump = b"INSERT INTO Users (Name, email) VALUES ('Ana', 'a@x.com');\n";
+
+    let output = run(&["-c", TYPO_RULES], None, dump);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    // The name is masked whatever its case; the misspelt rule is reported.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "INSERT INTO Users (Name, email) VALUES (NULL, 'a@x.com');\n"
+    );
+    let warnings = stderr(&output);
+    assert!(
+        warnings.contains("column `users.emial` was not found"),
+        "{warnings}"
+    );
+
+    let strict = run(&["-c", TYPO_RULES, "--strict"], None, dump);
+    assert!(!strict.status.success());
+    assert!(stderr(&strict).contains("--strict"), "{}", stderr(&strict));
 }

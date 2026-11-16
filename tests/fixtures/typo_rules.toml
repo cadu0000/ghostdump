@@ -1,0 +1,5 @@
+[tables.users]
+columns = [
+    { name = "name", strategy = "nullify" },
+    { name = "emial", strategy = "nullify" },
+]
