@@ -146,6 +146,10 @@ columns = [
 
 Only the declared columns are rewritten; every other byte of the dump, including the layout of `INSERT` statements and `COPY` blocks, is copied unchanged. Values keep their SQL type: numbers stay unquoted, generated text is escaped for the dialect, and `NULL` stays `NULL` by default. Add `null_policy = "generate"` to a column to mask `NULL` values too.
 
+Table and column names are matched without regard to case, and quotes are ignored, so a rule for `users.name` also applies to `INSERT INTO "Users" ("Name")`. A rule for `[tables.users]` applies to the table in any schema; write `[tables."audit.users"]` to give one schema its own rules. Two rules whose names differ only in case are rejected.
+
+A rule that matches no table or column of the input is reported in a warning at the end of the run, because a misspelt name leaves its column unmasked. `--strict` turns the warning into an error (the output has been written by then).
+
 Rules are checked before any data is read: a rule with a missing or invalid parameter stops GhostDump with a message that names the table and column. Then GhostDump prints, on stderr, what the rules guarantee for each table: the ε a row spends over its `dp_laplace` columns, and which columns are 0-LDP or only pseudonymized.
 
 #### `dp_laplace`
@@ -223,6 +227,7 @@ zcat production_db.sql.gz | ghostdump -c rules.toml | gzip > dev_db_anon.sql.gz
 | `-l` | `--limit <ROWS>` | Stop after N data rows, closing the statement they belong to. Statements after that point (such as a final `COMMIT`) are not written. |
 | | `--dialect <NAME>` | `auto` (default), `postgres`, `mysql` or `sqlite`. |
 | | `--max-row-size <MiB>` | Largest data row accepted (default 256). |
+| | `--strict` | Fail when a rule matches no table or column of the input. |
 | `-j` | `--threads <N>` | Threads that mask rows (default 1). Reading, parsing and writing stay on one thread; the output is the same for any number of threads. See [benchmarks](docs/benchmarks.md) for the speedup. |
 
 ---
