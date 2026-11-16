@@ -8,10 +8,10 @@ A critical security or correctness problem found in any phase is fixed at once, 
 
 | # | Risk | Status |
 | --- | --- | --- |
-| R1 | A rule that matches nothing is ignored silently: a typo in a table or column name leaves the column in clear. | open, stage 1.1 |
-| R2 | Names are compared exactly, so `INSERT INTO Users (Name)` does not match the rule `users.name`. | open, stage 1.1 |
+| R1 | A rule that matches nothing is ignored silently: a typo in a table or column name leaves the column in clear. | **fixed**: warning, and an error with `--strict` |
+| R2 | Names are compared exactly, so `INSERT INTO Users (Name)` does not match the rule `users.name`. | **fixed**: names compare without case |
 | R3 | Statements the parser does not treat as data pass through unmasked: `INSERT ... SELECT`, `INSERT ... SET`, `UPDATE`, `MERGE`, `WITH ... INSERT`, `CREATE TABLE AS SELECT`, and the literals of `ON DUPLICATE KEY UPDATE`. | open, stage 1.1 |
-| R4 | The schema is dropped from the table name, so `public.users` and `audit.users` share a rule. | open, stage 1.1 |
+| R4 | The schema is dropped from the table name, so `public.users` and `audit.users` share a rule. | **fixed**: `schema.table` rule keys |
 | R5 | On an error in the middle of a run, the output file is left partial on disk. | open, stage 1.4 |
 | R6 | The secret can be passed with `-s`, where it shows in the process list. | open, stage 1.4 |
 | R7 | The `f64` mechanism is still available, with a conditional guarantee. | open, stage 1.2 |
