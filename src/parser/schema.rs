@@ -7,6 +7,8 @@ use crate::parser::state::SqlDialect;
 /// Names read from the header of a data block.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeaderMetadata {
+    /// The schema (or, in MySQL, the database) written before the table name.
+    pub schema: Option<String>,
     pub table: String,
     /// `None` when the statement has no column list.
     pub columns: Option<Vec<String>>,
@@ -38,12 +40,18 @@ pub fn extract_metadata(header_bytes: &[u8], dialect: SqlDialect) -> Option<Head
     let process_match = |caps: regex::Captures| -> HeaderMetadata {
         let raw_table = caps.name("table").unwrap().as_str();
 
-        let table = raw_table
-            .rsplit('.')
-            .next()
-            .unwrap_or(raw_table)
-            .trim_matches(|c| c == '"' || c == '`' || c == '\'')
-            .to_string();
+        let unquote = |name: &str| {
+            name.trim_matches(|c| c == '"' || c == '`' || c == '\'')
+                .to_string()
+        };
+        let (schema, table) = match raw_table.rsplit_once('.') {
+            Some((schema, table)) => {
+                // `db.schema.table`: the schema is the last qualifier.
+                let schema = schema.rsplit('.').next().unwrap_or(schema);
+                (Some(unquote(schema)), unquote(table))
+            }
+            None => (None, unquote(raw_table)),
+        };
 
         let columns = caps.name("cols").map(|m| {
             m.as_str()
@@ -55,7 +63,11 @@ pub fn extract_metadata(header_bytes: &[u8], dialect: SqlDialect) -> Option<Head
                 .collect()
         });
 
-        HeaderMetadata { table, columns }
+        HeaderMetadata {
+            schema,
+            table,
+            columns,
+        }
     };
 
     if let Some(caps) = insert_re.captures(&header_str) {
