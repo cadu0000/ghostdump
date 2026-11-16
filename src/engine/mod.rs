@@ -8,7 +8,8 @@ pub mod strategy;
 use log::{debug, warn};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
 use std::thread;
@@ -73,7 +74,31 @@ pub struct RunReport {
     /// Data rows per table, by the name in the statement (`<unknown>` when
     /// it could not be read). Schema names only, never values.
     pub rows_by_table: BTreeMap<String, usize>,
+    /// Rules that matched no table or column of the input: a misspelt name
+    /// leaves its column unmasked. Empty when `--limit` stopped the run.
+    pub unused_rules: Vec<UnusedRule>,
 }
+
+/// A rule that matched nothing in the input.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnusedRule {
+    pub table: String,
+    /// `None` when no rule of the table matched: the table is absent from
+    /// the input, or none of the columns with rules is in it.
+    pub column: Option<String>,
+}
+
+impl fmt::Display for UnusedRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.column {
+            Some(column) => write!(f, "column `{}.{column}` was not found", self.table),
+            None => write!(f, "no rule of table `{}` matched the input", self.table),
+        }
+    }
+}
+
+/// A masking plan and the key of the rules it comes from.
+type KeyedPlan<'a> = (&'a str, MaskingPlan<'a>);
 
 pub struct AnonymizerEngine {
     config: CompiledConfig,
@@ -96,15 +121,17 @@ impl AnonymizerEngine {
 
     /// The columns of a data block that have rules, or `None` when no
     /// column has one (the rows are then copied as they are).
-    fn masking_plan(&self, metadata: &HeaderMetadata) -> Option<MaskingPlan<'_>> {
-        let table = self.config.tables.get(&metadata.table)?;
+    fn masking_plan(&self, metadata: &HeaderMetadata) -> Option<KeyedPlan<'_>> {
+        let (key, rules) = self
+            .config
+            .rules_for(metadata.schema.as_deref(), &metadata.table)?;
         let columns = metadata.columns.as_ref()?;
 
         let plan: MaskingPlan = columns
             .iter()
-            .map(|name| table.iter().find(|c| c.name == *name))
+            .map(|name| rules.iter().find(|rule| rule.matches(name)))
             .collect();
-        plan.iter().any(Option::is_some).then_some(plan)
+        plan.iter().any(Option::is_some).then_some((key, plan))
     }
 
     /// Decides how the rows of a data block are written, or refuses the block
@@ -114,7 +141,7 @@ impl AnonymizerEngine {
         metadata: Option<&HeaderMetadata>,
         opaque: bool,
         header: &[u8],
-    ) -> io::Result<Option<MaskingPlan<'_>>> {
+    ) -> io::Result<Option<KeyedPlan<'_>>> {
         let Some(metadata) = metadata else {
             if self.config.tables.is_empty() {
                 debug!("data block without table metadata, rows pass through");
@@ -128,7 +155,11 @@ impl AnonymizerEngine {
         };
         let table = &metadata.table;
 
-        if metadata.columns.is_none() && self.config.tables.contains_key(table) {
+        let has_rules = self
+            .config
+            .rules_for(metadata.schema.as_deref(), table)
+            .is_some();
+        if metadata.columns.is_none() && has_rules {
             return Err(refuse(format!(
                 "table `{table}` has rules, but its INSERT has no column list, so they cannot \
                  be matched to values. Dump it with column names (mysqldump --complete-insert, \
@@ -144,7 +175,7 @@ impl AnonymizerEngine {
             )));
         }
 
-        log_masking_plan(metadata, plan.as_deref());
+        log_masking_plan(metadata, plan.as_ref().map(|(_, plan)| plan.as_slice()));
         Ok(plan)
     }
 
@@ -211,6 +242,8 @@ impl AnonymizerEngine {
 
         let mut plan: Option<Arc<MaskingPlan>> = None;
         let mut plan_metadata: Option<Arc<HeaderMetadata>> = None;
+        // Rules applied at least once, as (table key, column name).
+        let mut used: BTreeSet<(&str, &String)> = BTreeSet::new();
 
         'leitura: loop {
             let bytes_read = reader.read(&mut buffer)?;
@@ -246,7 +279,13 @@ impl AnonymizerEngine {
                                 current_rows = 0;
                             }
                             plan = match self.plan_block(metadata.as_deref(), opaque, &raw_bytes) {
-                                Ok(plan) => plan.map(Arc::new),
+                                Ok(Some((key, columns))) => {
+                                    used.extend(
+                                        columns.iter().flatten().map(|rule| (key, &rule.name)),
+                                    );
+                                    Some(Arc::new(columns))
+                                }
+                                Ok(None) => None,
                                 Err(e) => return stop(sink, e),
                             };
                             plan_metadata = metadata;
@@ -335,7 +374,40 @@ impl AnonymizerEngine {
             rows_masked,
             fields_masked: stats.masked_fields,
             rows_by_table,
+            // A run cut short by `--limit` has not seen the whole input.
+            unused_rules: if reached_limit {
+                Vec::new()
+            } else {
+                self.unused_rules(&used)
+            },
         })
+    }
+}
+
+impl AnonymizerEngine {
+    /// The rules that are not in `used`, sorted by table and column.
+    fn unused_rules(&self, used: &BTreeSet<(&str, &String)>) -> Vec<UnusedRule> {
+        let mut unused = Vec::new();
+        for (table, rules) in &self.config.tables {
+            let missing: Vec<&String> = rules
+                .iter()
+                .map(|rule| &rule.name)
+                .filter(|name| !used.contains(&(table.as_str(), *name)))
+                .collect();
+            if missing.len() == rules.len() {
+                unused.push(UnusedRule {
+                    table: table.clone(),
+                    column: None,
+                });
+            } else {
+                unused.extend(missing.into_iter().map(|column| UnusedRule {
+                    table: table.clone(),
+                    column: Some(column.clone()),
+                }));
+            }
+        }
+        unused.sort_by(|a, b| (&a.table, &a.column).cmp(&(&b.table, &b.column)));
+        unused
     }
 }
 
@@ -625,6 +697,69 @@ mod tests {
     fn test_truncated_row_is_an_error() {
         let err = run(b"INSERT INTO t (a) VALUES (1), (2").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_names_match_without_case_and_with_schema() {
+        let rules = r#"
+            [tables.Users]
+            columns = [{ name = "Name", strategy = "nullify" }]
+
+            [tables."audit.users"]
+            columns = [{ name = "id", strategy = "nullify" }]
+        "#;
+        let run = |input: &[u8]| run_with(rules, SqlDialect::Postgres, input).unwrap();
+        assert_eq!(
+            run(b"INSERT INTO USERS (ID, NAME) VALUES (1, 'Ana');"),
+            "INSERT INTO USERS (ID, NAME) VALUES (1, NULL);"
+        );
+        assert_eq!(
+            run(b"INSERT INTO public.\"users\" (id, \"name\") VALUES (1, 'Ana');"),
+            "INSERT INTO public.\"users\" (id, \"name\") VALUES (1, NULL);"
+        );
+        // The rule that names the schema wins over the one that does not.
+        assert_eq!(
+            run(b"INSERT INTO Audit.Users (id, name) VALUES (1, 'Ana');"),
+            "INSERT INTO Audit.Users (id, name) VALUES (NULL, 'Ana');"
+        );
+    }
+
+    #[test]
+    fn test_rules_that_match_nothing_are_reported() {
+        let rules = r#"
+            [tables.users]
+            columns = [
+                { name = "name", strategy = "nullify" },
+                { name = "emial", strategy = "nullify" },
+            ]
+
+            [tables.orders]
+            columns = [{ name = "card", strategy = "nullify" }]
+        "#;
+        let report = |limit| {
+            let options = RunOptions {
+                limit,
+                ..RunOptions::new(SqlDialect::Postgres)
+            };
+            let input = b"INSERT INTO users (name, email) VALUES ('Ana', 'a@x.com');\n";
+            engine(rules)
+                .process_dump(&input[..], io::sink(), &options)
+                .unwrap()
+        };
+        let unused: Vec<String> = report(None)
+            .unused_rules
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            unused,
+            [
+                "no rule of table `orders` matched the input",
+                "column `users.emial` was not found"
+            ]
+        );
+        // A run cut short has not seen the whole input.
+        assert!(report(Some(1)).unused_rules.is_empty());
     }
 
     const THREAD_RULES: &str = r#"
