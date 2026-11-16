@@ -89,6 +89,13 @@ pub struct Args {
     )]
     pub threads: NonZeroUsize,
 
+    /// Without it, a rule that matches no table or column only warns.
+    #[arg(
+        long,
+        help = "Fail when a rule matches no table or column of the input"
+    )]
+    pub strict: bool,
+
     /// Fixes every random choice, for reproducible experiments. Hidden: a
     /// known seed lets anyone recompute the generated values and the noise.
     #[arg(long, hide = true, value_name = "N")]

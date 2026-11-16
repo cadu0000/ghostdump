@@ -97,6 +97,17 @@ fn main() {
         bar.finish_and_clear();
     }
 
+    for rule in &report.unused_rules {
+        warn!("unused rule: {rule}. Check the name: a misspelt rule leaves its column unmasked.");
+    }
+    if args.strict && !report.unused_rules.is_empty() {
+        fatal(&format!(
+            "{} rule(s) matched nothing in the input (--strict). The output was written, \
+             but columns may be unmasked.",
+            report.unused_rules.len()
+        ));
+    }
+
     info!("Processing completed successfully!");
     info!("Rows processed: {}", report.rows_processed);
     info!(
