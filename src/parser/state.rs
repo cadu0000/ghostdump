@@ -536,8 +536,8 @@ struct Framer {
     sqlite: u8,
     /// sqlite3: a `-` or `/` not yet counted, since it may open a comment.
     sqlite_dash: bool,
-    /// mysql: the statement delimiter.
-    delimiter: Vec<u8>,
+    /// mysql: the statement delimiter set by `DELIMITER`; `None` for `;`.
+    delimiter: Option<Vec<u8>>,
     /// mysql: the last bytes of code, compared with a longer delimiter.
     recent: VecDeque<u8>,
 }
@@ -552,23 +552,26 @@ impl Framer {
             words: 0,
             sqlite: SQLITE_START,
             sqlite_dash: false,
-            delimiter: vec![b';'],
+            delimiter: None,
             recent: VecDeque::new(),
         }
     }
 
     fn custom_delimiter(&self) -> bool {
-        self.delimiter != b";"
+        self.delimiter.is_some()
     }
 
     /// Whether `byte`, read in code right after the first word, ends the
     /// statement.
     fn ends_single_word(&self, byte: u8) -> bool {
-        self.delimiter == [byte]
+        match &self.delimiter {
+            None => byte == b';',
+            Some(delimiter) => delimiter == &[byte],
+        }
     }
 
     fn set_delimiter(&mut self, delimiter: Vec<u8>) {
-        self.delimiter = delimiter;
+        self.delimiter = (delimiter != b";").then_some(delimiter);
         self.recent.clear();
     }
 
@@ -629,14 +632,14 @@ impl Framer {
                     self.recent.clear();
                     return false;
                 }
-                if !self.custom_delimiter() {
+                let Some(delimiter) = &self.delimiter else {
                     return byte == b';';
-                }
+                };
                 self.recent.push_back(byte);
-                if self.recent.len() > self.delimiter.len() {
+                if self.recent.len() > delimiter.len() {
                     self.recent.pop_front();
                 }
-                self.recent.iter().eq(self.delimiter.iter())
+                self.recent.iter().eq(delimiter.iter())
             }
             SqlDialect::Sqlite => self.sqlite_byte(byte, class),
         }
