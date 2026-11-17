@@ -459,7 +459,11 @@ impl AnonymizerEngine {
         footer: &[u8],
         dialect: SqlDialect,
     ) -> io::Result<()> {
-        let Some(metadata) = metadata else {
+        // Most footers are a bare `;`, with no byte that can start a value.
+        let may_hold_values = footer
+            .iter()
+            .any(|&byte| byte.is_ascii_digit() || matches!(byte, b'\'' | b'"' | b'$'));
+        let Some(metadata) = metadata.filter(|_| may_hold_values) else {
             return Ok(());
         };
         let table = &metadata.table;
