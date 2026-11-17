@@ -40,6 +40,8 @@ SALARY_RULE = (
     '{{ name = "salary", strategy = "dp_laplace", epsilon = 0.5, '
     'bounds = [0.0, 10000.0], scale = 2, mechanism = "{sampler}" }}'
 )
+# The f64 sampler runs only behind its experiment option.
+CONFIG_FLAGS = {"laplace_f64": ["--experimental-f64-sampler"]}
 HMAC_KEYS = """
 [tables.users]
 columns = [{{ name = "id", strategy = "hmac" }}, {extra}]
@@ -91,8 +93,8 @@ def read_hwm(pid):
     return None
 
 
-def run_once(binary, config, dump, threads=None):
-    """Runs the CLI once; returns (seconds, peak RSS in KiB).
+def run_once(binary, config, dump, threads=None, flags=()):
+    """Runs the CLI once with extra `flags`; returns (seconds, peak RSS in KiB).
 
     The peak is VmHWM, which belongs to the program after exec. The
     rusage of os.wait4 would also count the memory the child inherited
@@ -103,6 +105,7 @@ def run_once(binary, config, dump, threads=None):
         command += ["-c", str(config)]
     if threads is not None:
         command += ["--threads", str(threads)]
+    command += flags
     env = dict(os.environ, GHOSTDUMP_SECRET=SECRET, GHOSTDUMP_LOG="error")
     # A file, not a pipe: a build that logs one line per value would fill a
     # pipe and block before exiting.
@@ -204,10 +207,11 @@ def main():
                         # Without rules nothing is masked and --threads is ignored.
                         if config is None and threads not in (None, 1):
                             continue
+                        flags = CONFIG_FLAGS.get(name, [])
                         for _ in range(args.warmup):
-                            run_once(binary, config, dump, threads)
+                            run_once(binary, config, dump, threads, flags)
                         for run in range(1, args.runs + 1):
-                            seconds, rss = run_once(binary, config, dump, threads)
+                            seconds, rss = run_once(binary, config, dump, threads, flags)
                             rows_out.append(
                                 {
                                     "binary": label,
