@@ -3,7 +3,7 @@
 use rand::Rng;
 
 use crate::codec::SqlValue;
-use crate::engine::laplace::bernoulli_exp;
+use crate::engine::laplace::{bernoulli_exp, exact_fraction};
 use crate::engine::mask::MaskStats;
 
 /// k-ary randomized response (Warner, 1965; Kairouz et al., 2016) over a
@@ -103,33 +103,6 @@ impl RandomizedResponse {
     }
 }
 
-/// `value` as an exact fraction of integers. Every finite f64 is a dyadic
-/// rational m·2^e; the denominator is kept below 2^100 so that the Bernoulli
-/// sampler's products stay within u128.
-fn exact_fraction(value: f64) -> Option<(u128, u128)> {
-    let bits = value.to_bits();
-    let exponent = ((bits >> 52) & 0x7ff) as i32;
-    let mantissa = if exponent == 0 {
-        (bits & ((1 << 52) - 1)) << 1
-    } else {
-        (bits & ((1 << 52) - 1)) | (1 << 52)
-    };
-    // value = mantissa · 2^(exponent − 1075)
-    let mut num = u128::from(mantissa);
-    let mut shift = 1075 - exponent;
-    while shift > 0 && num % 2 == 0 {
-        num /= 2;
-        shift -= 1;
-    }
-    if shift <= 0 {
-        return Some((num << (-shift), 1));
-    }
-    if shift > 100 {
-        return None;
-    }
-    Some((num, 1u128 << shift))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,16 +130,6 @@ mod tests {
             counts[index] += 1;
         }
         (counts.iter().map(|&c| c as f64 / n as f64).collect(), stats)
-    }
-
-    #[test]
-    fn test_exact_fraction() {
-        assert_eq!(exact_fraction(0.5), Some((1, 2)));
-        assert_eq!(exact_fraction(2.0), Some((2, 1)));
-        assert_eq!(exact_fraction(1.25), Some((5, 4)));
-        let (num, den) = exact_fraction(0.1).unwrap();
-        assert_eq!(num as f64 / den as f64, 0.1);
-        assert_eq!(exact_fraction(1e-40), None);
     }
 
     #[test]
@@ -213,5 +176,23 @@ mod tests {
         assert!(RandomizedResponse::new(1.0, vec!["A".into()]).is_err());
         assert!(RandomizedResponse::new(1.0, vec!["A".into(), "A".into()]).is_err());
         assert!(RandomizedResponse::new(1e-30, categories()).is_err());
+    }
+
+    #[test]
+    fn test_epsilon_at_its_limits() {
+        assert!(RandomizedResponse::new(64.0, categories()).is_ok());
+        assert!(RandomizedResponse::new(64.000_001, categories()).is_err());
+        assert!(RandomizedResponse::new(1e-9, categories()).is_ok());
+
+        // ε = 64: another category comes out with probability 2e^-64.
+        let rr = RandomizedResponse::new(64.0, categories()).unwrap();
+        let (kept, _) = shares(&rr, SqlValue::Text("PENDING".into()), 1_000);
+        assert_eq!(kept[1], 1.0);
+        // ε = 1e-9: every category comes out with probability close to 1/3.
+        let rr = RandomizedResponse::new(1e-9, categories()).unwrap();
+        let (uniform, _) = shares(&rr, SqlValue::Text("PENDING".into()), 30_000);
+        for share in uniform {
+            assert!((share - 1.0 / 3.0).abs() < 0.02, "{share}");
+        }
     }
 }

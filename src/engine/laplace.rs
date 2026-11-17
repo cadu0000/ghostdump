@@ -77,6 +77,11 @@ impl LaplaceMechanism {
         self.consistent.is_some()
     }
 
+    /// Whether the noise is drawn by the `f64` sampler.
+    pub fn is_f64(&self) -> bool {
+        matches!(self.sampler, Sampler::F64 { .. })
+    }
+
     /// The exact integer sampler; fails when the bounds, `scale` and ε do
     /// not fit its integer domain.
     pub fn exact(
@@ -205,10 +210,14 @@ impl LaplaceMechanism {
 /// the noise except with probability e^-10. With bounds [0, 100000] and
 /// ε = 1 this allows 6 places; 12 places leak (see
 /// docs/experiments/floating-point.md).
+///
+/// The casts from `f64` saturate (and map NaN to 0), so an infinite
+/// magnitude, reached when ε is tiny, gives 0 places.
 pub fn max_f64_scale(epsilon: f64, lo: f64, hi: f64) -> u32 {
     let magnitude = lo.abs().max(hi.abs()) + 10.0 * (hi - lo) / epsilon;
-    let spacing = 2f64.powi(magnitude.log2().floor() as i32 - 52);
-    let grid = 1024.0 * spacing;
+    // The binary exponent of a positive double lies in [-1074, 1023].
+    let exponent = magnitude.log2().floor().clamp(-1074.0, 1024.0) as i32;
+    let grid = 1024.0 * 2f64.powi(exponent - 52);
     (-grid.log10()).floor().max(0.0) as u32
 }
 
@@ -233,9 +242,17 @@ fn bernoulli(num: u128, den: u128, rng: &mut impl Rng) -> bool {
 
 /// Bernoulli(exp(-num / den)) for 0 <= num / den <= 1 (Canonne, Kamath and
 /// Steinke, 2020, algorithm 1). Only integer comparisons are involved.
+///
+/// Step k goes on with probability num / (den · k) <= 1 / k, so k reaches
+/// K with probability at most 1 / (K − 1)!. The loop stops when `den · k`
+/// no longer fits in u128, after at least 2^28 steps for the largest `den`
+/// in use (2^100): that changes the distribution by less than
+/// 1 / (2^28 − 1)!, and ends the loop whatever the generator returns.
 pub(crate) fn bernoulli_exp_le1(num: u128, den: u128, rng: &mut impl Rng) -> bool {
     let mut k: u128 = 1;
-    while bernoulli(num, den * k, rng) {
+    while let Some(den_k) = den.checked_mul(k)
+        && bernoulli(num, den_k, rng)
+    {
         k += 1;
     }
     k % 2 == 1
@@ -287,31 +304,78 @@ pub fn discrete_laplace(t: u64, rng: &mut impl Rng) -> i64 {
 /// from the limits of an i64.
 const MAX_NOISE_PARAMETER: u64 = 1 << 50;
 
+/// Largest value in units: up to 2^53, an f64 holds every integer, so the
+/// bounds and the clamped inputs convert to units without loss.
+const MAX_UNITS: f64 = 9_007_199_254_740_992.0;
+
+/// `value` as an exact fraction of integers num / den. Every finite f64 is
+/// a dyadic rational m·2^e. `None` for a negative or non-finite value, when
+/// the value passes u128, or when the denominator would pass 2^100, which
+/// keeps the products of the Bernoulli samplers within u128.
+pub(crate) fn exact_fraction(value: f64) -> Option<(u128, u128)> {
+    if !(value.is_finite() && value >= 0.0) {
+        return None;
+    }
+    let bits = value.to_bits();
+    let exponent = i32::try_from((bits >> 52) & 0x7ff).expect("the exponent has 11 bits");
+    let mantissa = if exponent == 0 {
+        (bits & ((1 << 52) - 1)) << 1
+    } else {
+        (bits & ((1 << 52) - 1)) | (1 << 52)
+    };
+    // value = mantissa · 2^(exponent − 1075)
+    let mut num = u128::from(mantissa);
+    let mut shift = 1075 - exponent;
+    while shift > 0 && num % 2 == 0 {
+        num /= 2;
+        shift -= 1;
+    }
+    if shift <= 0 {
+        let factor = 1u128.checked_shl(shift.unsigned_abs())?;
+        return num.checked_mul(factor).map(|num| (num, 1));
+    }
+    if shift > 100 {
+        return None;
+    }
+    Some((num, 1u128 << shift))
+}
+
 /// The integer domain of an exact `dp_laplace` column: values in units of
 /// the published precision (with `scale = 2`, one unit is 0.01).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExactDomain {
     /// 10^scale.
     unit: i64,
+    decimals: usize,
     lo: i64,
     hi: i64,
-    /// Discrete Laplace parameter: t = ceil((hi - lo) / ε).
+    /// Discrete Laplace parameter: the smallest t with (hi - lo) / t <= ε.
     t: u64,
 }
 
 impl ExactDomain {
     /// The domain for `bounds = [lo, hi]` written with `decimals` places,
     /// and the noise parameter that makes it ε-LDP.
+    ///
+    /// The noise parameter is computed in integers from the exact value of
+    /// ε, so Δ/t <= ε holds exactly, not only up to rounding: t = ⌈Δ·den/num⌉
+    /// with ε = num/den.
     pub fn new(epsilon: f64, lo: f64, hi: f64, decimals: usize) -> Result<Self, String> {
-        let unit = 10i64
-            .checked_pow(decimals as u32)
+        if !(epsilon.is_finite() && epsilon > 0.0) {
+            return Err("`epsilon` must be a positive number".into());
+        }
+        let unit = u32::try_from(decimals)
+            .ok()
+            .and_then(|decimals| 10i64.checked_pow(decimals))
             .ok_or("`scale` is too large for the exact sampler")?;
+        // 10^scale <= 10^18 is exact in an f64 (every power of ten up to 10^22 is).
+        let unit_f64 = unit as f64;
         let to_units = |value: f64| {
-            let units = (value * unit as f64).round();
-            // 2^53: beyond it, f64 no longer holds every integer.
-            if units.abs() > 9_007_199_254_740_992.0 {
+            let units = (value * unit_f64).round();
+            if units.abs() > MAX_UNITS {
                 Err("`bounds` times 10^scale must stay below 2^53 for the exact sampler")
             } else {
+                // An integer in [-2^53, 2^53]: the cast is exact.
                 Ok(units as i64)
             }
         };
@@ -320,25 +384,37 @@ impl ExactDomain {
             return Err("`bounds` must differ by at least one unit of `scale`".into());
         }
 
-        let delta = (hi - lo) as u64;
-        let needed = (delta as f64 / epsilon).ceil();
-        if needed.is_nan() || needed > MAX_NOISE_PARAMETER as f64 {
-            return Err(format!(
-                "bounds, scale and epsilon need a noise parameter of {needed} units, above \
-                 the exact sampler's limit of 2^50; use a larger epsilon or a smaller scale"
-            ));
-        }
-        let mut t = (needed as u64).max(1);
-        // ceil in f64 may land one below the exact value: make sure Δ/t <= ε.
-        while (delta as f64) / (t as f64) > epsilon {
-            t += 1;
-        }
-        Ok(Self { unit, lo, hi, t })
+        // At most 2^54, from bounds within ±2^53.
+        let delta = u128::from(hi.abs_diff(lo));
+        // Every ε >= 2^54 needs t = 1: capping ε there leaves t unchanged and
+        // keeps its fraction within u128.
+        let (num, den) = exact_fraction(epsilon.min(2.0 * MAX_UNITS))
+            .ok_or("`epsilon` is too small to be represented exactly; use at least 1e-9")?;
+        let t = delta
+            .checked_mul(den)
+            .map(|scaled| scaled.div_ceil(num))
+            .and_then(|t| u64::try_from(t).ok())
+            .filter(|&t| t <= MAX_NOISE_PARAMETER);
+        let Some(t) = t else {
+            return Err(
+                "bounds, scale and epsilon need a noise parameter above the exact sampler's \
+                 limit of 2^50 units; use a larger epsilon or a smaller scale"
+                    .into(),
+            );
+        };
+        Ok(Self {
+            unit,
+            decimals,
+            lo,
+            hi,
+            t,
+        })
     }
 
     /// The ε this domain really spends: Δ / t, never above the configured ε.
+    /// Rounded to an f64 for display; the bound itself is checked in integers.
     pub fn effective_epsilon(&self) -> f64 {
-        (self.hi - self.lo) as f64 / self.t as f64
+        self.lo.abs_diff(self.hi) as f64 / self.t as f64
     }
 
     /// Clamps `value` to the bounds and converts it to units; values that
@@ -346,15 +422,19 @@ impl ExactDomain {
     pub fn to_units(&self, value: Option<f64>) -> i64 {
         match value {
             Some(v) => {
+                // Finite inputs only: the product is finite or ±inf, never NaN.
                 let units = (v * self.unit as f64).round();
-                (units.max(self.lo as f64).min(self.hi as f64)) as i64
+                // Clamped to integers within ±2^53: the cast is exact.
+                units.clamp(self.lo as f64, self.hi as f64) as i64
             }
             None => self.lo + (self.hi - self.lo) / 2,
         }
     }
 
+    /// `units` plus noise. With t <= 2^50, noise past 2^62 has probability
+    /// below e^-4096; the sum saturates instead of overflowing even then.
     pub fn noisy(&self, units: i64, clamp_output: bool, rng: &mut impl Rng) -> i64 {
-        let noisy = units + discrete_laplace(self.t, rng);
+        let noisy = units.saturating_add(discrete_laplace(self.t, rng));
         if clamp_output {
             noisy.clamp(self.lo, self.hi)
         } else {
@@ -365,10 +445,10 @@ impl ExactDomain {
     /// Writes a number of units with the decimal point in place, without
     /// any floating-point step.
     pub fn format(&self, units: i64) -> String {
-        let decimals = self.unit.ilog10() as usize;
+        let decimals = self.decimals;
         let sign = if units < 0 { "-" } else { "" };
         let magnitude = units.unsigned_abs();
-        let unit = self.unit as u64;
+        let unit = self.unit.unsigned_abs();
         if decimals == 0 {
             format!("{sign}{magnitude}")
         } else {
@@ -525,6 +605,125 @@ mod tests {
         assert!(ExactDomain::new(1.0, 0.0, 1e15, 4).is_err());
         assert!(ExactDomain::new(1e-12, 0.0, 1e6, 2).is_err());
         assert!(ExactDomain::new(1.0, 0.0, 0.001, 2).is_err());
+    }
+
+    #[test]
+    fn test_exact_fraction() {
+        assert_eq!(exact_fraction(0.5), Some((1, 2)));
+        assert_eq!(exact_fraction(2.0), Some((2, 1)));
+        assert_eq!(exact_fraction(1.25), Some((5, 4)));
+        let (num, den) = exact_fraction(0.1).unwrap();
+        assert_eq!(num as f64 / den as f64, 0.1);
+        assert_eq!(exact_fraction(1e-40), None);
+
+        assert_eq!(exact_fraction(0.0), Some((0, 1)));
+        assert_eq!(exact_fraction(2f64.powi(127)), Some((1 << 127, 1)));
+        let below_2_128 = 2f64.powi(128) - 2f64.powi(75);
+        assert_eq!(
+            exact_fraction(below_2_128),
+            Some((u128::MAX - (1 << 75) + 1, 1))
+        );
+        for outside in [2f64.powi(128), 1e300, f64::MAX, f64::INFINITY, f64::NAN] {
+            assert_eq!(exact_fraction(outside), None, "{outside}");
+        }
+        assert_eq!(exact_fraction(-1.0), None);
+        assert_eq!(exact_fraction(-1e-300), None);
+    }
+
+    /// Whether t is the smallest noise parameter with Δ / t <= ε, compared
+    /// in integers.
+    fn has_smallest_exact_t(domain: &ExactDomain, epsilon: f64) -> bool {
+        let (num, den) = exact_fraction(epsilon).unwrap();
+        let delta = u128::from(domain.lo.abs_diff(domain.hi));
+        let t = u128::from(domain.t);
+        delta * den <= num * t && delta * den > num * (t - 1)
+    }
+
+    #[test]
+    fn test_noise_parameter_is_exact_at_the_limits() {
+        // Bounds of ±2^53 units: Δ reaches 2^54, and an odd Δ above 2^53
+        // is not an f64.
+        let max = 9_007_199_254_740_992.0;
+        for (epsilon, lo, hi) in [
+            (16.0, -max, max),
+            (16.0, -max, max - 1.0),
+            (1.0 / 3.0, 0.0, 3.0),
+            (0.1, 0.0, 1.0),
+            (1e-9, 0.0, 1.0),
+            (1e9, 0.0, 1.0),
+        ] {
+            let domain = ExactDomain::new(epsilon, lo, hi, 0).unwrap();
+            assert!(
+                has_smallest_exact_t(&domain, epsilon),
+                "ε {epsilon}, [{lo}, {hi}]: {domain:?}"
+            );
+        }
+        assert_eq!(ExactDomain::new(16.0, -max, max, 0).unwrap().t, 1 << 50);
+        // Just past the limits: t above 2^50, bounds above 2^53, 10^19.
+        assert!(ExactDomain::new(15.99, -max, max, 0).is_err());
+        assert!(ExactDomain::new(1.0, 0.0, max + 2.0, 0).is_err());
+        assert!(ExactDomain::new(1.0, 0.0, 1.0, 19).is_err());
+
+        // An ε too large for a fraction in u128 needs the least noise.
+        for epsilon in [2f64.powi(54), 2f64.powi(80), 1e300, f64::MAX] {
+            assert_eq!(ExactDomain::new(epsilon, -max, max, 0).unwrap().t, 1);
+        }
+        assert_eq!(ExactDomain::new(2f64.powi(53), -max, max, 0).unwrap().t, 2);
+        for epsilon in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            assert!(ExactDomain::new(epsilon, 0.0, 1.0, 0).is_err(), "{epsilon}");
+        }
+    }
+
+    #[test]
+    fn test_noise_parameter_is_exact_for_random_parameters() {
+        let mut rng = rng();
+        let mut checked = 0;
+        for _ in 0..10_000 {
+            let hi = rng.gen_range(1..=(1u32 << 31));
+            let epsilon = rng.gen_range(1e-6..64.0);
+            if let Ok(domain) = ExactDomain::new(epsilon, 0.0, f64::from(hi), 0) {
+                assert!(has_smallest_exact_t(&domain, epsilon), "{epsilon} {hi}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 9_000, "{checked}");
+
+        // Δ close to 2^54, where `Δ as f64` rounds: a check of Δ/t <= ε in
+        // floating point lets about 5% of these exceed ε.
+        let max = 1i64 << 53;
+        for _ in 0..10_000 {
+            let hi = rng.gen_range(max - (1 << 20)..=max);
+            let epsilon = rng.gen_range(16.0..65.0);
+            let domain = ExactDomain::new(epsilon, -(max as f64), hi as f64, 0).unwrap();
+            assert!(has_smallest_exact_t(&domain, epsilon), "{epsilon} {hi}");
+        }
+    }
+
+    #[test]
+    fn test_noisy_sum_saturates() {
+        let domain = ExactDomain::new(1.0, 0.0, 1.0, 0).unwrap();
+        let mut rng = rng();
+        // Without saturation, half of these sums would overflow.
+        for _ in 0..100 {
+            let high = domain.noisy(i64::MAX, false, &mut rng);
+            assert!(high > i64::MAX - 1_000, "{high}");
+            let low = domain.noisy(i64::MIN, false, &mut rng);
+            assert!(low < i64::MIN + 1_000, "{low}");
+        }
+    }
+
+    #[test]
+    fn test_bernoulli_ends_whatever_the_generator_returns() {
+        // A generator stuck at 0 says yes to every Bernoulli draw.
+        let mut stuck = rand::rngs::mock::StepRng::new(0, 0);
+        assert!(!bernoulli_exp_le1(1, 1 << 126, &mut stuck));
+    }
+
+    #[test]
+    fn test_f64_scale_limit_at_extreme_parameters() {
+        assert_eq!(max_f64_scale(f64::MIN_POSITIVE, 0.0, 1.0), 0);
+        assert_eq!(max_f64_scale(1.0, -1e300, 1e300), 0);
+        assert!(max_f64_scale(1e300, 0.0, 1e-300) > 300);
     }
 
     #[test]
