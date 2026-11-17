@@ -48,15 +48,15 @@ impl Config {
 }
 /// Rules validated and compiled, ready to be applied.
 ///
-/// Table and column names are matched without regard to ASCII case, in
-/// every dialect: PostgreSQL folds unquoted names to lower case, MySQL never
-/// distinguishes case in column names, and SQLite does not distinguish it at
-/// all. Matching a name that the database would treat as distinct can only
-/// mask one table more, which errs on the safe side.
+/// Table and column names are matched without regard to case (see
+/// [`fold_case`]), in every dialect: PostgreSQL folds unquoted names to lower
+/// case, MySQL never distinguishes case in column names, and SQLite does not
+/// distinguish it at all. Matching a name that the database would treat as
+/// distinct can only mask one table more, which errs on the safe side.
 #[derive(Debug)]
 pub struct CompiledConfig {
-    /// Rules by table, keyed by the lower-cased name: `table`, or
-    /// `schema.table` for a rule that names its schema.
+    /// Rules by table, keyed by the folded name (see [`fold_case`]): `table`,
+    /// or `schema.table` for a rule that names its schema.
     pub tables: HashMap<String, Vec<CompiledColumn>>,
 }
 
@@ -97,7 +97,7 @@ impl Config {
         let mut tables = HashMap::with_capacity(self.tables.len());
 
         for (table, table_config) in self.tables {
-            let key = table.to_ascii_lowercase();
+            let key = fold_case(&table);
             let mut columns: Vec<CompiledColumn> = Vec::with_capacity(table_config.columns.len());
             for column in table_config.columns {
                 if columns.iter().any(|c| c.matches(&column.name)) {
@@ -116,7 +116,7 @@ impl Config {
                 })?;
                 // Bound to the folded names, so consistent noise does not
                 // depend on how a dump spells them.
-                masker.bind(&key, &column.name.to_ascii_lowercase());
+                masker.bind(&key, &fold_case(&column.name));
                 columns.push(CompiledColumn {
                     name: column.name,
                     null_policy: column.null_policy,
@@ -189,10 +189,25 @@ impl fmt::Display for TableGuarantees {
     }
 }
 
+/// A name in the form rules are compared in: each character mapped to upper
+/// case and then to lower case. This ignores the case of ASCII letters, as
+/// PostgreSQL does for unquoted names and SQLite for every name, and of other
+/// letters too, as MySQL does for column names (`Ação` and `AÇÃO` are the
+/// same column). Going through upper case also joins `σ` and the final `ς`.
+pub fn fold_case(name: &str) -> String {
+    folded(name).collect()
+}
+
+fn folded(name: &str) -> impl Iterator<Item = char> + '_ {
+    name.chars()
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+}
+
 impl CompiledColumn {
-    /// Whether the rule is for the column `name`, compared without ASCII case.
+    /// Whether the rule is for the column `name`, compared without case.
     pub fn matches(&self, name: &str) -> bool {
-        self.name.eq_ignore_ascii_case(name)
+        folded(&self.name).eq(folded(name))
     }
 }
 
@@ -205,8 +220,8 @@ impl CompiledConfig {
         schema: Option<&str>,
         table: &str,
     ) -> Option<(&str, &[CompiledColumn])> {
-        let table = table.to_ascii_lowercase();
-        let qualified = schema.map(|schema| format!("{}.{table}", schema.to_ascii_lowercase()));
+        let table = fold_case(table);
+        let qualified = schema.map(|schema| format!("{}.{table}", fold_case(schema)));
         qualified
             .and_then(|key| self.tables.get_key_value(&key))
             .or_else(|| self.tables.get_key_value(&table))
@@ -377,5 +392,33 @@ mod tests {
         assert_eq!(key(Some("public"), "Users"), Some("users"));
         assert_eq!(key(None, "users"), Some("users"));
         assert_eq!(key(None, "orders"), None);
+    }
+
+    #[test]
+    fn test_case_is_ignored_outside_ascii() {
+        let config = compile_rules(
+            r#"
+            [tables."Ação"]
+            columns = [{ name = "ΟΔΟΣ", strategy = "nullify" }]
+        "#,
+        )
+        .unwrap();
+        let (key, rules) = config.rules_for(None, "AÇÃO").unwrap();
+        assert_eq!(key, "ação");
+        assert!(rules[0].matches("οδος"));
+        assert!(rules[0].matches("οδοσ"));
+        assert!(!rules[0].matches("odos"));
+
+        let err = compile_rules(
+            r#"
+            [tables.t]
+            columns = [
+                { name = "ação", strategy = "nullify" },
+                { name = "AÇÃO", strategy = "nullify" },
+            ]
+        "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("more than one rule"), "{err}");
     }
 }
