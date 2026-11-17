@@ -32,8 +32,10 @@ pub enum Remainder {
     Statement(Vec<u8>),
     /// The input ended inside a data block, before its terminator. When
     /// `partial_row` is true, an incomplete row was dropped: it cannot be
-    /// masked, so it must not be written.
-    UnterminatedData { partial_row: bool },
+    /// masked, so it must not be written. `footer` holds what came after the
+    /// last row (a clause such as `ON CONFLICT ...`), to be checked like a
+    /// footer before it is written.
+    UnterminatedData { partial_row: bool, footer: Vec<u8> },
 }
 
 pub enum NormalEvent {
@@ -904,9 +906,8 @@ pub enum ValueEvent {
     Continue,
     TupleComplete(Vec<u8>),
     ExitValuesMode(Vec<u8>),
-    /// A byte outside the rows (separators, comments, trailing clauses such
-    /// as `ON CONFLICT DO NOTHING`, the rest of the COPY command line),
-    /// written unchanged.
+    /// A byte outside the rows (separators, comments, the rest of the COPY
+    /// command line), written unchanged.
     Passthrough(u8),
     /// A row grew past the size limit without ending.
     RowTooLarge,
@@ -920,7 +921,9 @@ enum RowPhase {
     InRow(usize),
     /// VALUES: after a row, before a comma or the end of the list.
     AfterRow,
-    /// VALUES: after the rows, in a trailing clause, until the `;`.
+    /// VALUES: after the rows, in a clause such as `ON CONFLICT ...`, held
+    /// until the `;` so that the whole footer can be checked before it is
+    /// written.
     Trailer,
     /// COPY: on the rest of the `COPY ... FROM stdin;` line, which holds no data.
     CopyCommandLine,
@@ -930,6 +933,8 @@ enum RowPhase {
 
 pub struct ValueState {
     pub tuple_buffer: Vec<u8>,
+    /// VALUES: the clause after the rows, up to the `;`.
+    trailer: Vec<u8>,
     pub dialect: SqlDialect,
     pub format: InsertFormat,
     phase: RowPhase,
@@ -942,6 +947,7 @@ impl ValueState {
         ValueState {
             max_row_bytes,
             tuple_buffer: Vec::with_capacity(1024),
+            trailer: Vec::new(),
             dialect,
             format,
             phase: match format {
@@ -975,15 +981,23 @@ impl ValueState {
     /// Called when the input ends inside this data block.
     pub fn finish(&mut self) -> Remainder {
         let rest = std::mem::take(&mut self.tuple_buffer);
+        let footer = std::mem::take(&mut self.trailer);
 
         match self.phase {
             // End-of-data marker without its final newline.
             RowPhase::CopyData if rest == b"\\." || rest == b"\\.\r" => Remainder::Bytes(rest),
             RowPhase::CopyData => Remainder::UnterminatedData {
                 partial_row: !rest.is_empty(),
+                footer,
             },
-            RowPhase::InRow(_) => Remainder::UnterminatedData { partial_row: true },
-            _ => Remainder::UnterminatedData { partial_row: false },
+            RowPhase::InRow(_) => Remainder::UnterminatedData {
+                partial_row: true,
+                footer,
+            },
+            _ => Remainder::UnterminatedData {
+                partial_row: false,
+                footer,
+            },
         }
     }
 
@@ -1034,7 +1048,11 @@ impl ValueState {
                 }
                 ValueEvent::Continue
             }
-            _ if is_code && byte == b';' => ValueEvent::ExitValuesMode(vec![byte]),
+            _ if is_code && byte == b';' => {
+                let mut footer = std::mem::take(&mut self.trailer);
+                footer.push(byte);
+                ValueEvent::ExitValuesMode(footer)
+            }
             RowPhase::BeforeRow if is_code && byte == b'(' => {
                 self.phase = RowPhase::InRow(1);
                 self.tuple_buffer.push(byte);
@@ -1044,15 +1062,19 @@ impl ValueState {
                 self.phase = RowPhase::BeforeRow;
                 ValueEvent::Passthrough(byte)
             }
-            RowPhase::BeforeRow | RowPhase::AfterRow => {
-                // Anything other than whitespace or a comment ends the list of
-                // rows: `ON CONFLICT (id) DO NOTHING` must not be read as a row.
-                if !is_separator(byte, class) {
-                    self.phase = RowPhase::Trailer;
-                }
+            RowPhase::BeforeRow | RowPhase::AfterRow if is_separator(byte, class) => {
                 ValueEvent::Passthrough(byte)
             }
-            RowPhase::Trailer => ValueEvent::Passthrough(byte),
+            // Anything other than whitespace or a comment ends the list of
+            // rows: `ON CONFLICT (id) DO NOTHING` must not be read as a row.
+            RowPhase::BeforeRow | RowPhase::AfterRow | RowPhase::Trailer => {
+                self.phase = RowPhase::Trailer;
+                self.trailer.push(byte);
+                if self.trailer.len() > self.max_row_bytes {
+                    return ValueEvent::RowTooLarge;
+                }
+                ValueEvent::Continue
+            }
             RowPhase::CopyCommandLine | RowPhase::CopyData => {
                 unreachable!("COPY bytes are handled by process_copy_byte")
             }

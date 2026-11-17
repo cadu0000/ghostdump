@@ -6,7 +6,8 @@ use std::fmt;
 use std::sync::Arc;
 
 pub use schema::{
-    HeaderMetadata, detect_dialect, extract_metadata, may_write, names_in, statement_keyword,
+    HeaderMetadata, detect_dialect, extract_metadata, has_values, may_write, names_in,
+    statement_keyword,
 };
 pub use state::{InsertFormat, Remainder, SqlDialect};
 
@@ -60,6 +61,8 @@ pub enum SqlEvent {
         opaque: bool,
     },
     Tuple(Vec<u8>, InsertFormat),
+    /// What ends a data block: the `;` of `VALUES`, with any clause after the
+    /// rows (`ON CONFLICT ...`), or the `\.` line of COPY.
     Footer(Vec<u8>),
     /// The input cannot be processed safely; the run must stop.
     Error(ParseError),
@@ -560,15 +563,24 @@ mod tests {
     fn test_truncated_rows_are_reported() {
         assert_eq!(
             remainder(SqlDialect::Postgres, b"INSERT INTO t (a) VALUES (1), (2"),
-            Remainder::UnterminatedData { partial_row: true }
+            Remainder::UnterminatedData {
+                partial_row: true,
+                footer: Vec::new()
+            }
         );
         assert_eq!(
             remainder(SqlDialect::Postgres, b"COPY t (a) FROM stdin;\n1\n2"),
-            Remainder::UnterminatedData { partial_row: true }
+            Remainder::UnterminatedData {
+                partial_row: true,
+                footer: Vec::new()
+            }
         );
         assert_eq!(
             remainder(SqlDialect::Postgres, b"COPY t (a) FROM stdin;\n1\n"),
-            Remainder::UnterminatedData { partial_row: false }
+            Remainder::UnterminatedData {
+                partial_row: false,
+                footer: Vec::new()
+            }
         );
     }
 
@@ -693,6 +705,25 @@ mod tests {
         let (statements, opened) = held(SqlDialect::Postgres, b"COPY t TO STDIN;\n");
         assert!(!opened);
         assert_eq!(statements, ["COPY t TO STDIN;"]);
+    }
+
+    #[test]
+    fn test_clauses_after_the_rows_are_in_the_footer() {
+        let (seen, _) = parse(
+            SqlDialect::Mysql,
+            b"INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE a = 'x';\n",
+        );
+        assert_eq!(seen[3], footer("ON DUPLICATE KEY UPDATE a = 'x';"));
+        assert_eq!(
+            remainder(
+                SqlDialect::Postgres,
+                b"INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING"
+            ),
+            Remainder::UnterminatedData {
+                partial_row: false,
+                footer: b"ON CONFLICT DO NOTHING".to_vec()
+            }
+        );
     }
 
     #[test]

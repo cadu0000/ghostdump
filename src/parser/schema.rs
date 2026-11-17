@@ -44,6 +44,17 @@ impl Token {
             _ => None,
         }
     }
+
+    /// A string or a number, written as data.
+    fn is_value(&self, dialect: SqlDialect) -> bool {
+        match self {
+            Token::Number => true,
+            Token::Quoted { quote, .. } => {
+                matches!(quote, b'\'' | b'$') || (*quote == b'"' && dialect == SqlDialect::Mysql)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Splits SQL into tokens, without comments.
@@ -326,6 +337,14 @@ pub fn statement_keyword(statement: &[u8], dialect: SqlDialect) -> String {
     }
 }
 
+/// Whether SQL holds a string or a number, such as the values that an
+/// `ON DUPLICATE KEY UPDATE` or `ON CONFLICT DO UPDATE` clause writes.
+pub fn has_values(sql: &[u8], dialect: SqlDialect) -> bool {
+    tokenize(sql, dialect)
+        .iter()
+        .any(|token| token.is_value(dialect))
+}
+
 /// Guesses the dialect from the first bytes of a dump, using the comments
 /// and settings that pg_dump, mysqldump and SQLite's `.dump` write at the top.
 pub fn detect_dialect(prefix: &[u8]) -> Option<SqlDialect> {
@@ -554,6 +573,24 @@ mod tests {
         assert!(may_write(b"CREATE TABLE t SELECT 1;", SqlDialect::Mysql));
         assert!(may_write(b"UPDATE t SET a = 1;", pg));
         assert!(may_write(b"INSERT INTO t SELECT 1;", pg));
+    }
+
+    #[test]
+    fn test_values_in_a_clause() {
+        let (pg, mysql) = (SqlDialect::Postgres, SqlDialect::Mysql);
+        assert!(has_values(b"ON DUPLICATE KEY UPDATE a = 'x';", mysql));
+        assert!(has_values(b"ON DUPLICATE KEY UPDATE a = \"x\";", mysql));
+        assert!(has_values(b"ON CONFLICT (a) DO UPDATE SET b = 2;", pg));
+        assert!(has_values(b"ON CONFLICT DO UPDATE SET b = $$x$$;", pg));
+        assert!(!has_values(
+            b"ON CONFLICT (\"a\") DO UPDATE SET b = EXCLUDED.b2;",
+            pg
+        ));
+        assert!(!has_values(
+            b"ON DUPLICATE KEY UPDATE `a` = VALUES(`a`); -- 'x'",
+            mysql
+        ));
+        assert!(!has_values(b"ON CONFLICT DO NOTHING;", pg));
     }
 
     #[test]

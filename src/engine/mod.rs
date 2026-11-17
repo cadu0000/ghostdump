@@ -18,8 +18,8 @@ use crate::engine::config::{CompiledColumn, CompiledConfig};
 use crate::engine::sink::{MaskingPlan, ParallelSink, RowContext, SequentialSink, Sink};
 use crate::parser::state::{InsertFormat, SqlDialect};
 use crate::parser::{
-    DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SqlEvent, SqlParser, may_write, names_in,
-    statement_keyword,
+    DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SqlEvent, SqlParser, has_values, may_write,
+    names_in, statement_keyword,
 };
 
 /// How a dump is processed.
@@ -327,7 +327,14 @@ impl AnonymizerEngine {
                         }
                     }
 
-                    SqlEvent::Footer(footer_bytes) => sink.write(&footer_bytes)?,
+                    SqlEvent::Footer(footer_bytes) => {
+                        if let Err(e) =
+                            self.check_footer(plan_metadata.as_deref(), &footer_bytes, dialect)
+                        {
+                            return stop(sink, e);
+                        }
+                        sink.write(&footer_bytes)?;
+                    }
                     SqlEvent::Error(e) => return stop(sink, refuse(e.to_string())),
                 }
             }
@@ -343,13 +350,22 @@ impl AnonymizerEngine {
                     }
                     sink.write(&rest)?;
                 }
-                Remainder::UnterminatedData { partial_row: false } => {
+                Remainder::UnterminatedData {
+                    partial_row: false,
+                    footer,
+                } => {
+                    if let Err(e) = self.check_footer(plan_metadata.as_deref(), &footer, dialect) {
+                        return stop(sink, e);
+                    }
+                    sink.write(&footer)?;
                     warn!(
                         "the input ended inside a data block, before its terminator (`;` or `\\.`)"
                     );
                     unterminated_data_block = true;
                 }
-                Remainder::UnterminatedData { partial_row: true } => {
+                Remainder::UnterminatedData {
+                    partial_row: true, ..
+                } => {
                     return stop(
                         sink,
                         io::Error::new(
@@ -432,6 +448,33 @@ impl AnonymizerEngine {
                 .and_then(|schema| self.config.rules_named(Some(schema), part))
                 .or_else(|| self.config.rules_named(None, part))
         })
+    }
+
+    /// Refuses a clause after the rows that writes values (`ON DUPLICATE KEY
+    /// UPDATE name = '...'`) in a data block of a table with rules: the
+    /// values may belong to a column with a rule, and cannot be masked.
+    fn check_footer(
+        &self,
+        metadata: Option<&HeaderMetadata>,
+        footer: &[u8],
+        dialect: SqlDialect,
+    ) -> io::Result<()> {
+        let Some(metadata) = metadata else {
+            return Ok(());
+        };
+        let table = &metadata.table;
+        let has_rules = self
+            .config
+            .rules_for(metadata.schema.as_deref(), table)
+            .is_some();
+        if has_rules && has_values(footer, dialect) {
+            return Err(refuse(format!(
+                "the INSERT into table `{table}`, which has rules, writes values after its rows \
+                 (in a clause such as ON DUPLICATE KEY UPDATE or ON CONFLICT DO UPDATE), and \
+                 GhostDump cannot mask them. Remove the clause, or the rules of the table"
+            )));
+        }
+        Ok(())
     }
 
     /// The rules that are not in `used`, sorted by table and column.
@@ -771,6 +814,52 @@ mod tests {
         for (dialect, input) in cases {
             let out = run_with(STATEMENT_RULES, dialect, input).unwrap();
             assert_eq!(out.as_bytes(), input, "{dialect:?}");
+        }
+    }
+
+    #[test]
+    fn test_values_after_the_rows_of_a_table_with_rules_are_refused() {
+        let refused = [
+            (
+                SqlDialect::Mysql,
+                "INSERT INTO users (id) VALUES (1) ON DUPLICATE KEY UPDATE name = 'Ana';",
+            ),
+            (
+                SqlDialect::Postgres,
+                "INSERT INTO users (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET name = 'Ana';",
+            ),
+            // Without the final `;`.
+            (
+                SqlDialect::Postgres,
+                "INSERT INTO users (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET name = 'Ana'",
+            ),
+        ];
+        for (dialect, input) in refused {
+            let mut out = Vec::new();
+            let err = engine(STATEMENT_RULES)
+                .process_dump(input.as_bytes(), &mut out, &RunOptions::new(dialect))
+                .unwrap_err();
+            assert!(err.to_string().contains("after its rows"), "{err}");
+            assert!(!String::from_utf8_lossy(&out).contains("Ana"));
+        }
+
+        let copied = [
+            (
+                SqlDialect::Postgres,
+                "INSERT INTO users (id, name) VALUES (1, 'Ana') ON CONFLICT DO NOTHING;\n",
+            ),
+            (
+                SqlDialect::Mysql,
+                "INSERT INTO users (id, name) VALUES (1, 'Ana') ON DUPLICATE KEY UPDATE name = VALUES(name);\n",
+            ),
+            (
+                SqlDialect::Mysql,
+                "INSERT INTO orders (id) VALUES (1) ON DUPLICATE KEY UPDATE note = 'x';\n",
+            ),
+        ];
+        for (dialect, input) in copied {
+            let out = run_with(STATEMENT_RULES, dialect, input.as_bytes()).unwrap();
+            assert_eq!(out, input.replace("'Ana'", "NULL"));
         }
     }
 

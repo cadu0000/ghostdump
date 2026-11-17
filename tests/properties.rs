@@ -124,8 +124,13 @@ proptest! {
                 all.extend_from_slice(&rest);
                 prop_assert_eq!(all, input);
             }
-            Remainder::UnterminatedData { .. } => {
-                prop_assert!(input.starts_with(&out));
+            Remainder::UnterminatedData { partial_row, footer } => {
+                let mut all = out;
+                all.extend_from_slice(&footer);
+                prop_assert!(input.starts_with(&all));
+                if !partial_row {
+                    prop_assert_eq!(all, input);
+                }
             }
         }
     }
