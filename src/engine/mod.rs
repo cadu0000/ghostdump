@@ -1,4 +1,5 @@
 pub mod categorical;
+pub mod columns;
 pub mod config;
 pub mod laplace;
 pub mod mask;
@@ -8,15 +9,19 @@ pub mod strategy;
 use log::{debug, warn};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
 use std::thread;
 
+use crate::engine::columns::{ColumnOrders, Columns};
 use crate::engine::config::{CompiledColumn, CompiledConfig};
 use crate::engine::sink::{MaskingPlan, ParallelSink, RowContext, SequentialSink, Sink};
 use crate::parser::state::{InsertFormat, SqlDialect};
-use crate::parser::{DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SqlEvent, SqlParser};
+use crate::parser::{
+    DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SqlEvent, SqlParser, Statement, has_values,
+};
 
 /// How a dump is processed.
 #[derive(Debug, Clone)]
@@ -73,7 +78,31 @@ pub struct RunReport {
     /// Data rows per table, by the name in the statement (`<unknown>` when
     /// it could not be read). Schema names only, never values.
     pub rows_by_table: BTreeMap<String, usize>,
+    /// Rules that matched no table or column of the input: a misspelt name
+    /// leaves its column unmasked. Empty when `--limit` stopped the run.
+    pub unused_rules: Vec<UnusedRule>,
 }
+
+/// A rule that matched nothing in the input.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnusedRule {
+    pub table: String,
+    /// `None` when no rule of the table matched: the table is absent from
+    /// the input, or none of the columns with rules is in it.
+    pub column: Option<String>,
+}
+
+impl fmt::Display for UnusedRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.column {
+            Some(column) => write!(f, "column `{}.{column}` was not found", self.table),
+            None => write!(f, "no rule of table `{}` matched the input", self.table),
+        }
+    }
+}
+
+/// A masking plan and the key of the rules it comes from.
+type KeyedPlan<'a> = (&'a str, MaskingPlan<'a>);
 
 pub struct AnonymizerEngine {
     config: CompiledConfig,
@@ -96,15 +125,16 @@ impl AnonymizerEngine {
 
     /// The columns of a data block that have rules, or `None` when no
     /// column has one (the rows are then copied as they are).
-    fn masking_plan(&self, metadata: &HeaderMetadata) -> Option<MaskingPlan<'_>> {
-        let table = self.config.tables.get(&metadata.table)?;
-        let columns = metadata.columns.as_ref()?;
+    fn masking_plan(&self, metadata: &HeaderMetadata, columns: &[String]) -> Option<KeyedPlan<'_>> {
+        let (key, rules) = self
+            .config
+            .rules_for(metadata.schema.as_deref(), &metadata.table)?;
 
         let plan: MaskingPlan = columns
             .iter()
-            .map(|name| table.iter().find(|c| c.name == *name))
+            .map(|name| rules.iter().find(|rule| rule.matches(name)))
             .collect();
-        plan.iter().any(Option::is_some).then_some(plan)
+        plan.iter().any(Option::is_some).then_some((key, plan))
     }
 
     /// Decides how the rows of a data block are written, or refuses the block
@@ -114,7 +144,8 @@ impl AnonymizerEngine {
         metadata: Option<&HeaderMetadata>,
         opaque: bool,
         header: &[u8],
-    ) -> io::Result<Option<MaskingPlan<'_>>> {
+        orders: &ColumnOrders,
+    ) -> io::Result<Option<KeyedPlan<'_>>> {
         let Some(metadata) = metadata else {
             if self.config.tables.is_empty() {
                 debug!("data block without table metadata, rows pass through");
@@ -128,15 +159,43 @@ impl AnonymizerEngine {
         };
         let table = &metadata.table;
 
-        if metadata.columns.is_none() && self.config.tables.contains_key(table) {
-            return Err(refuse(format!(
-                "table `{table}` has rules, but its INSERT has no column list, so they cannot \
-                 be matched to values. Dump it with column names (mysqldump --complete-insert, \
-                 pg_dump --column-inserts) or remove its rules"
-            )));
-        }
+        let has_rules = self
+            .config
+            .rules_for(metadata.schema.as_deref(), table)
+            .is_some();
+        let columns: &[String] = match &metadata.columns {
+            Some(columns) => columns,
+            None if !has_rules => &[],
+            None => match orders.columns(&metadata.key) {
+                Columns::Known(columns) => {
+                    debug!(
+                        "table `{table}`: no column list, the columns of its CREATE TABLE apply"
+                    );
+                    columns
+                }
+                Columns::Unknown => {
+                    return Err(refuse(format!(
+                        "table `{table}` has rules, but its INSERT has no column list, and the \
+                         dump does not show its columns with certainty: its CREATE TABLE does \
+                         not list them all (AS, LIKE, INHERITS, PARTITION OF, OF, invisible \
+                         columns), or a later statement may have changed them (ALTER TABLE, \
+                         RENAME, DROP). Dump it with column names (mysqldump --complete-insert, \
+                         pg_dump --column-inserts) or remove its rules"
+                    )));
+                }
+                Columns::Missing => {
+                    return Err(refuse(format!(
+                        "table `{table}` has rules, but its INSERT has no column list, and no \
+                         CREATE TABLE for it comes earlier in the dump, so the rules cannot be \
+                         matched to values. Dump it with its schema, or with column names \
+                         (mysqldump --complete-insert, pg_dump --column-inserts), or remove \
+                         its rules"
+                    )));
+                }
+            },
+        };
 
-        let plan = self.masking_plan(metadata);
+        let plan = self.masking_plan(metadata, columns);
         if opaque && plan.is_some() {
             return Err(refuse(format!(
                 "table `{table}` has rules, but its COPY uses options GhostDump cannot read \
@@ -144,7 +203,7 @@ impl AnonymizerEngine {
             )));
         }
 
-        log_masking_plan(metadata, plan.as_deref());
+        log_masking_plan(metadata, plan.as_ref().map(|(_, plan)| plan.as_slice()));
         Ok(plan)
     }
 
@@ -211,6 +270,9 @@ impl AnonymizerEngine {
 
         let mut plan: Option<Arc<MaskingPlan>> = None;
         let mut plan_metadata: Option<Arc<HeaderMetadata>> = None;
+        let mut orders = ColumnOrders::default();
+        // Rules applied at least once, as (table key, column name).
+        let mut used: BTreeSet<(&str, &String)> = BTreeSet::new();
 
         'leitura: loop {
             let bytes_read = reader.read(&mut buffer)?;
@@ -226,6 +288,22 @@ impl AnonymizerEngine {
                 match event {
                     SqlEvent::DefaultStatement(b) => sink.write(&[b])?,
                     SqlEvent::Passthrough(bytes) => sink.write(&bytes)?,
+                    SqlEvent::Statement(bytes) => {
+                        if !self.config.tables.is_empty() {
+                            let statement = Statement::parse(&bytes, dialect);
+                            if let Err(e) = self.check_statement(&statement) {
+                                return stop(sink, e);
+                            }
+                            if let Some(change) = statement.table_change()
+                                && orders.apply(change, &self.config)
+                            {
+                                // The next header is planned again, even if
+                                // it repeats the last one.
+                                plan_metadata = None;
+                            }
+                        }
+                        sink.write(&bytes)?;
+                    }
 
                     SqlEvent::Header {
                         raw_bytes,
@@ -245,8 +323,19 @@ impl AnonymizerEngine {
                                 current_table = table.to_string();
                                 current_rows = 0;
                             }
-                            plan = match self.plan_block(metadata.as_deref(), opaque, &raw_bytes) {
-                                Ok(plan) => plan.map(Arc::new),
+                            plan = match self.plan_block(
+                                metadata.as_deref(),
+                                opaque,
+                                &raw_bytes,
+                                &orders,
+                            ) {
+                                Ok(Some((key, columns))) => {
+                                    used.extend(
+                                        columns.iter().flatten().map(|rule| (key, &rule.name)),
+                                    );
+                                    Some(Arc::new(columns))
+                                }
+                                Ok(None) => None,
                                 Err(e) => return stop(sink, e),
                             };
                             plan_metadata = metadata;
@@ -279,7 +368,14 @@ impl AnonymizerEngine {
                         }
                     }
 
-                    SqlEvent::Footer(footer_bytes) => sink.write(&footer_bytes)?,
+                    SqlEvent::Footer(footer_bytes) => {
+                        if let Err(e) =
+                            self.check_footer(plan_metadata.as_deref(), &footer_bytes, dialect)
+                        {
+                            return stop(sink, e);
+                        }
+                        sink.write(&footer_bytes)?;
+                    }
                     SqlEvent::Error(e) => return stop(sink, refuse(e.to_string())),
                 }
             }
@@ -289,13 +385,30 @@ impl AnonymizerEngine {
         if !reached_limit {
             match parser.finish() {
                 Remainder::Bytes(rest) => sink.write(&rest)?,
-                Remainder::UnterminatedData { partial_row: false } => {
+                Remainder::Statement(rest) => {
+                    if !self.config.tables.is_empty()
+                        && let Err(e) = self.check_statement(&Statement::parse(&rest, dialect))
+                    {
+                        return stop(sink, e);
+                    }
+                    sink.write(&rest)?;
+                }
+                Remainder::UnterminatedData {
+                    partial_row: false,
+                    footer,
+                } => {
+                    if let Err(e) = self.check_footer(plan_metadata.as_deref(), &footer, dialect) {
+                        return stop(sink, e);
+                    }
+                    sink.write(&footer)?;
                     warn!(
                         "the input ended inside a data block, before its terminator (`;` or `\\.`)"
                     );
                     unterminated_data_block = true;
                 }
-                Remainder::UnterminatedData { partial_row: true } => {
+                Remainder::UnterminatedData {
+                    partial_row: true, ..
+                } => {
                     return stop(
                         sink,
                         io::Error::new(
@@ -335,7 +448,106 @@ impl AnonymizerEngine {
             rows_masked,
             fields_masked: stats.masked_fields,
             rows_by_table,
+            // A run cut short by `--limit` has not seen the whole input.
+            unused_rules: if reached_limit {
+                Vec::new()
+            } else {
+                self.unused_rules(&used)
+            },
         })
+    }
+}
+
+impl AnonymizerEngine {
+    /// Refuses a statement that may write data GhostDump cannot mask (see
+    /// [`SqlEvent::Statement`]) when it refers to a table with rules. The
+    /// check is by name, so a column or keyword spelt like such a table is
+    /// refused too, which errs on the safe side.
+    fn check_statement(&self, statement: &Statement) -> io::Result<()> {
+        if !statement.may_write() {
+            return Ok(());
+        }
+        let Some(key) = statement
+            .names()
+            .iter()
+            .find_map(|parts| self.rules_named(parts))
+        else {
+            return Ok(());
+        };
+        Err(refuse(format!(
+            "a {} statement refers to table `{key}`, which has rules, and may write data in \
+             a form GhostDump cannot mask (only the rows of INSERT ... VALUES and \
+             COPY ... FROM stdin are masked). Remove the statement from the dump, or the \
+             rules of the table",
+            statement.keyword()
+        )))
+    }
+
+    /// The rules a name in a statement may refer to: each part alone, and
+    /// each part with the one before it as its schema.
+    fn rules_named(&self, parts: &[String]) -> Option<&str> {
+        parts.iter().enumerate().find_map(|(i, part)| {
+            let schema = i.checked_sub(1).map(|before| parts[before].as_str());
+            schema
+                .and_then(|schema| self.config.rules_named(Some(schema), part))
+                .or_else(|| self.config.rules_named(None, part))
+        })
+    }
+
+    /// Refuses a clause after the rows that writes values (`ON DUPLICATE KEY
+    /// UPDATE name = '...'`) in a data block of a table with rules: the
+    /// values may belong to a column with a rule, and cannot be masked.
+    fn check_footer(
+        &self,
+        metadata: Option<&HeaderMetadata>,
+        footer: &[u8],
+        dialect: SqlDialect,
+    ) -> io::Result<()> {
+        // Most footers are a bare `;`, with no byte that can start a value.
+        let may_hold_values = footer
+            .iter()
+            .any(|&byte| byte.is_ascii_digit() || matches!(byte, b'\'' | b'"' | b'$'));
+        let Some(metadata) = metadata.filter(|_| may_hold_values) else {
+            return Ok(());
+        };
+        let table = &metadata.table;
+        let has_rules = self
+            .config
+            .rules_for(metadata.schema.as_deref(), table)
+            .is_some();
+        if has_rules && has_values(footer, dialect) {
+            return Err(refuse(format!(
+                "the INSERT into table `{table}`, which has rules, writes values after its rows \
+                 (in a clause such as ON DUPLICATE KEY UPDATE or ON CONFLICT DO UPDATE), and \
+                 GhostDump cannot mask them. Remove the clause, or the rules of the table"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The rules that are not in `used`, sorted by table and column.
+    fn unused_rules(&self, used: &BTreeSet<(&str, &String)>) -> Vec<UnusedRule> {
+        let mut unused = Vec::new();
+        for (table, rules) in &self.config.tables {
+            let missing: Vec<&String> = rules
+                .iter()
+                .map(|rule| &rule.name)
+                .filter(|name| !used.contains(&(table.as_str(), *name)))
+                .collect();
+            if missing.len() == rules.len() {
+                unused.push(UnusedRule {
+                    table: table.clone(),
+                    column: None,
+                });
+            } else {
+                unused.extend(missing.into_iter().map(|column| UnusedRule {
+                    table: table.clone(),
+                    column: Some(column.clone()),
+                }));
+            }
+        }
+        unused.sort_by(|a, b| (&a.table, &a.column).cmp(&(&b.table, &b.column)));
+        unused
     }
 }
 
@@ -546,14 +758,221 @@ mod tests {
     }
 
     #[test]
+    fn test_rows_without_column_list_take_the_columns_of_create_table() {
+        let input = b"CREATE TABLE users (id int, name text, secret text);\n\
+                      INSERT INTO users VALUES (1, 'Ana', 'pw'), (2, 'Bia', NULL);\n";
+        let out = run_with(NAME_RULES, SqlDialect::Postgres, input).unwrap();
+        assert!(
+            out.ends_with(
+                "INSERT INTO users VALUES (1, 'O''Conner', NULL), (2, 'O''Conner', NULL);\n"
+            ),
+            "{out}"
+        );
+
+        // `"Users"` is another table in PostgreSQL: its CREATE TABLE does not apply.
+        let input = b"CREATE TABLE \"Users\" (secret text, name text);\n\
+                      INSERT INTO users VALUES ('Ana', 'pw');\n";
+        let err = run_with(NAME_RULES, SqlDialect::Postgres, input).unwrap_err();
+        assert!(err.to_string().contains("no CREATE TABLE"), "{err}");
+    }
+
+    #[test]
+    fn test_a_column_change_after_create_table_is_refused() {
+        // The second header repeats the first, but its columns changed.
+        let input = b"CREATE TABLE users (id int, name text);\n\
+                      INSERT INTO users VALUES (1, 'Ana');\n\
+                      ALTER TABLE users ADD COLUMN secret text;\n\
+                      INSERT INTO users VALUES (2, 'Bia', 'pw');\n";
+        let mut out = Vec::new();
+        let err = engine(NAME_RULES)
+            .process_dump(&input[..], &mut out, &RunOptions::new(SqlDialect::Postgres))
+            .unwrap_err();
+        assert!(err.to_string().contains("may have changed"), "{err}");
+        let out = String::from_utf8_lossy(&out);
+        assert!(
+            out.contains("(1, 'O''Conner')") && !out.contains("Bia"),
+            "{out}"
+        );
+
+        // What pg_dump writes between CREATE TABLE and the rows keeps the columns.
+        let input = b"CREATE TABLE public.users (id integer NOT NULL, name text);\n\
+                      ALTER TABLE public.users OWNER TO postgres;\n\
+                      ALTER TABLE public.users ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (\n    SEQUENCE NAME public.users_id_seq\n);\n\
+                      INSERT INTO public.users OVERRIDING SYSTEM VALUE VALUES (1, 'Ana');\n";
+        let out = run_with(NAME_RULES, SqlDialect::Postgres, input).unwrap();
+        assert!(out.contains("VALUES (1, 'O''Conner');"), "{out}");
+    }
+
+    #[test]
     fn test_unreadable_table_name_fails_closed_with_rules() {
-        let input = b"INSERT INTO \"my table\" (a) VALUES (1);";
+        // A name with Unicode escapes, which GhostDump does not decode.
+        let input = b"INSERT INTO U&\"d\\0061ta\" (a) VALUES (1);";
         let err = run_with(NAME_RULES, SqlDialect::Postgres, input).unwrap_err();
         assert!(
             err.to_string().contains("could not read the table name"),
             "{err}"
         );
         assert!(run(input).is_ok());
+    }
+
+    const STATEMENT_RULES: &str = r#"
+        [tables.users]
+        columns = [{ name = "name", strategy = "nullify" }]
+        [tables."audit.events"]
+        columns = [{ name = "payload", strategy = "nullify" }]
+    "#;
+
+    #[test]
+    fn test_statements_that_write_to_tables_with_rules_are_refused() {
+        let pg = SqlDialect::Postgres;
+        let mysql = SqlDialect::Mysql;
+        let refused = [
+            (pg, "UPDATE users SET name = 'Ana' WHERE id = 1;"),
+            (pg, "DELETE FROM public.users WHERE name = 'Ana';"),
+            (pg, "INSERT INTO users (name) SELECT 'Ana';"),
+            (
+                pg,
+                "WITH x AS (SELECT 'Ana' AS n) INSERT INTO users (name) SELECT n FROM x;",
+            ),
+            (
+                pg,
+                "MERGE INTO users u USING (VALUES ('Ana')) v(n) ON false \
+                 WHEN NOT MATCHED THEN INSERT (name) VALUES (v.n);",
+            ),
+            (pg, "CREATE TABLE users AS SELECT 'Ana' AS name;"),
+            (pg, "SELECT 'Ana' AS name INTO users;"),
+            (pg, "COPY users FROM '/tmp/users.csv';"),
+            // The rule for audit.events applies when audit is in the search path.
+            (pg, "UPDATE events SET payload = 'Ana';"),
+            (pg, "UPDATE users SET name = 'Ana'"),
+            (mysql, "INSERT INTO `users` SET `name` = 'Ana';"),
+            (mysql, "REPLACE INTO users (name) SELECT 'Ana';"),
+            (mysql, "LOAD DATA INFILE 'Ana.txt' INTO TABLE users;"),
+            (mysql, "CREATE TABLE users SELECT 'Ana' AS name;"),
+            (
+                mysql,
+                "DELIMITER //\nINSERT INTO users (name) VALUES ('Ana')//\nDELIMITER ;",
+            ),
+            (SqlDialect::Sqlite, "UPDATE \"Users\" SET name = 'Ana';"),
+        ];
+        for (dialect, statement) in refused {
+            let input = format!("SET x = 1;\n{statement}\n");
+            let mut out = Vec::new();
+            let err = engine(STATEMENT_RULES)
+                .process_dump(input.as_bytes(), &mut out, &RunOptions::new(dialect))
+                .unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("which has rules"),
+                "{statement}: {message}"
+            );
+            assert!(!message.contains("Ana"), "{message}");
+            // What came before is written; the statement is not.
+            let out = String::from_utf8_lossy(&out);
+            assert!(!out.contains("Ana"), "{statement}: {out}");
+            assert!(out.starts_with("SET x = 1;"), "{statement}: {out}");
+        }
+    }
+
+    #[test]
+    fn test_statements_without_tables_with_rules_are_copied() {
+        let input = b"UPDATE orders SET note = 'x';\n\
+                      SELECT pg_catalog.setval('public.users_id_seq', 2, true);\n\
+                      COPY users TO STDOUT;\n\
+                      CREATE TABLE users (name text) WITH (fillfactor = 70);\n\
+                      CREATE INDEX ON users (name);\n\
+                      INSERT INTO orders SELECT 1;\n";
+        let out = run_with(STATEMENT_RULES, SqlDialect::Postgres, input).unwrap();
+        assert_eq!(out.as_bytes(), input);
+    }
+
+    #[test]
+    fn test_routine_bodies_are_copied_unchanged() {
+        let cases: [(SqlDialect, &[u8]); 3] = [
+            (
+                SqlDialect::Postgres,
+                b"CREATE FUNCTION f(n text) RETURNS void LANGUAGE sql\nBEGIN ATOMIC\n \
+                  INSERT INTO users (name) VALUES (f.n);\n UPDATE users SET name = 'x';\nEND;\n",
+            ),
+            (
+                SqlDialect::Mysql,
+                b"DELIMITER ;;\nCREATE PROCEDURE p(IN n TEXT)\nBEGIN\n  DECLARE c INT;\n  \
+                  INSERT INTO users (name) VALUES (n);\nEND ;;\nDELIMITER ;\n",
+            ),
+            (
+                SqlDialect::Sqlite,
+                b"CREATE TRIGGER t AFTER INSERT ON a BEGIN DELETE FROM b; \
+                  INSERT INTO users (name) VALUES (NEW.x); END;\n",
+            ),
+        ];
+        for (dialect, input) in cases {
+            let out = run_with(STATEMENT_RULES, dialect, input).unwrap();
+            assert_eq!(out.as_bytes(), input, "{dialect:?}");
+        }
+    }
+
+    #[test]
+    fn test_values_after_the_rows_of_a_table_with_rules_are_refused() {
+        let refused = [
+            (
+                SqlDialect::Mysql,
+                "INSERT INTO users (id) VALUES (1) ON DUPLICATE KEY UPDATE name = 'Ana';",
+            ),
+            (
+                SqlDialect::Postgres,
+                "INSERT INTO users (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET name = 'Ana';",
+            ),
+            // Without the final `;`.
+            (
+                SqlDialect::Postgres,
+                "INSERT INTO users (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET name = 'Ana'",
+            ),
+        ];
+        for (dialect, input) in refused {
+            let mut out = Vec::new();
+            let err = engine(STATEMENT_RULES)
+                .process_dump(input.as_bytes(), &mut out, &RunOptions::new(dialect))
+                .unwrap_err();
+            assert!(err.to_string().contains("after its rows"), "{err}");
+            assert!(!String::from_utf8_lossy(&out).contains("Ana"));
+        }
+
+        let copied = [
+            (
+                SqlDialect::Postgres,
+                "INSERT INTO users (id, name) VALUES (1, 'Ana') ON CONFLICT DO NOTHING;\n",
+            ),
+            (
+                SqlDialect::Mysql,
+                "INSERT INTO users (id, name) VALUES (1, 'Ana') ON DUPLICATE KEY UPDATE name = VALUES(name);\n",
+            ),
+            (
+                SqlDialect::Mysql,
+                "INSERT INTO orders (id) VALUES (1) ON DUPLICATE KEY UPDATE note = 'x';\n",
+            ),
+        ];
+        for (dialect, input) in copied {
+            let out = run_with(STATEMENT_RULES, dialect, input.as_bytes()).unwrap();
+            assert_eq!(out, input.replace("'Ana'", "NULL"));
+        }
+    }
+
+    #[test]
+    fn test_quoted_names_and_overriding_are_masked() {
+        let rules = r#"
+            [tables."my table"]
+            columns = [{ name = "first name", strategy = "nullify" }]
+            [tables.users]
+            columns = [{ name = "name", strategy = "nullify" }]
+        "#;
+        let input = b"INSERT INTO public.\"my table\" (\"first name\") VALUES ('Ana');\n\
+                      INSERT INTO public.users (id, name) OVERRIDING SYSTEM VALUE VALUES (1, 'Bia');\n";
+        let out = run_with(rules, SqlDialect::Postgres, input).unwrap();
+        assert_eq!(
+            out,
+            "INSERT INTO public.\"my table\" (\"first name\") VALUES (NULL);\n\
+             INSERT INTO public.users (id, name) OVERRIDING SYSTEM VALUE VALUES (1, NULL);\n"
+        );
     }
 
     #[test]
@@ -625,6 +1044,69 @@ mod tests {
     fn test_truncated_row_is_an_error() {
         let err = run(b"INSERT INTO t (a) VALUES (1), (2").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_names_match_without_case_and_with_schema() {
+        let rules = r#"
+            [tables.Users]
+            columns = [{ name = "Name", strategy = "nullify" }]
+
+            [tables."audit.users"]
+            columns = [{ name = "id", strategy = "nullify" }]
+        "#;
+        let run = |input: &[u8]| run_with(rules, SqlDialect::Postgres, input).unwrap();
+        assert_eq!(
+            run(b"INSERT INTO USERS (ID, NAME) VALUES (1, 'Ana');"),
+            "INSERT INTO USERS (ID, NAME) VALUES (1, NULL);"
+        );
+        assert_eq!(
+            run(b"INSERT INTO public.\"users\" (id, \"name\") VALUES (1, 'Ana');"),
+            "INSERT INTO public.\"users\" (id, \"name\") VALUES (1, NULL);"
+        );
+        // The rule that names the schema wins over the one that does not.
+        assert_eq!(
+            run(b"INSERT INTO Audit.Users (id, name) VALUES (1, 'Ana');"),
+            "INSERT INTO Audit.Users (id, name) VALUES (NULL, 'Ana');"
+        );
+    }
+
+    #[test]
+    fn test_rules_that_match_nothing_are_reported() {
+        let rules = r#"
+            [tables.users]
+            columns = [
+                { name = "name", strategy = "nullify" },
+                { name = "emial", strategy = "nullify" },
+            ]
+
+            [tables.orders]
+            columns = [{ name = "card", strategy = "nullify" }]
+        "#;
+        let report = |limit| {
+            let options = RunOptions {
+                limit,
+                ..RunOptions::new(SqlDialect::Postgres)
+            };
+            let input = b"INSERT INTO users (name, email) VALUES ('Ana', 'a@x.com');\n";
+            engine(rules)
+                .process_dump(&input[..], io::sink(), &options)
+                .unwrap()
+        };
+        let unused: Vec<String> = report(None)
+            .unused_rules
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            unused,
+            [
+                "no rule of table `orders` matched the input",
+                "column `users.emial` was not found"
+            ]
+        );
+        // A run cut short has not seen the whole input.
+        assert!(report(Some(1)).unused_rules.is_empty());
     }
 
     const THREAD_RULES: &str = r#"

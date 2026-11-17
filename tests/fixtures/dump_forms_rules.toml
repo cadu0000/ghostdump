@@ -1,0 +1,15 @@
+# Rules for the dumps of pg_dump, mysqldump and sqlite3 in this directory.
+[tables.users]
+columns = [
+    { name = "name", strategy = "fixed", value = "Masked" },
+    { name = "email", strategy = "nullify" },
+]
+
+[tables."my table"]
+columns = [{ name = "first name", strategy = "nullify" }]
+
+[tables.log]
+columns = [{ name = "x", strategy = "nullify" }]
+
+[tables.audit]
+columns = [{ name = "user_name", strategy = "nullify" }]

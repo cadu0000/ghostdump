@@ -48,6 +48,21 @@ const FRAGMENTS: &[&str] = &[
     "\\connect db\n",
     "\u{feff}",
     "é",
+    "UPDATE t SET a = ",
+    "CREATE TABLE t AS SELECT ",
+    "CREATE FUNCTION f() BEGIN ATOMIC ",
+    "CREATE TRIGGER g BEGIN ",
+    "CASE ",
+    " END",
+    "DELIMITER //\n",
+    "//",
+    "DELIMITER ;\n",
+    "INSERT INTO t (a) OVERRIDING SYSTEM VALUE VALUES ",
+    "INSERT INTO \"t t\" (\"a\") VALUES ",
+    "COPY t FROM STDOUT;\n",
+    " ON DUPLICATE KEY UPDATE a = ",
+    "[",
+    "]",
 ];
 
 /// A byte string made of SQL fragments and arbitrary bytes.
@@ -75,6 +90,7 @@ fn reassemble(dialect: SqlDialect, input: &[u8]) -> (Vec<u8>, Remainder) {
         match parser.handle_byte(byte) {
             Some(SqlEvent::DefaultStatement(b)) => out.push(b),
             Some(SqlEvent::Passthrough(bytes))
+            | Some(SqlEvent::Statement(bytes))
             | Some(SqlEvent::Header {
                 raw_bytes: bytes, ..
             })
@@ -103,13 +119,18 @@ proptest! {
     fn parser_reports_every_byte(dialect in dialect(), input in sql_like()) {
         let (out, remainder) = reassemble(dialect, &input);
         match remainder {
-            Remainder::Bytes(rest) => {
+            Remainder::Bytes(rest) | Remainder::Statement(rest) => {
                 let mut all = out;
                 all.extend_from_slice(&rest);
                 prop_assert_eq!(all, input);
             }
-            Remainder::UnterminatedData { .. } => {
-                prop_assert!(input.starts_with(&out));
+            Remainder::UnterminatedData { partial_row, footer } => {
+                let mut all = out;
+                all.extend_from_slice(&footer);
+                prop_assert!(input.starts_with(&all));
+                if !partial_row {
+                    prop_assert_eq!(all, input);
+                }
             }
         }
     }
