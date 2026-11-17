@@ -17,7 +17,10 @@ use std::thread;
 use crate::engine::config::{CompiledColumn, CompiledConfig};
 use crate::engine::sink::{MaskingPlan, ParallelSink, RowContext, SequentialSink, Sink};
 use crate::parser::state::{InsertFormat, SqlDialect};
-use crate::parser::{DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SqlEvent, SqlParser};
+use crate::parser::{
+    DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SqlEvent, SqlParser, may_write, names_in,
+    statement_keyword,
+};
 
 /// How a dump is processed.
 #[derive(Debug, Clone)]
@@ -259,6 +262,12 @@ impl AnonymizerEngine {
                 match event {
                     SqlEvent::DefaultStatement(b) => sink.write(&[b])?,
                     SqlEvent::Passthrough(bytes) => sink.write(&bytes)?,
+                    SqlEvent::Statement(bytes) => {
+                        if let Err(e) = self.check_statement(&bytes, dialect) {
+                            return stop(sink, e);
+                        }
+                        sink.write(&bytes)?;
+                    }
 
                     SqlEvent::Header {
                         raw_bytes,
@@ -328,6 +337,12 @@ impl AnonymizerEngine {
         if !reached_limit {
             match parser.finish() {
                 Remainder::Bytes(rest) => sink.write(&rest)?,
+                Remainder::Statement(rest) => {
+                    if let Err(e) = self.check_statement(&rest, dialect) {
+                        return stop(sink, e);
+                    }
+                    sink.write(&rest)?;
+                }
                 Remainder::UnterminatedData { partial_row: false } => {
                     warn!(
                         "the input ended inside a data block, before its terminator (`;` or `\\.`)"
@@ -385,6 +400,40 @@ impl AnonymizerEngine {
 }
 
 impl AnonymizerEngine {
+    /// Refuses a statement that may write data GhostDump cannot mask (see
+    /// [`SqlEvent::Statement`]) when it refers to a table with rules. The
+    /// check is by name, so a column or keyword spelt like such a table is
+    /// refused too, which errs on the safe side.
+    fn check_statement(&self, statement: &[u8], dialect: SqlDialect) -> io::Result<()> {
+        if self.config.tables.is_empty() || !may_write(statement, dialect) {
+            return Ok(());
+        }
+        let Some(key) = names_in(statement, dialect)
+            .iter()
+            .find_map(|parts| self.rules_named(parts))
+        else {
+            return Ok(());
+        };
+        Err(refuse(format!(
+            "a {} statement refers to table `{key}`, which has rules, and may write data in \
+             a form GhostDump cannot mask (only the rows of INSERT ... VALUES and \
+             COPY ... FROM stdin are masked). Remove the statement from the dump, or the \
+             rules of the table",
+            statement_keyword(statement, dialect)
+        )))
+    }
+
+    /// The rules a name in a statement may refer to: each part alone, and
+    /// each part with the one before it as its schema.
+    fn rules_named(&self, parts: &[String]) -> Option<&str> {
+        parts.iter().enumerate().find_map(|(i, part)| {
+            let schema = i.checked_sub(1).map(|before| parts[before].as_str());
+            schema
+                .and_then(|schema| self.config.rules_named(Some(schema), part))
+                .or_else(|| self.config.rules_named(None, part))
+        })
+    }
+
     /// The rules that are not in `used`, sorted by table and column.
     fn unused_rules(&self, used: &BTreeSet<(&str, &String)>) -> Vec<UnusedRule> {
         let mut unused = Vec::new();
@@ -629,6 +678,77 @@ mod tests {
         assert!(run(input).is_ok());
     }
 
+    const STATEMENT_RULES: &str = r#"
+        [tables.users]
+        columns = [{ name = "name", strategy = "nullify" }]
+        [tables."audit.events"]
+        columns = [{ name = "payload", strategy = "nullify" }]
+    "#;
+
+    #[test]
+    fn test_statements_that_write_to_tables_with_rules_are_refused() {
+        let pg = SqlDialect::Postgres;
+        let mysql = SqlDialect::Mysql;
+        let refused = [
+            (pg, "UPDATE users SET name = 'Ana' WHERE id = 1;"),
+            (pg, "DELETE FROM public.users WHERE name = 'Ana';"),
+            (pg, "INSERT INTO users (name) SELECT 'Ana';"),
+            (
+                pg,
+                "WITH x AS (SELECT 'Ana' AS n) INSERT INTO users (name) SELECT n FROM x;",
+            ),
+            (
+                pg,
+                "MERGE INTO users u USING (VALUES ('Ana')) v(n) ON false \
+                 WHEN NOT MATCHED THEN INSERT (name) VALUES (v.n);",
+            ),
+            (pg, "CREATE TABLE users AS SELECT 'Ana' AS name;"),
+            (pg, "SELECT 'Ana' AS name INTO users;"),
+            (pg, "COPY users FROM '/tmp/users.csv';"),
+            // The rule for audit.events applies when audit is in the search path.
+            (pg, "UPDATE events SET payload = 'Ana';"),
+            (pg, "UPDATE users SET name = 'Ana'"),
+            (mysql, "INSERT INTO `users` SET `name` = 'Ana';"),
+            (mysql, "REPLACE INTO users (name) SELECT 'Ana';"),
+            (mysql, "LOAD DATA INFILE 'Ana.txt' INTO TABLE users;"),
+            (mysql, "CREATE TABLE users SELECT 'Ana' AS name;"),
+            (
+                mysql,
+                "DELIMITER //\nINSERT INTO users (name) VALUES ('Ana')//\nDELIMITER ;",
+            ),
+            (SqlDialect::Sqlite, "UPDATE \"Users\" SET name = 'Ana';"),
+        ];
+        for (dialect, statement) in refused {
+            let input = format!("SET x = 1;\n{statement}\n");
+            let mut out = Vec::new();
+            let err = engine(STATEMENT_RULES)
+                .process_dump(input.as_bytes(), &mut out, &RunOptions::new(dialect))
+                .unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("which has rules"),
+                "{statement}: {message}"
+            );
+            assert!(!message.contains("Ana"), "{message}");
+            // What came before is written; the statement is not.
+            let out = String::from_utf8_lossy(&out);
+            assert!(!out.contains("Ana"), "{statement}: {out}");
+            assert!(out.starts_with("SET x = 1;"), "{statement}: {out}");
+        }
+    }
+
+    #[test]
+    fn test_statements_without_tables_with_rules_are_copied() {
+        let input = b"UPDATE orders SET note = 'x';\n\
+                      SELECT pg_catalog.setval('public.users_id_seq', 2, true);\n\
+                      COPY users TO STDOUT;\n\
+                      CREATE TABLE users (name text) WITH (fillfactor = 70);\n\
+                      CREATE INDEX ON users (name);\n\
+                      INSERT INTO orders SELECT 1;\n";
+        let out = run_with(STATEMENT_RULES, SqlDialect::Postgres, input).unwrap();
+        assert_eq!(out.as_bytes(), input);
+    }
+
     #[test]
     fn test_routine_bodies_are_copied_unchanged() {
         let cases: [(SqlDialect, &[u8]); 3] = [
@@ -649,7 +769,7 @@ mod tests {
             ),
         ];
         for (dialect, input) in cases {
-            let out = run_with(NAME_RULES, dialect, input).unwrap();
+            let out = run_with(STATEMENT_RULES, dialect, input).unwrap();
             assert_eq!(out.as_bytes(), input, "{dialect:?}");
         }
     }

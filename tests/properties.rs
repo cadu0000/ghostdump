@@ -90,6 +90,7 @@ fn reassemble(dialect: SqlDialect, input: &[u8]) -> (Vec<u8>, Remainder) {
         match parser.handle_byte(byte) {
             Some(SqlEvent::DefaultStatement(b)) => out.push(b),
             Some(SqlEvent::Passthrough(bytes))
+            | Some(SqlEvent::Statement(bytes))
             | Some(SqlEvent::Header {
                 raw_bytes: bytes, ..
             })
@@ -118,7 +119,7 @@ proptest! {
     fn parser_reports_every_byte(dialect in dialect(), input in sql_like()) {
         let (out, remainder) = reassemble(dialect, &input);
         match remainder {
-            Remainder::Bytes(rest) => {
+            Remainder::Bytes(rest) | Remainder::Statement(rest) => {
                 let mut all = out;
                 all.extend_from_slice(&rest);
                 prop_assert_eq!(all, input);

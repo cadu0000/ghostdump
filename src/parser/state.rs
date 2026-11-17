@@ -27,6 +27,9 @@ pub enum DataKeyword {
 pub enum Remainder {
     /// Buffered bytes outside data rows, to be written unchanged.
     Bytes(Vec<u8>),
+    /// A statement held for checking, without its end (see
+    /// [`SqlEvent::Statement`](crate::parser::SqlEvent::Statement)).
+    Statement(Vec<u8>),
     /// The input ended inside a data block, before its terminator. When
     /// `partial_row` is true, an incomplete row was dropped: it cannot be
     /// masked, so it must not be written.
@@ -46,6 +49,14 @@ pub enum NormalEvent {
         delimiter: u8,
     },
     DefaultStatement(u8),
+    /// Bytes held while the start of a statement was read, to be written
+    /// unchanged.
+    Released(Vec<u8>),
+    /// A whole statement that may write data in a form that cannot be
+    /// masked (`UPDATE`, `CREATE TABLE ... AS SELECT`, ...).
+    Statement(Vec<u8>),
+    /// A statement held whole grew past the size limit without ending.
+    TooLarge,
 }
 
 /// Bytes held back so that the first word of a statement (up to `REPLACE`)
@@ -68,11 +79,24 @@ enum StatementPhase {
     Body,
 }
 
+/// How the bytes of the current statement are written.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Handling {
+    /// As they come, after the short lookbehind.
+    Stream,
+    /// Held until the statement ends and then reported whole, so that it can
+    /// be refused before any of it is written.
+    Hold,
+    /// After `CREATE`: held until the next words show whether the statement
+    /// creates a table, which a query may fill (`CREATE TABLE ... AS SELECT`).
+    AfterCreate,
+}
+
 /// What a statement's first word makes of it.
 enum FirstWord {
     Data(DataKeyword),
     Delimiter,
-    Other,
+    Handle(Handling),
 }
 
 /// The word being read: its first bytes in lower case, and its length.
@@ -108,56 +132,113 @@ impl Word {
 
 /// Passes SQL through and finds where each statement starts and ends.
 /// Statements that start with `INSERT`, `REPLACE` (MySQL and SQLite) or
-/// `COPY` (PostgreSQL) open a data block. Keywords inside literals,
-/// comments, identifiers or the body of another statement are ignored.
+/// `COPY` (PostgreSQL) open a data block. Statements that may write data in
+/// another form are held whole, so that they can be checked before any byte
+/// is written. Keywords inside literals, comments, identifiers or the body
+/// of another statement are ignored.
 pub struct NormalState {
     dialect: SqlDialect,
     lexer: Lexer,
     framer: Framer,
     pending: VecDeque<u8>,
+    held: Vec<u8>,
+    handling: Handling,
     phase: StatementPhase,
     word: Option<Word>,
     /// MySQL: the bytes of a `DELIMITER` line after the keyword.
     delimiter_line: Vec<u8>,
     /// Bytes of a UTF-8 BOM matched so far; `None` once past the input start.
     bom_matched: Option<usize>,
+    max_bytes: usize,
+}
+
+enum Outcome {
+    /// A data keyword of the given length ended at this byte.
+    Data(DataKeyword, usize),
+    /// The first word, of the given length, ended at this byte, and the
+    /// statement is held from it on.
+    Hold(usize),
+    End,
 }
 
 impl NormalState {
-    pub fn new(dialect: SqlDialect) -> Self {
+    /// `max_bytes` bounds a statement held whole.
+    pub fn new(dialect: SqlDialect, max_bytes: usize) -> Self {
         Self {
             dialect,
             lexer: Lexer::new(dialect),
             framer: Framer::new(dialect),
             pending: VecDeque::with_capacity(LOOKBEHIND + 1),
+            held: Vec::new(),
+            handling: Handling::Stream,
             phase: StatementPhase::Start,
             word: None,
             delimiter_line: Vec::new(),
             bom_matched: None,
+            max_bytes,
         }
     }
 
     /// State for the very beginning of the input, where a UTF-8 BOM may appear.
-    pub fn at_input_start(dialect: SqlDialect) -> Self {
+    pub fn at_input_start(dialect: SqlDialect, max_bytes: usize) -> Self {
         Self {
             bom_matched: Some(0),
-            ..Self::new(dialect)
+            ..Self::new(dialect, max_bytes)
         }
     }
 
     pub fn process_byte(&mut self, byte: u8) -> NormalEvent {
-        self.pending.push_back(byte);
-
-        if let Some((keyword, len)) = self.advance(byte) {
-            let start = self.pending.len() - len - 1;
-            return NormalEvent::StartInsertHeader {
-                before: self.pending.drain(..start).collect(),
-                initial_bytes: self.pending.drain(..).collect(),
-                keyword,
-                delimiter: byte,
-            };
+        let streaming = self.handling == Handling::Stream;
+        if streaming {
+            self.pending.push_back(byte);
+        } else {
+            self.held.push(byte);
         }
 
+        match self.advance(byte) {
+            Some(Outcome::Data(keyword, len)) => {
+                let start = self.pending.len() - len - 1;
+                return NormalEvent::StartInsertHeader {
+                    before: self.pending.drain(..start).collect(),
+                    initial_bytes: self.pending.drain(..).collect(),
+                    keyword,
+                    delimiter: byte,
+                };
+            }
+            Some(Outcome::Hold(len)) => {
+                // The statement is held from its first word; what came
+                // before it is written now.
+                let start = self.pending.len() - len - 1;
+                let before: Vec<u8> = self.pending.drain(..start).collect();
+                self.held = self.pending.drain(..).collect();
+                return if before.is_empty() {
+                    NormalEvent::Continue
+                } else {
+                    NormalEvent::Released(before)
+                };
+            }
+            Some(Outcome::End) => match std::mem::replace(&mut self.handling, Handling::Stream) {
+                Handling::Hold => return NormalEvent::Statement(std::mem::take(&mut self.held)),
+                Handling::AfterCreate => {
+                    return NormalEvent::Released(std::mem::take(&mut self.held));
+                }
+                Handling::Stream => {}
+            },
+            None => {}
+        }
+
+        if !streaming && self.handling == Handling::Stream {
+            // `CREATE` of something other than a table.
+            return NormalEvent::Released(std::mem::take(&mut self.held));
+        }
+
+        if self.handling != Handling::Stream {
+            return if self.held.len() > self.max_bytes {
+                NormalEvent::TooLarge
+            } else {
+                NormalEvent::Continue
+            };
+        }
         if self.pending.len() > LOOKBEHIND
             && let Some(oldest) = self.pending.pop_front()
         {
@@ -166,13 +247,19 @@ impl NormalState {
         NormalEvent::Continue
     }
 
-    /// Bytes still held back, to be written as they are when the input ends.
-    pub fn take_pending(&mut self) -> Vec<u8> {
-        self.pending.drain(..).collect()
+    /// What is still held when the input ends: a statement held for
+    /// checking, or bytes to be written as they are.
+    pub fn finish(&mut self) -> Remainder {
+        let mut rest: Vec<u8> = self.pending.drain(..).collect();
+        rest.append(&mut self.held);
+        if self.handling == Handling::Hold {
+            Remainder::Statement(rest)
+        } else {
+            Remainder::Bytes(rest)
+        }
     }
 
-    /// The data keyword that ended at this byte, and its length.
-    fn advance(&mut self, byte: u8) -> Option<(DataKeyword, usize)> {
+    fn advance(&mut self, byte: u8) -> Option<Outcome> {
         if self.skip_bom(byte) {
             return None;
         }
@@ -199,25 +286,36 @@ impl NormalState {
 
         let class = self.lexer.feed(byte);
         let in_word = class == ByteClass::Code && is_ident_byte(byte);
+        let mut held_from = None;
 
         if !in_word && let Some(word) = self.word.take() {
             self.framer.word(&word);
             if self.phase == StatementPhase::FirstWord {
                 self.phase = StatementPhase::Body;
                 match self.first_word(&word, byte, class) {
-                    FirstWord::Data(keyword) => return Some((keyword, word.len)),
+                    FirstWord::Data(keyword) => return Some(Outcome::Data(keyword, word.len)),
                     FirstWord::Delimiter => {
                         self.phase = StatementPhase::DelimiterLine;
                         self.delimiter_line.clear();
                         return None;
                     }
-                    FirstWord::Other => {}
+                    FirstWord::Handle(Handling::Stream) => {}
+                    FirstWord::Handle(handling) => {
+                        self.handling = handling;
+                        held_from = Some(word.len);
+                    }
                 }
+            } else if self.handling == Handling::AfterCreate {
+                self.handling = after_create(&word);
             }
         }
 
         if in_word {
             self.word.get_or_insert_with(Word::default).push(byte);
+        } else if self.handling == Handling::AfterCreate && !is_separator(byte, class) {
+            // `CREATE (` or `CREATE "x"`: not a table.
+            self.handling = Handling::Stream;
+            held_from = None;
         }
 
         match self.phase {
@@ -235,8 +333,9 @@ impl NormalState {
         if self.framer.ends_at(byte, class) {
             self.framer.reset();
             self.phase = StatementPhase::Start;
+            return Some(Outcome::End);
         }
-        None
+        held_from.map(Outcome::Hold)
     }
 
     fn after_start(&self, byte: u8, class: ByteClass) -> StatementPhase {
@@ -256,6 +355,10 @@ impl NormalState {
     /// What the first word of a statement makes of it; `byte` ended the word.
     fn first_word(&self, word: &Word, byte: u8, class: ByteClass) -> FirstWord {
         let ends_statement = class == ByteClass::Code && self.framer.ends_single_word(byte);
+        if ends_statement {
+            // A statement of one word writes nothing.
+            return FirstWord::Handle(Handling::Stream);
+        }
         let data =
             if word.is("insert") || (word.is("replace") && self.dialect != SqlDialect::Postgres) {
                 Some(DataKeyword::Insert)
@@ -266,14 +369,20 @@ impl NormalState {
             };
 
         match data {
-            Some(keyword) if !ends_statement => FirstWord::Data(keyword),
+            // The rows of a block end at `;`, so a custom delimiter is held instead.
+            Some(_) if self.framer.custom_delimiter() => FirstWord::Handle(Handling::Hold),
+            Some(keyword) => FirstWord::Data(keyword),
             _ if self.dialect == SqlDialect::Mysql
                 && word.is("delimiter")
                 && (byte == b' ' || byte == b'\t') =>
             {
                 FirstWord::Delimiter
             }
-            _ => FirstWord::Other,
+            _ if word.is_any(&["update", "delete", "merge", "with", "select", "load"]) => {
+                FirstWord::Handle(Handling::Hold)
+            }
+            _ if word.is("create") => FirstWord::Handle(Handling::AfterCreate),
+            _ => FirstWord::Handle(Handling::Stream),
         }
     }
 
@@ -331,6 +440,27 @@ impl NormalState {
 
 /// mysql reads at most this many bytes of a client command line.
 const MAX_DELIMITER_LINE: usize = 256;
+
+/// The handling of a statement after `CREATE` and another word: a table is
+/// held, the words that may come before `TABLE` keep the decision open, and
+/// anything else (`INDEX`, `FUNCTION`, `VIEW`, ...) is streamed.
+fn after_create(word: &Word) -> Handling {
+    if word.is("table") {
+        Handling::Hold
+    } else if word.is_any(&[
+        "or",
+        "replace",
+        "global",
+        "local",
+        "temp",
+        "temporary",
+        "unlogged",
+    ]) {
+        Handling::AfterCreate
+    } else {
+        Handling::Stream
+    }
+}
 
 /// psql's record of the first words of a statement outside parentheses.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -582,7 +712,8 @@ pub enum InsertHeaderEvent {
         opaque: bool,
     },
     /// The statement ended without opening a data block (`INSERT ... SELECT`,
-    /// `COPY ... TO stdout`); its bytes pass through unchanged.
+    /// `COPY ... FROM 'file'`, `COPY ... TO stdout`): it is reported whole,
+    /// to be checked before it is written.
     NotData(Vec<u8>),
     /// The header grew past the size limit without ending.
     TooLarge,

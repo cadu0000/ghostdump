@@ -247,6 +247,85 @@ pub fn extract_metadata(header_bytes: &[u8], dialect: SqlDialect) -> Option<Head
     })
 }
 
+/// Whether a statement held for checking may write data. Statements that
+/// only read (`SELECT` without `INTO`, `COPY ... TO`) and `CREATE TABLE`
+/// without a query cannot, so they need no check.
+pub fn may_write(statement: &[u8], dialect: SqlDialect) -> bool {
+    let tokens = tokenize(statement, dialect);
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    let outside = outside_parentheses(&tokens);
+    let any_outside = |words: &[&str]| {
+        outside
+            .iter()
+            .any(|token| words.iter().any(|word| token.is_word(word)))
+    };
+
+    if first.is_word("select") || first.is_word("with") {
+        // `SELECT ... INTO table`, or a `WITH` that changes data.
+        tokens.iter().any(|token| {
+            ["into", "insert", "update", "delete", "merge"]
+                .iter()
+                .any(|word| token.is_word(word))
+        })
+    } else if first.is_word("copy") {
+        any_outside(&["from"])
+    } else if first.is_word("create") {
+        // A query fills the table: `AS SELECT` (PostgreSQL, SQLite), or in
+        // MySQL also `SELECT` with no `AS`, and `TABLE` or `VALUES` statements.
+        let table = outside.iter().position(|token| token.is_word("table"));
+        let after = table.map_or(&[][..], |table| &outside[table + 1..]);
+        after.iter().any(|token| {
+            token.is_word("as")
+                || (dialect == SqlDialect::Mysql
+                    && ["select", "with", "table", "values"]
+                        .iter()
+                        .any(|word| token.is_word(word)))
+        })
+    } else {
+        true
+    }
+}
+
+/// The tokens outside parentheses.
+fn outside_parentheses(tokens: &[Token]) -> Vec<&Token> {
+    let mut depth = 0u32;
+    let mut outside = Vec::new();
+    for token in tokens {
+        match token {
+            Token::Symbol(b'(') => depth += 1,
+            Token::Symbol(b')') => depth = depth.saturating_sub(1),
+            _ if depth == 0 => outside.push(token),
+            _ => {}
+        }
+    }
+    outside
+}
+
+/// Every name a statement refers to, as its parts (`schema.table` gives two).
+/// Keywords are included: the check that uses this errs on the safe side.
+pub fn names_in(statement: &[u8], dialect: SqlDialect) -> Vec<Vec<String>> {
+    let tokens = tokenize(statement, dialect);
+    let mut names = Vec::new();
+    let mut at = 0;
+    while at < tokens.len() {
+        match qualified_name(&tokens, &mut at, dialect) {
+            Some(parts) => names.push(parts),
+            None => at += 1,
+        }
+    }
+    names
+}
+
+/// The first word of a statement, in upper case, to name it in messages.
+pub fn statement_keyword(statement: &[u8], dialect: SqlDialect) -> String {
+    match tokenize(statement, dialect).first() {
+        Some(Token::Word(word)) => word.to_ascii_uppercase(),
+        _ => "SQL".to_string(),
+    }
+}
+
 /// Guesses the dialect from the first bytes of a dump, using the comments
 /// and settings that pg_dump, mysqldump and SQLite's `.dump` write at the top.
 pub fn detect_dialect(prefix: &[u8]) -> Option<SqlDialect> {
@@ -434,6 +513,47 @@ mod tests {
             metadata("COPY t FROM STDOUT;", SqlDialect::Postgres),
             Some(("t".to_string(), None))
         );
+    }
+
+    #[test]
+    fn test_names_in_a_statement() {
+        let names = names_in(
+            b"UPDATE public.users u SET \"e-mail\" = 'x' -- logs\n FROM [o] WHERE u.id = 1",
+            SqlDialect::Sqlite,
+        );
+        let has = |parts: &[&str]| names.iter().any(|name| name == parts);
+        assert!(has(&["public", "users"]));
+        assert!(has(&["e-mail"]));
+        assert!(has(&["o"]));
+        assert!(has(&["u", "id"]));
+        assert!(!has(&["logs"]));
+        // In SQLite a string may stand for a name; elsewhere it is a value.
+        assert!(has(&["x"]));
+        assert!(names_in(b"SELECT 'x'", SqlDialect::Postgres).len() == 1);
+    }
+
+    #[test]
+    fn test_statements_that_may_write() {
+        let pg = SqlDialect::Postgres;
+        assert!(!may_write(
+            b"SELECT pg_catalog.setval('public.users_id_seq', 2, true);",
+            pg
+        ));
+        assert!(may_write(b"SELECT * INTO t2 FROM t;", pg));
+        assert!(may_write(
+            b"WITH x AS (DELETE FROM t RETURNING *) SELECT 1;",
+            pg
+        ));
+        assert!(!may_write(b"COPY (SELECT * FROM t) TO STDOUT;", pg));
+        assert!(may_write(b"COPY t FROM '/tmp/t.csv';", pg));
+        assert!(!may_write(
+            b"CREATE TABLE t (a int GENERATED ALWAYS AS (1) STORED) WITH (fillfactor = 70);",
+            pg
+        ));
+        assert!(may_write(b"CREATE TABLE t AS SELECT 1;", pg));
+        assert!(may_write(b"CREATE TABLE t SELECT 1;", SqlDialect::Mysql));
+        assert!(may_write(b"UPDATE t SET a = 1;", pg));
+        assert!(may_write(b"INSERT INTO t SELECT 1;", pg));
     }
 
     #[test]

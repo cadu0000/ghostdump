@@ -5,7 +5,9 @@ pub mod state;
 use std::fmt;
 use std::sync::Arc;
 
-pub use schema::{HeaderMetadata, detect_dialect, extract_metadata};
+pub use schema::{
+    HeaderMetadata, detect_dialect, extract_metadata, may_write, names_in, statement_keyword,
+};
 pub use state::{InsertFormat, Remainder, SqlDialect};
 
 use state::{
@@ -17,7 +19,8 @@ pub const DEFAULT_MAX_ROW_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParseError {
-    /// A row or a data block header grew past the size limit.
+    /// A row, a data block header or a statement held for checking grew
+    /// past the size limit.
     TooLarge { limit: usize },
 }
 
@@ -26,8 +29,8 @@ impl fmt::Display for ParseError {
         match self {
             ParseError::TooLarge { limit } => write!(
                 f,
-                "a data row or statement header is longer than {limit} bytes \
-                 (raise --max-row-size if the dump really has rows this large)"
+                "a data row or a statement is longer than {limit} bytes \
+                 (raise --max-row-size if the dump really has ones this large)"
             ),
         }
     }
@@ -36,14 +39,18 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 /// What the parser reports for each input byte. Writing every byte of
-/// `DefaultStatement`, `Passthrough`, `Header`, `Tuple` and `Footer`, in
-/// order, reproduces the input exactly.
+/// `DefaultStatement`, `Passthrough`, `Statement`, `Header`, `Tuple` and
+/// `Footer`, in order, reproduces the input exactly.
 #[derive(Debug, PartialEq)]
 pub enum SqlEvent {
     /// A byte outside data rows, to be written unchanged.
     DefaultStatement(u8),
     /// Bytes outside data rows, to be written unchanged.
     Passthrough(Vec<u8>),
+    /// A whole statement that may write data in a form GhostDump cannot mask
+    /// (`UPDATE`, `INSERT ... SELECT`, `CREATE TABLE ... AS SELECT`, ...).
+    /// It is written unchanged unless it refers to a table with rules.
+    Statement(Vec<u8>),
     Header {
         raw_bytes: Vec<u8>,
         /// Shared between identical headers (`pg_dump --inserts` repeats
@@ -71,7 +78,7 @@ pub struct SqlParser {
 impl SqlParser {
     pub fn new(dialect: SqlDialect) -> Self {
         Self {
-            state: State::Normal(NormalState::at_input_start(dialect)),
+            state: State::Normal(NormalState::at_input_start(dialect, DEFAULT_MAX_ROW_BYTES)),
             dialect,
             last_header: Vec::new(),
             last_metadata: None,
@@ -83,6 +90,7 @@ impl SqlParser {
     /// as errors instead of growing the buffer without bound.
     pub fn with_max_row_bytes(mut self, limit: usize) -> Self {
         self.max_row_bytes = limit;
+        self.state = State::Normal(NormalState::at_input_start(self.dialect, limit));
         self
     }
 
@@ -106,6 +114,9 @@ impl SqlParser {
                 }
                 NormalEvent::Continue => None,
                 NormalEvent::DefaultStatement(byte) => Some(SqlEvent::DefaultStatement(byte)),
+                NormalEvent::Released(bytes) => Some(SqlEvent::Passthrough(bytes)),
+                NormalEvent::Statement(bytes) => Some(SqlEvent::Statement(bytes)),
+                NormalEvent::TooLarge => Some(self.too_large()),
             },
             State::InsertHeader(header_state) => match header_state.process_byte(byte) {
                 InsertHeaderEvent::HeaderComplete {
@@ -130,8 +141,8 @@ impl SqlParser {
                     })
                 }
                 InsertHeaderEvent::NotData(bytes) => {
-                    self.state = State::Normal(NormalState::new(self.dialect));
-                    Some(SqlEvent::Passthrough(bytes))
+                    self.state = State::Normal(NormalState::new(self.dialect, self.max_row_bytes));
+                    Some(SqlEvent::Statement(bytes))
                 }
                 InsertHeaderEvent::TooLarge => Some(self.too_large()),
                 InsertHeaderEvent::Continue => None,
@@ -139,7 +150,7 @@ impl SqlParser {
             State::ValueMode(v_state) => match v_state.process_byte(byte) {
                 ValueEvent::TupleComplete(data) => Some(SqlEvent::Tuple(data, v_state.format)),
                 ValueEvent::ExitValuesMode(footer_bytes) => {
-                    self.state = State::Normal(NormalState::new(self.dialect));
+                    self.state = State::Normal(NormalState::new(self.dialect, self.max_row_bytes));
                     Some(SqlEvent::Footer(footer_bytes))
                 }
                 ValueEvent::Passthrough(byte) => Some(SqlEvent::DefaultStatement(byte)),
@@ -167,9 +178,9 @@ impl SqlParser {
     /// Ends the input and returns what the parser still holds.
     pub fn finish(&mut self) -> Remainder {
         match &mut self.state {
-            State::Normal(normal_state) => Remainder::Bytes(normal_state.take_pending()),
+            State::Normal(normal_state) => normal_state.finish(),
             State::InsertHeader(header_state) => {
-                Remainder::Bytes(std::mem::take(&mut header_state.keyword_buf))
+                Remainder::Statement(std::mem::take(&mut header_state.keyword_buf))
             }
             State::ValueMode(v_state) => v_state.finish(),
         }
@@ -189,12 +200,14 @@ mod tests {
         for &byte in sql {
             match parser.handle_byte(byte) {
                 Some(SqlEvent::DefaultStatement(b)) => out.push(b),
-                Some(SqlEvent::Passthrough(bytes)) => out.extend_from_slice(&bytes),
+                Some(SqlEvent::Passthrough(bytes) | SqlEvent::Statement(bytes)) => {
+                    out.extend_from_slice(&bytes)
+                }
                 Some(SqlEvent::Header { .. }) => opened = true,
                 _ => {}
             }
         }
-        if let Remainder::Bytes(rest) = parser.finish() {
+        if let Remainder::Bytes(rest) | Remainder::Statement(rest) = parser.finish() {
             out.extend_from_slice(&rest);
         }
         (out, opened)
@@ -227,6 +240,7 @@ mod tests {
     #[derive(Debug, PartialEq)]
     enum Seen {
         Bytes(String),
+        Statement(String),
         Header(String),
         Tuple(String),
         Footer(String),
@@ -244,6 +258,7 @@ mod tests {
             match parser.handle_byte(byte) {
                 Some(SqlEvent::DefaultStatement(b)) => push_bytes(&mut seen, &[b]),
                 Some(SqlEvent::Passthrough(bytes)) => push_bytes(&mut seen, &bytes),
+                Some(SqlEvent::Statement(bytes)) => seen.push(Seen::Statement(text(&bytes))),
                 Some(SqlEvent::Header { raw_bytes, .. }) => {
                     seen.push(Seen::Header(text(&raw_bytes)))
                 }
@@ -312,9 +327,11 @@ mod tests {
         let mut out = String::new();
         for item in &seen {
             match item {
-                Seen::Bytes(s) | Seen::Header(s) | Seen::Tuple(s) | Seen::Footer(s) => {
-                    out.push_str(s)
-                }
+                Seen::Bytes(s)
+                | Seen::Statement(s)
+                | Seen::Header(s)
+                | Seen::Tuple(s)
+                | Seen::Footer(s) => out.push_str(s),
             }
         }
         if let Remainder::Bytes(rest) = rest {
@@ -555,14 +572,32 @@ mod tests {
         );
     }
 
+    /// The statements `sql` is split into by `Statement` events, and whether
+    /// a data block was opened.
+    fn held(dialect: SqlDialect, sql: &[u8]) -> (Vec<String>, bool) {
+        let (seen, rest) = parse(dialect, sql);
+        let mut statements: Vec<String> = seen
+            .iter()
+            .filter_map(|item| match item {
+                Seen::Statement(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        if let Remainder::Statement(rest) = rest {
+            statements.push(String::from_utf8_lossy(&rest).into_owned());
+        }
+        let opened = seen.iter().any(|item| matches!(item, Seen::Header(_)));
+        (statements, opened)
+    }
+
     #[test]
     fn test_postgres_sql_function_bodies_are_one_statement() {
         // pg_dump writes SQL-standard bodies this way (PostgreSQL 14 and later).
-        let function = b"CREATE OR REPLACE FUNCTION public.f(n text) RETURNS void\n    LANGUAGE sql\n    BEGIN ATOMIC\n INSERT INTO public.t (a)\n   VALUES (f.n);\n UPDATE public.t SET a = CASE WHEN true THEN 'x' END;\nEND;\n";
-        assert_passes_through(SqlDialect::Postgres, function);
-        let mut sql = function.to_vec();
-        sql.extend_from_slice(b"INSERT INTO t (a) VALUES (1);\n");
-        assert!(opens_data_block(SqlDialect::Postgres, &sql));
+        let sql = b"CREATE OR REPLACE FUNCTION public.f(n text) RETURNS void\n    LANGUAGE sql\n    BEGIN ATOMIC\n INSERT INTO public.t (a)\n   VALUES (f.n);\n UPDATE public.t SET a = CASE WHEN true THEN 'x' END;\nEND;\nINSERT INTO t (a) VALUES (1);\n";
+        let (statements, opened) = held(SqlDialect::Postgres, sql);
+        assert!(statements.is_empty(), "{statements:?}");
+        assert!(opened, "the INSERT after the function is data");
+        assert_passes_through(SqlDialect::Postgres, &sql[..sql.len() - 30]);
     }
 
     #[test]
@@ -587,13 +622,21 @@ mod tests {
     }
 
     #[test]
+    fn test_mysql_data_with_a_custom_delimiter_is_held() {
+        let sql = b"DELIMITER //\nINSERT INTO users (name) VALUES ('Ana')//\nDELIMITER ;\n";
+        let (statements, opened) = held(SqlDialect::Mysql, sql);
+        assert!(!opened);
+        assert_eq!(statements, ["INSERT INTO users (name) VALUES ('Ana')//"]);
+    }
+
+    #[test]
     fn test_sqlite_triggers_end_at_end() {
         // sqlite3 .dump writes the whole trigger on one line.
-        let trigger = b"CREATE TRIGGER trg AFTER UPDATE ON users BEGIN UPDATE audit SET n = CASE WHEN 1 THEN 2 END; INSERT INTO audit (n) VALUES (NEW.name); -- c\n END;\n";
-        assert_passes_through(SqlDialect::Sqlite, trigger);
-        let mut sql = trigger.to_vec();
-        sql.extend_from_slice(b"INSERT INTO t (a) VALUES (1);\n");
-        assert!(opens_data_block(SqlDialect::Sqlite, &sql));
+        let sql = b"CREATE TRIGGER trg AFTER UPDATE ON users BEGIN UPDATE audit SET n = CASE WHEN 1 THEN 2 END; INSERT INTO audit (n) VALUES (NEW.name); -- c\n END;\nINSERT INTO t (a) VALUES (1);\n";
+        let (statements, opened) = held(SqlDialect::Sqlite, sql);
+        assert!(statements.is_empty(), "{statements:?}");
+        assert!(opened);
+        assert_passes_through(SqlDialect::Sqlite, &sql[..sql.len() - 30]);
         assert_passes_through(
             SqlDialect::Sqlite,
             b"CREATE TEMP TRIGGER t BEFORE DELETE ON a BEGIN DELETE FROM b; INSERT INTO c (x) VALUES (1); END;\n",
@@ -601,11 +644,45 @@ mod tests {
     }
 
     #[test]
-    fn test_values_inside_a_query_is_not_a_data_block() {
+    fn test_statements_that_may_write_are_held_whole() {
+        let sql = b"SET x = 1;\nUPDATE users SET name = 'Ana';\nCREATE INDEX i ON users (name);\nDELETE FROM users WHERE name = 'Ana';\nCREATE TEMP TABLE t AS SELECT 'Ana';\nINSERT INTO t SELECT 1;\nWITH x AS (SELECT 1) SELECT 2;\n";
+        let (statements, opened) = held(SqlDialect::Postgres, sql);
+        assert!(!opened);
+        assert_eq!(
+            statements,
+            [
+                "UPDATE users SET name = 'Ana';",
+                "DELETE FROM users WHERE name = 'Ana';",
+                "CREATE TEMP TABLE t AS SELECT 'Ana';",
+                "INSERT INTO t SELECT 1;",
+                "WITH x AS (SELECT 1) SELECT 2;",
+            ]
+        );
         assert_passes_through(
+            SqlDialect::Postgres,
+            b"CREATE VIEW v AS SELECT 'Ana';\nSELECT;\n",
+        );
+        // Without its end, the statement is still held.
+        let (statements, _) = held(SqlDialect::Postgres, b"UPDATE users SET name = 'Ana'");
+        assert_eq!(statements, ["UPDATE users SET name = 'Ana'"]);
+    }
+
+    #[test]
+    fn test_create_of_something_other_than_a_table_is_not_held() {
+        assert_passes_through(
+            SqlDialect::Postgres,
+            b"CREATE(x;\nCREATE \"t\" AS SELECT 1;\nCREATE OR REPLACE VIEW v AS SELECT 1;\n",
+        );
+    }
+
+    #[test]
+    fn test_values_inside_a_query_is_not_a_data_block() {
+        let (statements, opened) = held(
             SqlDialect::Postgres,
             b"INSERT INTO t (a) SELECT * FROM (VALUES (1)) v;\nINSERT INTO t DEFAULT VALUES;\n",
         );
+        assert!(!opened);
+        assert_eq!(statements.len(), 2);
     }
 
     #[test]
@@ -613,7 +690,9 @@ mod tests {
         // The server reads `FROM STDOUT` as `FROM STDIN`, and psql sends the rows.
         let (seen, _) = parse(SqlDialect::Postgres, b"COPY t (a) FROM STDOUT;\nx\n\\.\n");
         assert!(seen.contains(&tuple("x\n")), "{seen:?}");
-        assert_passes_through(SqlDialect::Postgres, b"COPY t TO STDIN;\n");
+        let (statements, opened) = held(SqlDialect::Postgres, b"COPY t TO STDIN;\n");
+        assert!(!opened);
+        assert_eq!(statements, ["COPY t TO STDIN;"]);
     }
 
     #[test]
