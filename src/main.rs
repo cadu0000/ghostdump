@@ -38,6 +38,7 @@ fn main() {
                 config.tables.len(),
                 path.display()
             );
+            check_f64_sampler(&config, args.experimental_f64_sampler);
             log_guarantees(&config);
             config
         }
@@ -134,6 +135,26 @@ fn main() {
 
 /// What the rules protect, one line per table. ε adds up over the rows of
 /// a person and over repeated releases, which GhostDump cannot see.
+/// `mechanism = "f64"` runs only with `--experimental-f64-sampler`, and
+/// then with a warning.
+fn check_f64_sampler(config: &CompiledConfig, allowed: bool) {
+    if !config.uses_f64_sampler() {
+        return;
+    }
+    if !allowed {
+        fatal(
+            "mechanism = \"f64\" is kept for experiments: its guarantee holds only while \
+             rounding hides the low-order bits of floating-point noise. Use the exact sampler \
+             (the default), or pass --experimental-f64-sampler to measure it",
+        );
+    }
+    warn!(
+        "--experimental-f64-sampler: the f64 sampler's guarantee holds only while rounding \
+         hides the low-order bits of floating-point noise (see \
+         docs/experiments/floating-point.md). Use it for experiments, never on real data."
+    );
+}
+
 fn log_guarantees(config: &CompiledConfig) {
     for table in config.guarantees() {
         info!("privacy: {table}");

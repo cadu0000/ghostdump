@@ -100,6 +100,12 @@ pub struct Args {
     /// known seed lets anyone recompute the generated values and the noise.
     #[arg(long, hide = true, value_name = "N")]
     pub seed: Option<u64>,
+
+    /// Accepts `mechanism = "f64"`, kept to measure the cost of the exact
+    /// sampler. Hidden: its guarantee holds only while rounding hides the
+    /// low-order bits of floating-point noise.
+    #[arg(long, hide = true)]
+    pub experimental_f64_sampler: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
