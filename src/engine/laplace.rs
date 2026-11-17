@@ -115,7 +115,9 @@ impl LaplaceMechanism {
         let text = match &self.sampler {
             Sampler::F64 { noise_scale } => {
                 let clamped = self.clamp(parsed);
-                let noisy = match self.prf(secret, &clamped.to_bits().to_le_bytes()) {
+                // -0.0 and 0.0 are one value, so they get one key.
+                let key = if clamped == 0.0 { 0.0f64 } else { clamped };
+                let noisy = match self.prf(secret, &key.to_bits().to_le_bytes()) {
                     Some(mut keyed) => self.noisy(clamped, *noise_scale, &mut keyed),
                     None => self.noisy(clamped, *noise_scale, rng),
                 };
@@ -786,6 +788,8 @@ mod tests {
             assert_ne!(run(m, "42", "k", 1), run(m, "42", "other", 1));
             // Values clamped to the same bound get the same noise.
             assert_eq!(run(m, "500", "k", 1), run(m, "100", "k", 1));
+            assert_eq!(run(m, "0", "k", 1), run(m, "-0", "k", 1));
+            assert_eq!(run(m, "0", "k", 1), run(m, "-0.0", "k", 2));
         }
 
         let mut other = LaplaceMechanism::exact(1.0, 0.0, 100.0, 2, false)
