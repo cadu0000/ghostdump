@@ -619,13 +619,32 @@ mod tests {
 
     #[test]
     fn test_unreadable_table_name_fails_closed_with_rules() {
-        let input = b"INSERT INTO \"my table\" (a) VALUES (1);";
+        // A name with Unicode escapes, which GhostDump does not decode.
+        let input = b"INSERT INTO U&\"d\\0061ta\" (a) VALUES (1);";
         let err = run_with(NAME_RULES, SqlDialect::Postgres, input).unwrap_err();
         assert!(
             err.to_string().contains("could not read the table name"),
             "{err}"
         );
         assert!(run(input).is_ok());
+    }
+
+    #[test]
+    fn test_quoted_names_and_overriding_are_masked() {
+        let rules = r#"
+            [tables."my table"]
+            columns = [{ name = "first name", strategy = "nullify" }]
+            [tables.users]
+            columns = [{ name = "name", strategy = "nullify" }]
+        "#;
+        let input = b"INSERT INTO public.\"my table\" (\"first name\") VALUES ('Ana');\n\
+                      INSERT INTO public.users (id, name) OVERRIDING SYSTEM VALUE VALUES (1, 'Bia');\n";
+        let out = run_with(rules, SqlDialect::Postgres, input).unwrap();
+        assert_eq!(
+            out,
+            "INSERT INTO public.\"my table\" (\"first name\") VALUES (NULL);\n\
+             INSERT INTO public.users (id, name) OVERRIDING SYSTEM VALUE VALUES (1, NULL);\n"
+        );
     }
 
     #[test]

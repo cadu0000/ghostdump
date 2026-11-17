@@ -90,6 +90,7 @@ impl SqlParser {
         match &mut self.state {
             State::Normal(normal_state) => match normal_state.process_byte(byte) {
                 NormalEvent::StartInsertHeader {
+                    before,
                     initial_bytes,
                     keyword,
                     delimiter,
@@ -101,7 +102,7 @@ impl SqlParser {
                         delimiter,
                         self.max_row_bytes,
                     ));
-                    None
+                    (!before.is_empty()).then_some(SqlEvent::Passthrough(before))
                 }
                 NormalEvent::Continue => None,
                 NormalEvent::DefaultStatement(byte) => Some(SqlEvent::DefaultStatement(byte)),
@@ -405,8 +406,7 @@ mod tests {
     #[test]
     fn test_repeated_headers_share_metadata() {
         let mut parser = SqlParser::new(SqlDialect::Postgres);
-        // The header of a statement carries the line break before it, so
-        // the second and third headers are identical.
+        // Headers start at the keyword, so repeated headers are identical.
         let sql = b"INSERT INTO t (a) VALUES (1);\nINSERT INTO t (a) VALUES (2);\nINSERT INTO t (a) VALUES (3);\n";
         let metadata: Vec<Arc<HeaderMetadata>> = sql
             .iter()
@@ -416,6 +416,7 @@ mod tests {
             })
             .collect();
         assert_eq!(metadata.len(), 3);
+        assert!(Arc::ptr_eq(&metadata[0], &metadata[1]));
         assert!(Arc::ptr_eq(&metadata[1], &metadata[2]));
         assert_eq!(metadata[0].table, "t");
     }
@@ -552,6 +553,22 @@ mod tests {
             remainder(SqlDialect::Postgres, b"COPY t (a) FROM stdin;\n1\n"),
             Remainder::UnterminatedData { partial_row: false }
         );
+    }
+
+    #[test]
+    fn test_values_inside_a_query_is_not_a_data_block() {
+        assert_passes_through(
+            SqlDialect::Postgres,
+            b"INSERT INTO t (a) SELECT * FROM (VALUES (1)) v;\nINSERT INTO t DEFAULT VALUES;\n",
+        );
+    }
+
+    #[test]
+    fn test_copy_from_stdout_reads_rows() {
+        // The server reads `FROM STDOUT` as `FROM STDIN`, and psql sends the rows.
+        let (seen, _) = parse(SqlDialect::Postgres, b"COPY t (a) FROM STDOUT;\nx\n\\.\n");
+        assert!(seen.contains(&tuple("x\n")), "{seen:?}");
+        assert_passes_through(SqlDialect::Postgres, b"COPY t TO STDIN;\n");
     }
 
     #[test]

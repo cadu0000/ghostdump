@@ -36,6 +36,10 @@ pub enum Remainder {
 pub enum NormalEvent {
     Continue,
     StartInsertHeader {
+        /// Bytes before the keyword (the end of the statement before), to
+        /// be written unchanged.
+        before: Vec<u8>,
+        /// The keyword and the byte after it, which start the header.
         initial_bytes: Vec<u8>,
         keyword: DataKeyword,
         /// The byte after the keyword, already included in `initial_bytes`.
@@ -96,8 +100,10 @@ impl NormalState {
     pub fn process_byte(&mut self, byte: u8) -> NormalEvent {
         self.pending.push_back(byte);
 
-        if let Some(keyword) = self.advance(byte) {
+        if let Some((keyword, len)) = self.advance(byte) {
+            let start = self.pending.len() - len - 1;
             return NormalEvent::StartInsertHeader {
+                before: self.pending.drain(..start).collect(),
                 initial_bytes: self.pending.drain(..).collect(),
                 keyword,
                 delimiter: byte,
@@ -118,7 +124,8 @@ impl NormalState {
         self.pending.drain(..).collect()
     }
 
-    fn advance(&mut self, byte: u8) -> Option<DataKeyword> {
+    /// The data keyword that ended at this byte, and its length.
+    fn advance(&mut self, byte: u8) -> Option<(DataKeyword, usize)> {
         if self.skip_bom(byte) {
             return None;
         }
@@ -151,7 +158,7 @@ impl NormalState {
                     if let Some(keyword) = self.keyword_before_last(len)
                         && !ends_statement
                     {
-                        return Some(keyword);
+                        return Some((keyword, len));
                     }
                     self.phase = StatementPhase::Body;
                     self.body_byte(byte, class);
@@ -245,6 +252,19 @@ pub enum InsertHeaderEvent {
     TooLarge,
 }
 
+/// COPY: where the rows come from, as far as the words read so far tell.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CopySource {
+    Unknown,
+    /// Right after `FROM`.
+    AfterFrom,
+    /// `FROM STDIN`, or `FROM STDOUT`, which the server reads the same way:
+    /// the rows follow the statement (psql, `psqlscan_is_copy_from_stdin`).
+    Inline,
+    /// A file, a program, or no `FROM` at all.
+    Elsewhere,
+}
+
 pub struct InsertHeaderState {
     pub keyword_buf: Vec<u8>,
     pub dialect: SqlDialect,
@@ -252,8 +272,13 @@ pub struct InsertHeaderState {
     lexer: Lexer,
     /// Length of the run of identifier bytes that ends at the last byte.
     word_len: usize,
-    /// COPY: the word `STDIN` appeared, so the statement reads rows.
-    saw_stdin: bool,
+    /// Parenthesis depth: `VALUES` and `FROM` count only outside parentheses.
+    depth: u32,
+    /// INSERT: a word showed that the rows come from a query or from
+    /// assignments (`SELECT`, `TABLE`, `SET`, `DEFAULT VALUES`), so a later
+    /// `VALUES` does not open a data block.
+    not_values: bool,
+    source: CopySource,
     /// COPY: something other than spaces followed `STDIN`.
     copy_options: bool,
     max_bytes: usize,
@@ -278,7 +303,9 @@ impl InsertHeaderState {
             keyword,
             lexer,
             word_len: 0,
-            saw_stdin: false,
+            depth: 0,
+            not_values: false,
+            source: CopySource::Unknown,
             copy_options: false,
             max_bytes,
         }
@@ -299,22 +326,29 @@ impl InsertHeaderState {
 
         // A word ends here, if one was being read.
         let word_len = std::mem::take(&mut self.word_len);
-        if self.keyword == DataKeyword::Copy
-            && !self.saw_stdin
-            && self.last_word_is(word_len, b"STDIN")
-        {
-            self.saw_stdin = true;
+        let outside = self.depth == 0;
+        if outside && word_len > 0 {
+            self.take_word(word_len);
+        } else if self.source == CopySource::AfterFrom && !is_separator(byte, class) {
+            // `FROM 'file'`.
+            self.source = CopySource::Elsewhere;
         }
         self.note_copy_option(byte, class);
 
         if class != ByteClass::Code {
             return InsertHeaderEvent::Continue;
         }
-        let ends_statement = byte == b';';
+        // psql ends a statement only outside parentheses.
+        let ends_statement = byte == b';' && (outside || self.dialect != SqlDialect::Postgres);
 
         match self.keyword {
             // `INSERT ... DEFAULT VALUES;` has no rows: it falls through to `NotData`.
-            DataKeyword::Insert if !ends_statement && self.is_values_keyword(word_len) => {
+            DataKeyword::Insert
+                if !ends_statement
+                    && outside
+                    && !self.not_values
+                    && self.is_values_keyword(word_len) =>
+            {
                 let mut header_bytes = std::mem::take(&mut self.keyword_buf);
                 header_bytes.pop();
 
@@ -325,7 +359,7 @@ impl InsertHeaderState {
                     opaque: false,
                 };
             }
-            DataKeyword::Copy if ends_statement && self.saw_stdin => {
+            DataKeyword::Copy if ends_statement && self.source == CopySource::Inline => {
                 return InsertHeaderEvent::HeaderComplete {
                     format: InsertFormat::Copy,
                     header_bytes: std::mem::take(&mut self.keyword_buf),
@@ -336,11 +370,46 @@ impl InsertHeaderState {
             _ => {}
         }
 
+        match byte {
+            b'(' => self.depth += 1,
+            b')' => self.depth = self.depth.saturating_sub(1),
+            _ => {}
+        }
+
         if ends_statement {
             return InsertHeaderEvent::NotData(std::mem::take(&mut self.keyword_buf));
         }
 
         InsertHeaderEvent::Continue
+    }
+
+    /// Takes a word outside parentheses, made of the `len` bytes before the last one.
+    fn take_word(&mut self, len: usize) {
+        match self.keyword {
+            DataKeyword::Insert => {
+                let query = ["SELECT", "WITH", "TABLE", "DEFAULT"]
+                    .iter()
+                    .any(|word| self.last_word_is(len, word.as_bytes()));
+                let assignments =
+                    self.dialect == SqlDialect::Mysql && self.last_word_is(len, b"SET");
+                if query || assignments {
+                    self.not_values = true;
+                }
+            }
+            DataKeyword::Copy => {
+                self.source = match self.source {
+                    CopySource::Unknown if self.last_word_is(len, b"FROM") => CopySource::AfterFrom,
+                    CopySource::AfterFrom
+                        if self.last_word_is(len, b"STDIN")
+                            || self.last_word_is(len, b"STDOUT") =>
+                    {
+                        CopySource::Inline
+                    }
+                    CopySource::AfterFrom => CopySource::Elsewhere,
+                    source => source,
+                };
+            }
+        }
     }
 
     /// `VALUES`, or its MySQL synonym `VALUE`, made of the `len` bytes before the last one.
@@ -352,7 +421,7 @@ impl InsertHeaderState {
     /// After `STDIN`, anything other than spaces and the final `;` is a COPY option.
     fn note_copy_option(&mut self, byte: u8, class: ByteClass) {
         let plain = class == ByteClass::Code && (byte.is_ascii_whitespace() || byte == b';');
-        if self.saw_stdin && !plain {
+        if self.source == CopySource::Inline && !plain {
             self.copy_options = true;
         }
     }

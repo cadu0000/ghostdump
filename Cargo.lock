@@ -546,7 +546,6 @@ dependencies = [
  "mimalloc",
  "proptest",
  "rand 0.8.5",
- "regex",
  "serde",
  "sha2",
  "toml",
