@@ -228,6 +228,25 @@ impl CompiledConfig {
             .map(|(key, columns)| (key.as_str(), columns.as_slice()))
     }
 
+    /// The key of the rules that a name written in a statement may refer to.
+    /// Without a schema, the name may also be the table of a rule for
+    /// `schema.table`, since the statement may run with that schema in its
+    /// search path.
+    pub fn rules_named(&self, schema: Option<&str>, table: &str) -> Option<&str> {
+        if let Some((key, _)) = self.rules_for(schema, table) {
+            return Some(key);
+        }
+        if schema.is_some() {
+            return None;
+        }
+        let table = fold_case(table);
+        self.tables
+            .keys()
+            .filter(|key| key.rsplit_once('.').is_some_and(|(_, name)| name == table))
+            .min()
+            .map(String::as_str)
+    }
+
     /// The guarantees of each table's rules, sorted by table name.
     pub fn guarantees(&self) -> Vec<TableGuarantees> {
         let mut tables: Vec<TableGuarantees> = self
@@ -420,5 +439,23 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("more than one rule"), "{err}");
+    }
+
+    #[test]
+    fn test_names_in_statements_also_find_rules_with_a_schema() {
+        let config = compile_rules(
+            r#"
+            [tables."audit.users"]
+            columns = [{ name = "a", strategy = "nullify" }]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.rules_named(None, "USERS"), Some("audit.users"));
+        assert_eq!(
+            config.rules_named(Some("audit"), "users"),
+            Some("audit.users")
+        );
+        assert_eq!(config.rules_named(Some("public"), "users"), None);
+        assert_eq!(config.rules_named(None, "orders"), None);
     }
 }
