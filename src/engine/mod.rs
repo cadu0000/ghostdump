@@ -1,4 +1,5 @@
 pub mod categorical;
+pub mod columns;
 pub mod config;
 pub mod laplace;
 pub mod mask;
@@ -14,6 +15,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
 use std::thread;
 
+use crate::engine::columns::{ColumnOrders, Columns};
 use crate::engine::config::{CompiledColumn, CompiledConfig};
 use crate::engine::sink::{MaskingPlan, ParallelSink, RowContext, SequentialSink, Sink};
 use crate::parser::state::{InsertFormat, SqlDialect};
@@ -123,11 +125,10 @@ impl AnonymizerEngine {
 
     /// The columns of a data block that have rules, or `None` when no
     /// column has one (the rows are then copied as they are).
-    fn masking_plan(&self, metadata: &HeaderMetadata) -> Option<KeyedPlan<'_>> {
+    fn masking_plan(&self, metadata: &HeaderMetadata, columns: &[String]) -> Option<KeyedPlan<'_>> {
         let (key, rules) = self
             .config
             .rules_for(metadata.schema.as_deref(), &metadata.table)?;
-        let columns = metadata.columns.as_ref()?;
 
         let plan: MaskingPlan = columns
             .iter()
@@ -143,6 +144,7 @@ impl AnonymizerEngine {
         metadata: Option<&HeaderMetadata>,
         opaque: bool,
         header: &[u8],
+        orders: &ColumnOrders,
     ) -> io::Result<Option<KeyedPlan<'_>>> {
         let Some(metadata) = metadata else {
             if self.config.tables.is_empty() {
@@ -161,15 +163,39 @@ impl AnonymizerEngine {
             .config
             .rules_for(metadata.schema.as_deref(), table)
             .is_some();
-        if metadata.columns.is_none() && has_rules {
-            return Err(refuse(format!(
-                "table `{table}` has rules, but its INSERT has no column list, so they cannot \
-                 be matched to values. Dump it with column names (mysqldump --complete-insert, \
-                 pg_dump --column-inserts) or remove its rules"
-            )));
-        }
+        let columns: &[String] = match &metadata.columns {
+            Some(columns) => columns,
+            None if !has_rules => &[],
+            None => match orders.columns(&metadata.key) {
+                Columns::Known(columns) => {
+                    debug!(
+                        "table `{table}`: no column list, the columns of its CREATE TABLE apply"
+                    );
+                    columns
+                }
+                Columns::Unknown => {
+                    return Err(refuse(format!(
+                        "table `{table}` has rules, but its INSERT has no column list, and the \
+                         dump does not show its columns with certainty: its CREATE TABLE does \
+                         not list them all (AS, LIKE, INHERITS, PARTITION OF, OF, invisible \
+                         columns), or a later statement may have changed them (ALTER TABLE, \
+                         RENAME, DROP). Dump it with column names (mysqldump --complete-insert, \
+                         pg_dump --column-inserts) or remove its rules"
+                    )));
+                }
+                Columns::Missing => {
+                    return Err(refuse(format!(
+                        "table `{table}` has rules, but its INSERT has no column list, and no \
+                         CREATE TABLE for it comes earlier in the dump, so the rules cannot be \
+                         matched to values. Dump it with its schema, or with column names \
+                         (mysqldump --complete-insert, pg_dump --column-inserts), or remove \
+                         its rules"
+                    )));
+                }
+            },
+        };
 
-        let plan = self.masking_plan(metadata);
+        let plan = self.masking_plan(metadata, columns);
         if opaque && plan.is_some() {
             return Err(refuse(format!(
                 "table `{table}` has rules, but its COPY uses options GhostDump cannot read \
@@ -244,6 +270,7 @@ impl AnonymizerEngine {
 
         let mut plan: Option<Arc<MaskingPlan>> = None;
         let mut plan_metadata: Option<Arc<HeaderMetadata>> = None;
+        let mut orders = ColumnOrders::default();
         // Rules applied at least once, as (table key, column name).
         let mut used: BTreeSet<(&str, &String)> = BTreeSet::new();
 
@@ -262,10 +289,18 @@ impl AnonymizerEngine {
                     SqlEvent::DefaultStatement(b) => sink.write(&[b])?,
                     SqlEvent::Passthrough(bytes) => sink.write(&bytes)?,
                     SqlEvent::Statement(bytes) => {
-                        if !self.config.tables.is_empty()
-                            && let Err(e) = self.check_statement(&Statement::parse(&bytes, dialect))
-                        {
-                            return stop(sink, e);
+                        if !self.config.tables.is_empty() {
+                            let statement = Statement::parse(&bytes, dialect);
+                            if let Err(e) = self.check_statement(&statement) {
+                                return stop(sink, e);
+                            }
+                            if let Some(change) = statement.table_change()
+                                && orders.apply(change, &self.config)
+                            {
+                                // The next header is planned again, even if
+                                // it repeats the last one.
+                                plan_metadata = None;
+                            }
                         }
                         sink.write(&bytes)?;
                     }
@@ -288,7 +323,12 @@ impl AnonymizerEngine {
                                 current_table = table.to_string();
                                 current_rows = 0;
                             }
-                            plan = match self.plan_block(metadata.as_deref(), opaque, &raw_bytes) {
+                            plan = match self.plan_block(
+                                metadata.as_deref(),
+                                opaque,
+                                &raw_bytes,
+                                &orders,
+                            ) {
                                 Ok(Some((key, columns))) => {
                                     used.extend(
                                         columns.iter().flatten().map(|rule| (key, &rule.name)),
@@ -715,6 +755,52 @@ mod tests {
         let input = b"INSERT INTO `other` VALUES (1,'Ana');";
         let out = run_with(NAME_RULES, SqlDialect::Mysql, input).unwrap();
         assert_eq!(out.as_bytes(), input);
+    }
+
+    #[test]
+    fn test_rows_without_column_list_take_the_columns_of_create_table() {
+        let input = b"CREATE TABLE users (id int, name text, secret text);\n\
+                      INSERT INTO users VALUES (1, 'Ana', 'pw'), (2, 'Bia', NULL);\n";
+        let out = run_with(NAME_RULES, SqlDialect::Postgres, input).unwrap();
+        assert!(
+            out.ends_with(
+                "INSERT INTO users VALUES (1, 'O''Conner', NULL), (2, 'O''Conner', NULL);\n"
+            ),
+            "{out}"
+        );
+
+        // `"Users"` is another table in PostgreSQL: its CREATE TABLE does not apply.
+        let input = b"CREATE TABLE \"Users\" (secret text, name text);\n\
+                      INSERT INTO users VALUES ('Ana', 'pw');\n";
+        let err = run_with(NAME_RULES, SqlDialect::Postgres, input).unwrap_err();
+        assert!(err.to_string().contains("no CREATE TABLE"), "{err}");
+    }
+
+    #[test]
+    fn test_a_column_change_after_create_table_is_refused() {
+        // The second header repeats the first, but its columns changed.
+        let input = b"CREATE TABLE users (id int, name text);\n\
+                      INSERT INTO users VALUES (1, 'Ana');\n\
+                      ALTER TABLE users ADD COLUMN secret text;\n\
+                      INSERT INTO users VALUES (2, 'Bia', 'pw');\n";
+        let mut out = Vec::new();
+        let err = engine(NAME_RULES)
+            .process_dump(&input[..], &mut out, &RunOptions::new(SqlDialect::Postgres))
+            .unwrap_err();
+        assert!(err.to_string().contains("may have changed"), "{err}");
+        let out = String::from_utf8_lossy(&out);
+        assert!(
+            out.contains("(1, 'O''Conner')") && !out.contains("Bia"),
+            "{out}"
+        );
+
+        // What pg_dump writes between CREATE TABLE and the rows keeps the columns.
+        let input = b"CREATE TABLE public.users (id integer NOT NULL, name text);\n\
+                      ALTER TABLE public.users OWNER TO postgres;\n\
+                      ALTER TABLE public.users ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (\n    SEQUENCE NAME public.users_id_seq\n);\n\
+                      INSERT INTO public.users OVERRIDING SYSTEM VALUE VALUES (1, 'Ana');\n";
+        let out = run_with(NAME_RULES, SqlDialect::Postgres, input).unwrap();
+        assert!(out.contains("VALUES (1, 'O''Conner');"), "{out}");
     }
 
     #[test]

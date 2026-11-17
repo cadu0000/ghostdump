@@ -186,17 +186,33 @@ fn mysqldump_with_column_names_is_masked() {
 }
 
 #[test]
-fn mysqldump_default_format_is_refused() {
+fn mysqldump_default_format_is_masked() {
+    // No column list: the columns come from the CREATE TABLE before the rows.
     let dump = include_bytes!("fixtures/mysql_default.sql");
     let output = run(&["-c", MYSQL_RULES], None, dump);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("--complete-insert"));
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(
-        !stdout.contains("Ana") && !stdout.contains("example.com"),
+        stdout.contains(
+            "INSERT INTO `customers` VALUES (1,'Masked O\\'Name',NULL),(2,'Masked O\\'Name',NULL);"
+        ),
         "{stdout}"
     );
+    assert!(!stdout.contains("example.com"));
+}
+
+#[test]
+fn rows_without_column_names_or_create_table_are_refused() {
+    // A data-only dump: nothing tells which value belongs to which column.
+    let dump = b"INSERT INTO `customers` VALUES (1,'Ana O\\'Neil','ana@example.com');\n";
+    let output = run(&["-c", MYSQL_RULES, "--dialect", "mysql"], None, dump);
+
+    assert!(!output.status.success());
+    let message = stderr(&output);
+    assert!(message.contains("no CREATE TABLE"), "{message}");
+    assert!(message.contains("--complete-insert"), "{message}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Ana"));
 }
 
 #[test]
@@ -433,16 +449,42 @@ fn sqlite_trigger_bodies_are_copied() {
 }
 
 #[test]
-fn sqlite_dump_rows_without_column_names_are_refused() {
-    // sqlite3's .dump never writes column names.
+fn sqlite_dump_is_masked() {
+    // sqlite3's .dump never writes column names: they come from its CREATE TABLE.
     let dump = include_bytes!("fixtures/sqlite_dump.sql");
     let output = run(&["-c", DUMP_FORMS_RULES], None, dump);
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(!output.status.success());
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(
-        stderr(&output).contains("no column list"),
-        "{}",
-        stderr(&output)
+        stdout.contains("INSERT INTO users VALUES(1,'Masked',NULL);"),
+        "{stdout}"
     );
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("Alice Example"));
+    assert!(stdout.contains("INSERT INTO users VALUES(2,'Masked',NULL);"));
+    assert!(!stdout.contains("Alice") && !stdout.contains("example.com"));
+}
+
+#[test]
+fn pg_dump_with_inserts_is_masked() {
+    // pg_dump 16 --inserts: no column list, and OVERRIDING SYSTEM VALUE for
+    // the identity column.
+    let dump = include_bytes!("fixtures/pg_dump_inserts.sql");
+    let output = run(&["-c", DUMP_FORMS_RULES], None, dump);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(
+        stdout.contains(
+            "INSERT INTO public.users OVERRIDING SYSTEM VALUE VALUES (1, 'Masked', NULL);"
+        )
+    );
+    assert!(stdout.contains("INSERT INTO public.\"my table\" VALUES (NULL);"));
+    for value in [
+        "Alice Example",
+        "alice@example.com",
+        "O''Brien",
+        "Carol Example",
+    ] {
+        assert!(!stdout.contains(value), "{value} in {stdout}");
+    }
 }
