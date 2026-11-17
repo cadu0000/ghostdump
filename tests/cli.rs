@@ -28,6 +28,7 @@ const CONSISTENT_RULES: &str = concat!(
 );
 const RR_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rr_rules.toml");
 const DP_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dp_rules.toml");
+const F64_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/f64_rules.toml");
 const TYPO_RULES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/typo_rules.toml"
@@ -223,6 +224,31 @@ fn invalid_rules_stop_before_reading_data() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("table `users`, column `salary`"));
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn f64_sampler_needs_the_hidden_experiment_option() {
+    let dump = b"INSERT INTO users (salary) VALUES (10);\n";
+
+    let refused = run(&["-c", F64_RULES], None, dump);
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    assert!(
+        stderr(&refused).contains("--experimental-f64-sampler"),
+        "{}",
+        stderr(&refused)
+    );
+
+    let allowed = run(&["-c", F64_RULES, "--experimental-f64-sampler"], None, dump);
+    assert!(allowed.status.success(), "stderr: {}", stderr(&allowed));
+    assert!(
+        stderr(&allowed).contains("never on real data"),
+        "{}",
+        stderr(&allowed)
+    );
+
+    let help = run(&["--help"], None, b"");
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("f64"));
 }
 
 #[test]
