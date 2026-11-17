@@ -79,7 +79,7 @@ Configurations:
 | --- | --- |
 | `no_rules` | none: a pass-through copy |
 | `hmac_only` | `hmac` on the four keys (`users.id`, `users.company_id`, `orders.id`, `orders.user_id`) |
-| `laplace_f64`, `laplace_exact` | `dp_laplace` on `users.salary`, with the sampler named |
+| `laplace_f64`, `laplace_exact` | `dp_laplace` on `users.salary`, with the sampler named (the `f64` runs pass `--experimental-f64-sampler`) |
 | `full` | the generated `rules.toml`: every rule of the dataset guide |
 
 `--baseline-binary` runs an older build with `no_rules` and with `full` written in its format (`sensitivity` instead of `bounds`).
