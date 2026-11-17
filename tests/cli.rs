@@ -32,6 +32,14 @@ const TYPO_RULES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/typo_rules.toml"
 );
+const DUMP_FORMS_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/dump_forms_rules.toml"
+);
+const AUDIT_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/audit_rules.toml"
+);
 
 /// Runs ghostdump with `args`, the secret (if any) in the environment, and
 /// `stdin` as input.
@@ -350,4 +358,91 @@ fn unused_rules_warn_and_fail_with_strict() {
     let strict = run(&["-c", TYPO_RULES, "--strict"], None, dump);
     assert!(!strict.status.success());
     assert!(stderr(&strict).contains("--strict"), "{}", stderr(&strict));
+}
+
+/// The text from the first `start` to the `end` after it, both included.
+fn section<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+    let from = text
+        .find(start)
+        .unwrap_or_else(|| panic!("`{start}` not found"));
+    let to = from + text[from..].find(end).expect("the end follows") + end.len();
+    &text[from..to]
+}
+
+#[test]
+fn pg_dump_with_column_inserts_is_masked() {
+    // pg_dump 16 --column-inserts: an identity column GENERATED ALWAYS, a
+    // quoted name with a space, a SQL-standard function body and a rule
+    // with two actions.
+    let dump = include_bytes!("fixtures/pg_dump_column_inserts.sql");
+    let output = run(&["-c", DUMP_FORMS_RULES], None, dump);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let input = String::from_utf8_lossy(dump);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    for value in [
+        "Alice Example",
+        "alice@example.com",
+        "O''Brien",
+        "Carol Example",
+    ] {
+        assert!(!stdout.contains(value), "{value} in {stdout}");
+    }
+    assert!(stdout.contains(
+        "INSERT INTO public.users (id, name, email) OVERRIDING SYSTEM VALUE VALUES (1, 'Masked', NULL);"
+    ));
+    assert!(stdout.contains("INSERT INTO public.\"my table\" (\"first name\") VALUES (NULL);"));
+    // The function body and the rule are code: they are copied as they are.
+    for (start, end) in [("CREATE FUNCTION", "\nEND;"), ("CREATE RULE", "\n);\n")] {
+        assert_eq!(section(&stdout, start, end), section(&input, start, end));
+    }
+}
+
+#[test]
+fn mysqldump_routines_are_copied_and_rows_masked() {
+    // mysqldump 8.0 --complete-insert --routines: a trigger and a procedure
+    // whose bodies write to tables with rules.
+    let dump = include_bytes!("fixtures/mysqldump_routines.sql");
+    let output = run(&["-c", DUMP_FORMS_RULES], None, dump);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let input = String::from_utf8_lossy(dump);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    for value in ["Alice Example", "alice@example.com", "O\\'Brien"] {
+        assert!(!stdout.contains(value), "{value} in {stdout}");
+    }
+    assert!(stdout.contains("VALUES (1,'Masked',NULL),(2,'Masked',NULL);"));
+    assert!(stdout.contains("VALUES (1,NULL),(2,NULL);"));
+    for (start, end) in [("/*!50003 CREATE*/", "*/;;"), ("CREATE DEFINER", "END ;;")] {
+        assert_eq!(section(&stdout, start, end), section(&input, start, end));
+    }
+}
+
+#[test]
+fn sqlite_trigger_bodies_are_copied() {
+    // The trigger inserts into `audit`, which has a rule: its body is code,
+    // not a data block.
+    let dump = include_bytes!("fixtures/sqlite_dump.sql");
+    let output = run(&["-c", AUDIT_RULES], None, dump);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(dump)
+    );
+}
+
+#[test]
+fn sqlite_dump_rows_without_column_names_are_refused() {
+    // sqlite3's .dump never writes column names.
+    let dump = include_bytes!("fixtures/sqlite_dump.sql");
+    let output = run(&["-c", DUMP_FORMS_RULES], None, dump);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("no column list"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Alice Example"));
 }
