@@ -246,13 +246,15 @@ fn bernoulli(num: u128, den: u128, rng: &mut impl Rng) -> bool {
 /// Steinke, 2020, algorithm 1). Only integer comparisons are involved.
 ///
 /// Step k goes on with probability num / (den · k) <= 1 / k, so k reaches
-/// K with probability at most 1 / (K − 1)!. The loop stops when `den · k`
-/// no longer fits in u128, after at least 2^28 steps for the largest `den`
-/// in use (2^100): that changes the distribution by less than
-/// 1 / (2^28 − 1)!, and ends the loop whatever the generator returns.
+/// K with probability at most 1 / (K − 1)!. The loop also stops when
+/// `den · k` or `k + 1` would not fit in u128, at step 2^28 at the earliest
+/// for the largest `den` in use (2^100): that changes the distribution by
+/// less than 1 / (2^28 − 1)!, and no product or count overflows whatever
+/// the generator returns.
 pub(crate) fn bernoulli_exp_le1(num: u128, den: u128, rng: &mut impl Rng) -> bool {
     let mut k: u128 = 1;
     while let Some(den_k) = den.checked_mul(k)
+        && k < u128::MAX
         && bernoulli(num, den_k, rng)
     {
         k += 1;
@@ -295,8 +297,9 @@ pub fn discrete_laplace(t: u64, rng: &mut impl Rng) -> i64 {
         if negative && magnitude == 0 {
             continue;
         }
-        // The magnitude has a geometric tail: it fits in an i64 for any t
-        // accepted by the rules (see `ExactDomain`).
+        // The magnitude has a geometric tail: with t <= 2^50 (see
+        // `ExactDomain`), it passes i64::MAX only if v >= 2^13, with
+        // probability e^-8192, and then saturates.
         let magnitude = i64::try_from(magnitude).unwrap_or(i64::MAX);
         return if negative { -magnitude } else { magnitude };
     }
@@ -374,7 +377,7 @@ impl ExactDomain {
         let unit_f64 = unit as f64;
         let to_units = |value: f64| {
             let units = (value * unit_f64).round();
-            if units.abs() > MAX_UNITS {
+            if units.is_nan() || units.abs() > MAX_UNITS {
                 Err("`bounds` times 10^scale must stay below 2^53 for the exact sampler")
             } else {
                 // An integer in [-2^53, 2^53]: the cast is exact.
@@ -434,7 +437,7 @@ impl ExactDomain {
     }
 
     /// `units` plus noise. With t <= 2^50, noise past 2^62 has probability
-    /// below e^-4096; the sum saturates instead of overflowing even then.
+    /// at most 2e^-4096; the sum saturates instead of overflowing even then.
     pub fn noisy(&self, units: i64, clamp_output: bool, rng: &mut impl Rng) -> i64 {
         let noisy = units.saturating_add(discrete_laplace(self.t, rng));
         if clamp_output {
@@ -674,6 +677,10 @@ mod tests {
         for epsilon in [0.0, -1.0, f64::INFINITY, f64::NAN] {
             assert!(ExactDomain::new(epsilon, 0.0, 1.0, 0).is_err(), "{epsilon}");
         }
+        for bound in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e300] {
+            assert!(ExactDomain::new(1.0, bound, 1.0, 0).is_err(), "{bound}");
+            assert!(ExactDomain::new(1.0, 0.0, bound, 0).is_err(), "{bound}");
+        }
     }
 
     #[test]
@@ -691,7 +698,7 @@ mod tests {
         assert!(checked > 9_000, "{checked}");
 
         // Δ close to 2^54, where `Δ as f64` rounds: a check of Δ/t <= ε in
-        // floating point lets about 5% of these exceed ε.
+        // floating point lets 346 of these 10,000 exceed ε.
         let max = 1i64 << 53;
         for _ in 0..10_000 {
             let hi = rng.gen_range(max - (1 << 20)..=max);
