@@ -84,6 +84,12 @@ impl Lexer {
         }
     }
 
+    /// Whether the last byte fed left the lexer inside quoted text: a
+    /// string, a quoted identifier or a dollar-quoted string.
+    pub fn in_quotes(&self) -> bool {
+        matches!(self.state, LexState::Quoted(_) | LexState::DollarQuoted)
+    }
+
     fn code_byte(&mut self, byte: u8) -> ByteClass {
         let class = match byte {
             b'-' if self.prev == b'-' => {
@@ -118,6 +124,12 @@ impl Lexer {
             b'`' if self.dialect != SqlDialect::Postgres => {
                 self.backslash_escapes = false;
                 self.state = LexState::Quoted(b'`');
+                ByteClass::Literal
+            }
+            b'[' if self.dialect == SqlDialect::Sqlite => {
+                // SQLite also quotes identifiers as [name], which ends at `]`.
+                self.backslash_escapes = false;
+                self.state = LexState::Quoted(b']');
                 ByteClass::Literal
             }
             b'$' if self.dialect == SqlDialect::Postgres && !is_ident_byte(self.prev) => {
@@ -330,6 +342,29 @@ mod tests {
     #[test]
     fn test_double_quoted_identifier_hides_quote() {
         assert_eq!(classes(SqlDialect::Postgres, b"\"it's\" x"), "llllllcc");
+    }
+
+    #[test]
+    fn test_square_brackets_quote_only_in_sqlite() {
+        assert_eq!(classes(SqlDialect::Sqlite, b"[a;'b] x"), "llllllcc");
+        assert_eq!(classes(SqlDialect::Postgres, b"[a] x"), "ccccc");
+    }
+
+    #[test]
+    fn test_in_quotes_follows_the_text() {
+        let mut lexer = Lexer::new(SqlDialect::Postgres);
+        let inside: Vec<bool> = b"'a''b' x $$c$$"
+            .iter()
+            .map(|&byte| {
+                lexer.feed(byte);
+                lexer.in_quotes()
+            })
+            .collect();
+        let expected = [
+            true, true, false, true, true, false, false, false, false, false, true, true, true,
+            false,
+        ];
+        assert_eq!(inside, expected);
     }
 
     #[test]
