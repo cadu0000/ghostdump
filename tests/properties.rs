@@ -48,6 +48,21 @@ const FRAGMENTS: &[&str] = &[
     "\\connect db\n",
     "\u{feff}",
     "é",
+    "UPDATE t SET a = ",
+    "CREATE TABLE t AS SELECT ",
+    "CREATE FUNCTION f() BEGIN ATOMIC ",
+    "CREATE TRIGGER g BEGIN ",
+    "CASE ",
+    " END",
+    "DELIMITER //\n",
+    "//",
+    "DELIMITER ;\n",
+    "INSERT INTO t (a) OVERRIDING SYSTEM VALUE VALUES ",
+    "INSERT INTO \"t t\" (\"a\") VALUES ",
+    "COPY t FROM STDOUT;\n",
+    " ON DUPLICATE KEY UPDATE a = ",
+    "[",
+    "]",
 ];
 
 /// A byte string made of SQL fragments and arbitrary bytes.

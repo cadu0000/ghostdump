@@ -630,6 +630,31 @@ mod tests {
     }
 
     #[test]
+    fn test_routine_bodies_are_copied_unchanged() {
+        let cases: [(SqlDialect, &[u8]); 3] = [
+            (
+                SqlDialect::Postgres,
+                b"CREATE FUNCTION f(n text) RETURNS void LANGUAGE sql\nBEGIN ATOMIC\n \
+                  INSERT INTO users (name) VALUES (f.n);\n UPDATE users SET name = 'x';\nEND;\n",
+            ),
+            (
+                SqlDialect::Mysql,
+                b"DELIMITER ;;\nCREATE PROCEDURE p(IN n TEXT)\nBEGIN\n  DECLARE c INT;\n  \
+                  INSERT INTO users (name) VALUES (n);\nEND ;;\nDELIMITER ;\n",
+            ),
+            (
+                SqlDialect::Sqlite,
+                b"CREATE TRIGGER t AFTER INSERT ON a BEGIN DELETE FROM b; \
+                  INSERT INTO users (name) VALUES (NEW.x); END;\n",
+            ),
+        ];
+        for (dialect, input) in cases {
+            let out = run_with(NAME_RULES, dialect, input).unwrap();
+            assert_eq!(out.as_bytes(), input, "{dialect:?}");
+        }
+    }
+
+    #[test]
     fn test_quoted_names_and_overriding_are_masked() {
         let rules = r#"
             [tables."my table"]

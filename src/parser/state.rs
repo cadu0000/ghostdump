@@ -58,22 +58,67 @@ enum StatementPhase {
     Start,
     /// A `-` or `/` at statement start that may open a comment.
     MaybeComment,
-    /// Reading the first word of a statement; holds its length so far.
-    FirstWord(usize),
+    /// Reading the first word of a statement.
+    FirstWord,
     /// Inside a psql meta-command line, such as `\connect` or `\restrict`.
     MetaCommand,
+    /// MySQL: the rest of a `DELIMITER` line, which holds the new delimiter.
+    DelimiterLine,
     /// Anywhere else in a statement.
     Body,
 }
 
-/// Passes SQL through and watches for statements that start with `INSERT`,
-/// `REPLACE` (MySQL and SQLite) or `COPY` (PostgreSQL). Keywords inside literals, comments, identifiers or other
-/// statements are ignored.
+/// What a statement's first word makes of it.
+enum FirstWord {
+    Data(DataKeyword),
+    Delimiter,
+    Other,
+}
+
+/// The word being read: its first bytes in lower case, and its length.
+#[derive(Debug, Default, Clone, Copy)]
+struct Word {
+    start: [u8; 12],
+    len: usize,
+}
+
+impl Word {
+    fn push(&mut self, byte: u8) {
+        if let Some(slot) = self.start.get_mut(self.len) {
+            *slot = byte.to_ascii_lowercase();
+        }
+        self.len += 1;
+    }
+
+    /// Whether the word is `keyword`, given in lower case.
+    fn is(&self, keyword: &str) -> bool {
+        self.len == keyword.len() && self.start.get(..self.len) == Some(keyword.as_bytes())
+    }
+
+    fn is_any(&self, keywords: &[&str]) -> bool {
+        keywords.iter().any(|keyword| self.is(keyword))
+    }
+
+    /// A keyword or a name, as opposed to a number or a `$1` parameter.
+    fn is_name(&self) -> bool {
+        let first = self.start[0];
+        self.len > 0 && (first.is_ascii_alphabetic() || first == b'_' || first >= 0x80)
+    }
+}
+
+/// Passes SQL through and finds where each statement starts and ends.
+/// Statements that start with `INSERT`, `REPLACE` (MySQL and SQLite) or
+/// `COPY` (PostgreSQL) open a data block. Keywords inside literals,
+/// comments, identifiers or the body of another statement are ignored.
 pub struct NormalState {
     dialect: SqlDialect,
     lexer: Lexer,
+    framer: Framer,
     pending: VecDeque<u8>,
     phase: StatementPhase,
+    word: Option<Word>,
+    /// MySQL: the bytes of a `DELIMITER` line after the keyword.
+    delimiter_line: Vec<u8>,
     /// Bytes of a UTF-8 BOM matched so far; `None` once past the input start.
     bom_matched: Option<usize>,
 }
@@ -83,8 +128,11 @@ impl NormalState {
         Self {
             dialect,
             lexer: Lexer::new(dialect),
+            framer: Framer::new(dialect),
             pending: VecDeque::with_capacity(LOOKBEHIND + 1),
             phase: StatementPhase::Start,
+            word: None,
+            delimiter_line: Vec::new(),
             bom_matched: None,
         }
     }
@@ -115,7 +163,6 @@ impl NormalState {
         {
             return NormalEvent::DefaultStatement(oldest);
         }
-
         NormalEvent::Continue
     }
 
@@ -130,44 +177,65 @@ impl NormalState {
             return None;
         }
 
-        if self.phase == StatementPhase::MetaCommand {
-            // The line is not SQL: its quotes must not reach the lexer.
-            if byte == b'\n' {
-                self.phase = StatementPhase::Start;
+        match self.phase {
+            StatementPhase::MetaCommand => {
+                // The line is not SQL: its quotes must not reach the lexer.
+                if byte == b'\n' {
+                    self.phase = StatementPhase::Start;
+                }
+                return None;
             }
-            return None;
+            StatementPhase::DelimiterLine => {
+                if byte == b'\n' {
+                    self.set_delimiter();
+                    self.phase = StatementPhase::Start;
+                } else if self.delimiter_line.len() < MAX_DELIMITER_LINE {
+                    self.delimiter_line.push(byte);
+                }
+                return None;
+            }
+            _ => {}
         }
 
         let class = self.lexer.feed(byte);
+        let in_word = class == ByteClass::Code && is_ident_byte(byte);
+
+        if !in_word && let Some(word) = self.word.take() {
+            self.framer.word(&word);
+            if self.phase == StatementPhase::FirstWord {
+                self.phase = StatementPhase::Body;
+                match self.first_word(&word, byte, class) {
+                    FirstWord::Data(keyword) => return Some((keyword, word.len)),
+                    FirstWord::Delimiter => {
+                        self.phase = StatementPhase::DelimiterLine;
+                        self.delimiter_line.clear();
+                        return None;
+                    }
+                    FirstWord::Other => {}
+                }
+            }
+        }
+
+        if in_word {
+            self.word.get_or_insert_with(Word::default).push(byte);
+        }
 
         match self.phase {
             StatementPhase::Start => self.phase = self.after_start(byte, class),
             StatementPhase::MaybeComment => {
-                if class == ByteClass::CommentStart {
-                    self.phase = StatementPhase::Start;
+                self.phase = if class == ByteClass::CommentStart {
+                    StatementPhase::Start
                 } else {
-                    self.phase = StatementPhase::Body;
-                    self.body_byte(byte, class);
-                }
+                    StatementPhase::Body
+                };
             }
-            StatementPhase::FirstWord(len) => {
-                if class == ByteClass::Code && is_ident_byte(byte) {
-                    self.phase = StatementPhase::FirstWord(len + 1);
-                } else {
-                    let ends_statement = class == ByteClass::Code && byte == b';';
-                    if let Some(keyword) = self.keyword_before_last(len)
-                        && !ends_statement
-                    {
-                        return Some((keyword, len));
-                    }
-                    self.phase = StatementPhase::Body;
-                    self.body_byte(byte, class);
-                }
-            }
-            StatementPhase::Body => self.body_byte(byte, class),
-            StatementPhase::MetaCommand => unreachable!("meta-command lines are handled above"),
+            _ => {}
         }
 
+        if self.framer.ends_at(byte, class) {
+            self.framer.reset();
+            self.phase = StatementPhase::Start;
+        }
         None
     }
 
@@ -176,39 +244,72 @@ impl NormalState {
             ByteClass::Comment | ByteClass::CommentStart => StatementPhase::Start,
             ByteClass::Literal => StatementPhase::Body,
             ByteClass::Code => match byte {
-                b';' => StatementPhase::Start,
                 b'-' | b'/' => StatementPhase::MaybeComment,
                 b'\\' if self.dialect == SqlDialect::Postgres => StatementPhase::MetaCommand,
                 b if b.is_ascii_whitespace() => StatementPhase::Start,
-                b if b.is_ascii_alphabetic() => StatementPhase::FirstWord(1),
+                b if b.is_ascii_alphabetic() => StatementPhase::FirstWord,
                 _ => StatementPhase::Body,
             },
         }
     }
 
-    fn body_byte(&mut self, byte: u8, class: ByteClass) {
-        if class == ByteClass::Code && byte == b';' {
-            self.phase = StatementPhase::Start;
+    /// What the first word of a statement makes of it; `byte` ended the word.
+    fn first_word(&self, word: &Word, byte: u8, class: ByteClass) -> FirstWord {
+        let ends_statement = class == ByteClass::Code && self.framer.ends_single_word(byte);
+        let data =
+            if word.is("insert") || (word.is("replace") && self.dialect != SqlDialect::Postgres) {
+                Some(DataKeyword::Insert)
+            } else if word.is("copy") && self.dialect == SqlDialect::Postgres {
+                Some(DataKeyword::Copy)
+            } else {
+                None
+            };
+
+        match data {
+            Some(keyword) if !ends_statement => FirstWord::Data(keyword),
+            _ if self.dialect == SqlDialect::Mysql
+                && word.is("delimiter")
+                && (byte == b' ' || byte == b'\t') =>
+            {
+                FirstWord::Delimiter
+            }
+            _ => FirstWord::Other,
         }
     }
 
-    /// The data keyword formed by the `len` bytes before the last one, if any.
-    fn keyword_before_last(&self, len: usize) -> Option<DataKeyword> {
-        let (word, keyword): (&[u8], DataKeyword) = match len {
-            6 => (b"INSERT", DataKeyword::Insert),
-            7 if self.dialect != SqlDialect::Postgres => (b"REPLACE", DataKeyword::Insert),
-            4 if self.dialect == SqlDialect::Postgres => (b"COPY", DataKeyword::Copy),
-            _ => return None,
+    /// Reads the argument of a `DELIMITER` line, as the mysql client does: up
+    /// to the first space, or between quotes. An empty delimiter, or one with
+    /// a backslash, is refused by mysql and leaves the delimiter unchanged.
+    fn set_delimiter(&mut self) {
+        let line = std::mem::take(&mut self.delimiter_line);
+        let argument = line.trim_ascii_start();
+        let delimiter: Vec<u8> = match argument.split_first() {
+            Some((&quote, rest)) if matches!(quote, b'\'' | b'"' | b'`') => {
+                let mut out = Vec::new();
+                let mut escaped = false;
+                for &byte in rest {
+                    if escaped {
+                        out.push(byte);
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == quote {
+                        break;
+                    } else {
+                        out.push(byte);
+                    }
+                }
+                out
+            }
+            _ => argument
+                .iter()
+                .take_while(|byte| !byte.is_ascii_whitespace())
+                .copied()
+                .collect(),
         };
-
-        let end = self.pending.len().checked_sub(1)?;
-        let start = end.checked_sub(len)?;
-
-        self.pending
-            .range(start..end)
-            .zip(word)
-            .all(|(byte, expected)| byte.eq_ignore_ascii_case(expected))
-            .then_some(keyword)
+        if !delimiter.is_empty() && !delimiter.contains(&b'\\') {
+            self.framer.set_delimiter(delimiter);
+        }
     }
 
     fn skip_bom(&mut self, byte: u8) -> bool {
@@ -225,6 +326,241 @@ impl NormalState {
             self.bom_matched = None;
             false
         }
+    }
+}
+
+/// mysql reads at most this many bytes of a client command line.
+const MAX_DELIMITER_LINE: usize = 256;
+
+/// psql's record of the first words of a statement outside parentheses.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum Lead {
+    #[default]
+    Other,
+    Create,
+    Or,
+    Replace,
+    Routine,
+}
+
+impl Lead {
+    fn of(word: &Word) -> Self {
+        if word.is("create") {
+            Lead::Create
+        } else if word.is("or") {
+            Lead::Or
+        } else if word.is("replace") {
+            Lead::Replace
+        } else if word.is_any(&["function", "procedure"]) {
+            Lead::Routine
+        } else {
+            Lead::Other
+        }
+    }
+}
+
+/// Tokens and states of `sqlite3_complete`, numbered as in SQLite's
+/// `src/complete.c`. White space (token 1) never changes the state, so it is
+/// not fed.
+const SQLITE_SEMI: usize = 0;
+const SQLITE_OTHER: usize = 2;
+const SQLITE_EXPLAIN: usize = 3;
+const SQLITE_CREATE: usize = 4;
+const SQLITE_TEMP: usize = 5;
+const SQLITE_TRIGGER: usize = 6;
+const SQLITE_END: usize = 7;
+const SQLITE_START: u8 = 1;
+const SQLITE_TRANSITIONS: [[u8; 8]; 8] = [
+    // SEMI WS OTHER EXPLAIN CREATE TEMP TRIGGER END
+    [1, 0, 2, 3, 4, 2, 2, 2], // INVALID
+    [1, 1, 2, 3, 4, 2, 2, 2], // START
+    [1, 2, 2, 2, 2, 2, 2, 2], // NORMAL
+    [1, 3, 3, 2, 4, 2, 2, 2], // EXPLAIN
+    [1, 4, 2, 2, 2, 4, 5, 2], // CREATE
+    [6, 5, 5, 5, 5, 5, 5, 5], // TRIGGER
+    [6, 6, 5, 5, 5, 5, 5, 7], // SEMI
+    [1, 7, 5, 5, 5, 5, 5, 5], // END
+];
+
+/// Finds where statements end, as the client that loads the dump does:
+///
+/// * psql ends a statement at a `;` outside parentheses and outside the
+///   `BEGIN ... END` body of `CREATE [OR REPLACE] FUNCTION | PROCEDURE`, in
+///   which it also counts `CASE ... END` (`psqlscan_track_identifier` in
+///   PostgreSQL's `src/fe_utils/psqlscan.l`).
+/// * mysql ends a statement at its delimiter, `;` until a `DELIMITER`
+///   command changes it, anywhere outside quoted text (MySQL Reference
+///   Manual, "mysql Client Commands").
+/// * sqlite3 ends a statement at a `;`, except in `CREATE TRIGGER`, which
+///   ends at `; END ;` (`sqlite3_complete` in SQLite's `src/complete.c`).
+struct Framer {
+    dialect: SqlDialect,
+    paren_depth: u32,
+    begin_depth: u32,
+    /// psql: the first four words outside parentheses.
+    lead: [Lead; 4],
+    words: usize,
+    /// sqlite3: the state of `sqlite3_complete`.
+    sqlite: u8,
+    /// sqlite3: a `-` or `/` not yet counted, since it may open a comment.
+    sqlite_dash: bool,
+    /// mysql: the statement delimiter.
+    delimiter: Vec<u8>,
+    /// mysql: the last bytes of code, compared with a longer delimiter.
+    recent: VecDeque<u8>,
+}
+
+impl Framer {
+    fn new(dialect: SqlDialect) -> Self {
+        Self {
+            dialect,
+            paren_depth: 0,
+            begin_depth: 0,
+            lead: [Lead::Other; 4],
+            words: 0,
+            sqlite: SQLITE_START,
+            sqlite_dash: false,
+            delimiter: vec![b';'],
+            recent: VecDeque::new(),
+        }
+    }
+
+    fn custom_delimiter(&self) -> bool {
+        self.delimiter != b";"
+    }
+
+    /// Whether `byte`, read in code right after the first word, ends the
+    /// statement.
+    fn ends_single_word(&self, byte: u8) -> bool {
+        self.delimiter == [byte]
+    }
+
+    fn set_delimiter(&mut self, delimiter: Vec<u8>) {
+        self.delimiter = delimiter;
+        self.recent.clear();
+    }
+
+    /// Takes a word that just ended, before the byte that ended it.
+    fn word(&mut self, word: &Word) {
+        match self.dialect {
+            SqlDialect::Postgres if self.paren_depth == 0 && word.is_name() => {
+                if let Some(slot) = self.lead.get_mut(self.words) {
+                    *slot = Lead::of(word);
+                }
+                self.words += 1;
+                if self.in_create_routine() {
+                    // CASE also ends with END; it counts only inside BEGIN.
+                    if word.is("begin") || (word.is("case") && self.begin_depth >= 1) {
+                        self.begin_depth += 1;
+                    } else if word.is("end") && self.begin_depth > 0 {
+                        self.begin_depth -= 1;
+                    }
+                }
+            }
+            SqlDialect::Sqlite => {
+                self.sqlite_flush_dash();
+                let token = if word.is("create") {
+                    SQLITE_CREATE
+                } else if word.is_any(&["temp", "temporary"]) {
+                    SQLITE_TEMP
+                } else if word.is("trigger") {
+                    SQLITE_TRIGGER
+                } else if word.is("end") {
+                    SQLITE_END
+                } else if word.is("explain") {
+                    SQLITE_EXPLAIN
+                } else {
+                    SQLITE_OTHER
+                };
+                self.sqlite_step(token);
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether `byte` ends the statement.
+    fn ends_at(&mut self, byte: u8, class: ByteClass) -> bool {
+        match self.dialect {
+            SqlDialect::Postgres => {
+                if class == ByteClass::Code {
+                    match byte {
+                        b'(' => self.paren_depth += 1,
+                        b')' => self.paren_depth = self.paren_depth.saturating_sub(1),
+                        b';' => return self.paren_depth == 0 && self.begin_depth == 0,
+                        _ => {}
+                    }
+                }
+                false
+            }
+            SqlDialect::Mysql => {
+                if class != ByteClass::Code {
+                    self.recent.clear();
+                    return false;
+                }
+                if !self.custom_delimiter() {
+                    return byte == b';';
+                }
+                self.recent.push_back(byte);
+                if self.recent.len() > self.delimiter.len() {
+                    self.recent.pop_front();
+                }
+                self.recent.iter().eq(self.delimiter.iter())
+            }
+            SqlDialect::Sqlite => self.sqlite_byte(byte, class),
+        }
+    }
+
+    /// Forgets the statement that ended; the mysql delimiter stays.
+    fn reset(&mut self) {
+        self.paren_depth = 0;
+        self.begin_depth = 0;
+        self.lead = [Lead::Other; 4];
+        self.words = 0;
+        self.recent.clear();
+    }
+
+    /// psql's test for `CREATE [OR REPLACE] {FUNCTION | PROCEDURE}`.
+    fn in_create_routine(&self) -> bool {
+        matches!(
+            self.lead,
+            [Lead::Create, Lead::Routine, ..]
+                | [Lead::Create, Lead::Or, Lead::Replace, Lead::Routine]
+        )
+    }
+
+    fn sqlite_byte(&mut self, byte: u8, class: ByteClass) -> bool {
+        if class == ByteClass::CommentStart {
+            // The `-` or `/` before opened a comment, which counts as space.
+            self.sqlite_dash = false;
+            return false;
+        }
+        self.sqlite_flush_dash();
+        let token = match class {
+            ByteClass::Comment => return false,
+            ByteClass::Literal => SQLITE_OTHER,
+            _ => match byte {
+                b';' => SQLITE_SEMI,
+                b'-' | b'/' => {
+                    self.sqlite_dash = true;
+                    return false;
+                }
+                // Words are counted whole, when they end.
+                b if b.is_ascii_whitespace() || is_ident_byte(b) => return false,
+                _ => SQLITE_OTHER,
+            },
+        };
+        self.sqlite_step(token);
+        token == SQLITE_SEMI && self.sqlite == SQLITE_START
+    }
+
+    fn sqlite_flush_dash(&mut self) {
+        if std::mem::take(&mut self.sqlite_dash) {
+            self.sqlite_step(SQLITE_OTHER);
+        }
+    }
+
+    fn sqlite_step(&mut self, token: usize) {
+        self.sqlite = SQLITE_TRANSITIONS[usize::from(self.sqlite)][token];
     }
 }
 

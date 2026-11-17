@@ -556,6 +556,51 @@ mod tests {
     }
 
     #[test]
+    fn test_postgres_sql_function_bodies_are_one_statement() {
+        // pg_dump writes SQL-standard bodies this way (PostgreSQL 14 and later).
+        let function = b"CREATE OR REPLACE FUNCTION public.f(n text) RETURNS void\n    LANGUAGE sql\n    BEGIN ATOMIC\n INSERT INTO public.t (a)\n   VALUES (f.n);\n UPDATE public.t SET a = CASE WHEN true THEN 'x' END;\nEND;\n";
+        assert_passes_through(SqlDialect::Postgres, function);
+        let mut sql = function.to_vec();
+        sql.extend_from_slice(b"INSERT INTO t (a) VALUES (1);\n");
+        assert!(opens_data_block(SqlDialect::Postgres, &sql));
+    }
+
+    #[test]
+    fn test_postgres_statements_end_outside_parentheses() {
+        // pg_dump writes rules with several actions in parentheses.
+        let sql = b"CREATE RULE r AS\n    ON INSERT TO public.t DO ( INSERT INTO public.log (x)\n  VALUES (new.x);\n INSERT INTO public.log (x)\n  VALUES (new.x);\n);\n";
+        assert_passes_through(SqlDialect::Postgres, sql);
+    }
+
+    #[test]
+    fn test_mysql_delimiter_keeps_routine_bodies_whole() {
+        let sql = b"DELIMITER //\nCREATE PROCEDURE p(IN n TEXT)\nBEGIN\n  DECLARE c INT;\n  INSERT INTO users (name) VALUES (n);\n  UPDATE users SET name = 'x';\nEND//\nDELIMITER ;\n";
+        assert_passes_through(SqlDialect::Mysql, sql);
+
+        // mysqldump's form, with `;;`.
+        let sql = b"DELIMITER ;;\n/*!50003 CREATE*/ /*!50003 TRIGGER t AFTER INSERT ON users FOR EACH ROW BEGIN INSERT INTO audit (n) VALUES (NEW.name); END */;;\nCREATE PROCEDURE p()\nBEGIN INSERT INTO users (name) VALUES ('x'); END ;;\nDELIMITER ;\n";
+        assert_passes_through(SqlDialect::Mysql, sql);
+
+        // Back to `;`, data blocks open again.
+        let sql = b"DELIMITER $$\nSELECT 1$$\ndelimiter ;\nINSERT INTO t (a) VALUES (1);\n";
+        assert!(opens_data_block(SqlDialect::Mysql, sql));
+    }
+
+    #[test]
+    fn test_sqlite_triggers_end_at_end() {
+        // sqlite3 .dump writes the whole trigger on one line.
+        let trigger = b"CREATE TRIGGER trg AFTER UPDATE ON users BEGIN UPDATE audit SET n = CASE WHEN 1 THEN 2 END; INSERT INTO audit (n) VALUES (NEW.name); -- c\n END;\n";
+        assert_passes_through(SqlDialect::Sqlite, trigger);
+        let mut sql = trigger.to_vec();
+        sql.extend_from_slice(b"INSERT INTO t (a) VALUES (1);\n");
+        assert!(opens_data_block(SqlDialect::Sqlite, &sql));
+        assert_passes_through(
+            SqlDialect::Sqlite,
+            b"CREATE TEMP TRIGGER t BEFORE DELETE ON a BEGIN DELETE FROM b; INSERT INTO c (x) VALUES (1); END;\n",
+        );
+    }
+
+    #[test]
     fn test_values_inside_a_query_is_not_a_data_block() {
         assert_passes_through(
             SqlDialect::Postgres,
