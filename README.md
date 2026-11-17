@@ -91,21 +91,24 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 | 114bd151f8fb0
 
 GhostDump's FSM parser is designed to handle the most common SQL dump formats. The dialect is detected from the dump header (`--dialect auto`, the default) or chosen with `--dialect postgres|mysql|sqlite`. A statement ends where the client that loads the dump ends it: psql at a `;` outside parentheses and outside the `BEGIN ATOMIC ... END` body of a function, mysql at its delimiter (changed by `DELIMITER`), sqlite3 at a `;`, or at `; END;` for a trigger. The bodies of functions, procedures, triggers and rules are code: they are copied as they are.
 
-* **PostgreSQL**: `COPY ... FROM stdin;` blocks in text format and `INSERT` statements with a column list (`pg_dump --column-inserts`, also with `--rows-per-insert` and `--on-conflict-do-nothing`, and with `OVERRIDING SYSTEM VALUE` for identity columns). `pg_dump --inserts` writes no column list.
-* **MySQL**: multi-row `INSERT`, `INSERT IGNORE` and `REPLACE` statements. Rules need column names in the statements: dump with `mysqldump --complete-insert`.
-* **SQLite**: `INSERT` and `INSERT OR ...` statements with a column list. The `.dump` command of `sqlite3` never writes one, so the rows of a table with rules cannot be masked from its output yet.
+* **PostgreSQL**: `COPY ... FROM stdin;` blocks in text format and `INSERT` statements (`pg_dump --inserts` and `--column-inserts`, also with `--rows-per-insert` and `--on-conflict-do-nothing`, and with `OVERRIDING SYSTEM VALUE` for identity columns).
+* **MySQL**: multi-row `INSERT`, `INSERT IGNORE` and `REPLACE` statements, as mysqldump writes them with or without `--complete-insert`.
+* **SQLite**: `INSERT` and `INSERT OR ...` statements, as the `.dump` command of `sqlite3` writes them.
+
+An `INSERT` without a column list fills the columns of the table in order. GhostDump takes that order from the `CREATE TABLE` that comes before the rows in the same dump, as the database does: every column in PostgreSQL and MySQL (a generated one takes `DEFAULT`), every column but the generated ones in SQLite. It keeps the order of the tables with rules only, so its memory grows with the rules, not with the rows. A table is found by its name as the database tells it apart: PostgreSQL folds unquoted names to lower case and keeps quoted ones, MySQL keeps the case of table names, SQLite ignores it.
 
 Quoted names are read with their spaces and escaped quotes: `"my table"`, `` `my table` ``, `[my table]`.
 
 GhostDump fails closed: when a table has rules that cannot be applied, it stops with an error instead of writing the values unmasked. This happens when:
 
-* an `INSERT` has no column list, a `COPY ... FROM stdin` uses options such as `WITH (FORMAT csv)`, or the table name of a data block cannot be read;
+* an `INSERT` has no column list and the dump does not show the columns with certainty: no `CREATE TABLE` for the table comes before (a data-only dump, such as `sqlite3`'s `.dump --data-only` or `mysqldump --no-create-info`), its `CREATE TABLE` does not list them all (`AS SELECT`, `LIKE`, `INHERITS`, `PARTITION OF`, `OF`, MySQL `INVISIBLE` columns), or a later statement may have changed them (`ALTER TABLE ... ADD COLUMN`, `DROP COLUMN`, `RENAME`, `DROP TABLE`);
+* a `COPY ... FROM stdin` uses options such as `WITH (FORMAT csv)`, or the table name of a data block cannot be read;
 * a statement that writes data in another form names a table with rules: `INSERT ... SELECT`, MySQL's `INSERT ... SET`, `UPDATE`, `DELETE`, `MERGE`, `LOAD DATA`, `COPY ... FROM 'file'`, `CREATE TABLE ... AS SELECT`, `SELECT ... INTO`, and `WITH` holding any of these. The check is by name, so a column or keyword spelt like such a table stops the run too. pg_dump, mysqldump and sqlite3 never write these statements;
 * the clause after the rows of an `INSERT` into a table with rules holds a value, as `ON DUPLICATE KEY UPDATE name = 'x'` does (`ON CONFLICT DO NOTHING` holds none).
 
 Rows, and the statements GhostDump holds to check them, also stop the run when they are larger than `--max-row-size` (256 MiB by default).
 
-What GhostDump does not see: data that reaches a table through code (the body of a function, procedure, trigger or rule, a `DO` block, a prepared statement, a variable), statements inside MySQL version comments (`/*! ... */`), and PostgreSQL large objects, which pg_dump writes as `SELECT pg_catalog.lowrite(...)`. Dump with `pg_dump --no-large-objects` (`-B`) when large objects hold personal data.
+What GhostDump does not see: data that reaches a table through code (the body of a function, procedure, trigger or rule, a `DO` block, a prepared statement, a variable), statements inside MySQL version comments (`/*! ... */`), which may also change the columns of a table, and PostgreSQL large objects, which pg_dump writes as `SELECT pg_catalog.lowrite(...)`. Dump with `pg_dump --no-large-objects` (`-B`) when large objects hold personal data.
 
 ---
 
