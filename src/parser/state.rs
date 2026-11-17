@@ -380,7 +380,12 @@ impl NormalState {
             {
                 FirstWord::Delimiter
             }
-            _ if word.is_any(&["update", "delete", "merge", "with", "select", "load"]) => {
+            // Statements that may write data, and those that change tables,
+            // whose column order an INSERT without a column list relies on.
+            _ if word.is_any(&[
+                "update", "delete", "merge", "with", "select", "load", "alter", "drop", "rename",
+            ]) =>
+            {
                 FirstWord::Handle(Handling::Hold)
             }
             _ if word.is("create") => FirstWord::Handle(Handling::AfterCreate),

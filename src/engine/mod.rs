@@ -18,8 +18,7 @@ use crate::engine::config::{CompiledColumn, CompiledConfig};
 use crate::engine::sink::{MaskingPlan, ParallelSink, RowContext, SequentialSink, Sink};
 use crate::parser::state::{InsertFormat, SqlDialect};
 use crate::parser::{
-    DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SqlEvent, SqlParser, has_values, may_write,
-    names_in, statement_keyword,
+    DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SqlEvent, SqlParser, Statement, has_values,
 };
 
 /// How a dump is processed.
@@ -263,7 +262,9 @@ impl AnonymizerEngine {
                     SqlEvent::DefaultStatement(b) => sink.write(&[b])?,
                     SqlEvent::Passthrough(bytes) => sink.write(&bytes)?,
                     SqlEvent::Statement(bytes) => {
-                        if let Err(e) = self.check_statement(&bytes, dialect) {
+                        if !self.config.tables.is_empty()
+                            && let Err(e) = self.check_statement(&Statement::parse(&bytes, dialect))
+                        {
                             return stop(sink, e);
                         }
                         sink.write(&bytes)?;
@@ -345,7 +346,9 @@ impl AnonymizerEngine {
             match parser.finish() {
                 Remainder::Bytes(rest) => sink.write(&rest)?,
                 Remainder::Statement(rest) => {
-                    if let Err(e) = self.check_statement(&rest, dialect) {
+                    if !self.config.tables.is_empty()
+                        && let Err(e) = self.check_statement(&Statement::parse(&rest, dialect))
+                    {
                         return stop(sink, e);
                     }
                     sink.write(&rest)?;
@@ -420,11 +423,12 @@ impl AnonymizerEngine {
     /// [`SqlEvent::Statement`]) when it refers to a table with rules. The
     /// check is by name, so a column or keyword spelt like such a table is
     /// refused too, which errs on the safe side.
-    fn check_statement(&self, statement: &[u8], dialect: SqlDialect) -> io::Result<()> {
-        if self.config.tables.is_empty() || !may_write(statement, dialect) {
+    fn check_statement(&self, statement: &Statement) -> io::Result<()> {
+        if !statement.may_write() {
             return Ok(());
         }
-        let Some(key) = names_in(statement, dialect)
+        let Some(key) = statement
+            .names()
             .iter()
             .find_map(|parts| self.rules_named(parts))
         else {
@@ -435,7 +439,7 @@ impl AnonymizerEngine {
              a form GhostDump cannot mask (only the rows of INSERT ... VALUES and \
              COPY ... FROM stdin are masked). Remove the statement from the dump, or the \
              rules of the table",
-            statement_keyword(statement, dialect)
+            statement.keyword()
         )))
     }
 

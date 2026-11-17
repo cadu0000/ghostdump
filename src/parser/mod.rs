@@ -6,8 +6,7 @@ use std::fmt;
 use std::sync::Arc;
 
 pub use schema::{
-    HeaderMetadata, detect_dialect, extract_metadata, has_values, may_write, names_in,
-    statement_keyword,
+    HeaderMetadata, Statement, TableChange, TableName, detect_dialect, extract_metadata, has_values,
 };
 pub use state::{InsertFormat, Remainder, SqlDialect};
 
