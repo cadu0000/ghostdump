@@ -81,8 +81,8 @@ impl RandomizedResponse {
         rng: &mut impl Rng,
         stats: &mut MaskStats,
     ) -> SqlValue {
-        let truth = value.as_str().map(str::trim).and_then(|text| {
-            let found = self.categories.iter().position(|c| c == text);
+        let truth = value.as_bytes().map(trimmed).and_then(|bytes| {
+            let found = self.categories.iter().position(|c| c.as_bytes() == bytes);
             if found.is_none() {
                 stats.outside_categories += 1;
             }
@@ -99,7 +99,16 @@ impl RandomizedResponse {
                 Some(_) => {}
             }
         };
-        SqlValue::Text(self.categories[index].clone())
+        SqlValue::Text(self.categories[index].as_bytes().to_vec())
+    }
+}
+
+/// `bytes` without the whitespace around it: Unicode whitespace for UTF-8
+/// text, ASCII whitespace for other bytes.
+fn trimmed(bytes: &[u8]) -> &[u8] {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.trim().as_bytes(),
+        Err(_) => bytes.trim_ascii(),
     }
 }
 
@@ -168,6 +177,18 @@ mod tests {
         for share in unknown.iter().chain(&null) {
             assert!((share - 1.0 / 3.0).abs() < 5.0 * sd, "{share}");
         }
+    }
+
+    #[test]
+    fn test_values_are_compared_by_their_bytes() {
+        let rr = RandomizedResponse::new(64.0, vec!["São Paulo".into(), "Natal".into()]).unwrap();
+        let (kept, stats) = shares(&rr, SqlValue::Text(" São Paulo\u{a0}".into()), 100);
+        assert_eq!((kept[0], stats.outside_categories), (1.0, 0));
+        let (kept, stats) = shares(&rr, SqlValue::Text(b" Natal\t".to_vec()), 100);
+        assert_eq!((kept[1], stats.outside_categories), (1.0, 0));
+        // "São Paulo" in Latin-1 is not the category, which is UTF-8.
+        let (_, stats) = shares(&rr, SqlValue::Text(b"S\xe3o Paulo".to_vec()), 100);
+        assert_eq!(stats.outside_categories, 100);
     }
 
     #[test]

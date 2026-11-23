@@ -35,7 +35,7 @@ pub fn decode(field: &[u8]) -> SqlValue {
         return SqlValue::Null;
     }
     if !field.contains(&b'\\') {
-        return SqlValue::Text(String::from_utf8_lossy(field).into_owned());
+        return SqlValue::Text(field.to_vec());
     }
 
     let mut out = Vec::with_capacity(field.len());
@@ -80,7 +80,7 @@ pub fn decode(field: &[u8]) -> SqlValue {
             other => out.push(other),
         }
     }
-    SqlValue::Text(String::from_utf8_lossy(&out).into_owned())
+    SqlValue::Text(out)
 }
 
 fn hex_value(byte: u8) -> u8 {
@@ -92,10 +92,9 @@ fn hex_value(byte: u8) -> u8 {
 }
 
 pub fn encode(value: &SqlValue, out: &mut impl Write) -> io::Result<()> {
-    let Some(text) = value.as_str() else {
+    let Some(bytes) = value.as_bytes() else {
         return out.write_all(b"\\N");
     };
-    let bytes = text.as_bytes();
     let mut start = 0;
     for (i, &byte) in bytes.iter().enumerate() {
         let escaped: &[u8] = match byte {
@@ -134,6 +133,16 @@ mod tests {
         assert_eq!(decode(b"\\N"), SqlValue::Null);
         assert_eq!(decode(b"a\\tb\\\\c\\n"), SqlValue::Text("a\tb\\c\n".into()));
         assert_eq!(decode(b"\\101\\x42"), SqlValue::Text("AB".into()));
+    }
+
+    #[test]
+    fn test_bytes_that_are_not_utf8_are_kept() {
+        assert_eq!(decode(b"Jos\xe9"), SqlValue::Text(b"Jos\xe9".to_vec()));
+        assert_eq!(decode(b"\\351\\xff"), SqlValue::Text(vec![0xe9, 0xff]));
+        let value = SqlValue::Text(vec![0xe9, b'\t', 0xff]);
+        let mut out = Vec::new();
+        encode(&value, &mut out).unwrap();
+        assert_eq!(decode(&out), value);
     }
 
     #[test]

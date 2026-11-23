@@ -49,8 +49,7 @@ pub fn decode(field: &[u8], dialect: SqlDialect) -> SqlValue {
     if field.eq_ignore_ascii_case(b"NULL") {
         return SqlValue::Null;
     }
-    string_literal(field, dialect)
-        .unwrap_or_else(|| SqlValue::Raw(String::from_utf8_lossy(field).into_owned()))
+    string_literal(field, dialect).unwrap_or_else(|| SqlValue::Raw(field.to_vec()))
 }
 
 /// The value of a string literal, or `None` if `field` is not one.
@@ -90,7 +89,7 @@ fn string_literal(field: &[u8], dialect: SqlDialect) -> Option<SqlValue> {
             i += 1;
         }
     }
-    Some(SqlValue::Text(String::from_utf8_lossy(&out).into_owned()))
+    Some(SqlValue::Text(out))
 }
 
 /// MySQL string prefixes: `N'...'` and character set introducers
@@ -150,13 +149,12 @@ static ESCAPED: [u8; 256] = {
 pub fn encode(value: &SqlValue, dialect: SqlDialect, out: &mut impl Write) -> io::Result<()> {
     match value {
         SqlValue::Null => out.write_all(b"NULL"),
-        SqlValue::Raw(text) => out.write_all(text.as_bytes()),
-        SqlValue::Text(text) => quote(text, dialect, out),
+        SqlValue::Raw(bytes) => out.write_all(bytes),
+        SqlValue::Text(bytes) => quote(bytes, dialect, out),
     }
 }
 
-fn quote(text: &str, dialect: SqlDialect, out: &mut impl Write) -> io::Result<()> {
-    let bytes = text.as_bytes();
+fn quote(bytes: &[u8], dialect: SqlDialect, out: &mut impl Write) -> io::Result<()> {
     // PostgreSQL: an E'' string reads the same whatever standard_conforming_strings says.
     let postgres_escape = dialect == SqlDialect::Postgres && bytes.contains(&b'\\');
     out.write_all(if postgres_escape { b"E'" } else { b"'" })?;
@@ -233,6 +231,31 @@ mod tests {
 
         let lite = SqlDialect::Sqlite;
         assert_eq!(decode(b"'a\\'", lite), SqlValue::Text("a\\".into()));
+    }
+
+    #[test]
+    fn test_bytes_that_are_not_utf8_are_kept() {
+        // Latin-1 text, as pg_dump writes it from a LATIN1 database.
+        assert_eq!(
+            decode(b"'Jos\xe9'", SqlDialect::Postgres),
+            SqlValue::Text(b"Jos\xe9".to_vec())
+        );
+        // A binary column, as mysqldump writes it without --hex-blob: the
+        // first byte is escaped because it would start a UTF-8 sequence.
+        assert_eq!(
+            decode(b"_binary '\\\xe9\xff\\0\x01'", SqlDialect::Mysql),
+            SqlValue::Text(vec![0xe9, 0xff, 0, 1])
+        );
+        assert_eq!(
+            decode(b"X'e9'\xff", SqlDialect::Sqlite),
+            SqlValue::Raw(b"X'e9'\xff".to_vec())
+        );
+        let latin1 = SqlValue::Text(b"Jos\xe9 \\ '".to_vec());
+        for dialect in [SqlDialect::Postgres, SqlDialect::Mysql, SqlDialect::Sqlite] {
+            let mut out = Vec::new();
+            encode(&latin1, dialect, &mut out).unwrap();
+            assert_eq!(decode(&out, dialect), latin1, "{dialect:?}");
+        }
     }
 
     #[test]

@@ -116,7 +116,7 @@ fn run(arm: &Arm, x0: f64, x1: f64, seed: u64) -> Outcome {
             None => input + laplace_noise(b, &mut rng),
             Some(m) => {
                 let text = format!("{input:.2}");
-                let out = m.apply(SqlValue::Raw(text), &mut rng, "", &mut stats);
+                let out = m.apply(SqlValue::Raw(text.into_bytes()), &mut rng, "", &mut stats);
                 out.as_str().unwrap().parse::<f64>().unwrap()
             }
         };
