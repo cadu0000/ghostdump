@@ -6,7 +6,8 @@ use std::fmt;
 use std::sync::Arc;
 
 pub use schema::{
-    HeaderMetadata, Statement, TableChange, TableName, detect_dialect, extract_metadata, has_values,
+    HeaderMetadata, SessionSetting, Statement, TableChange, TableName, detect_dialect,
+    extract_metadata, has_values,
 };
 pub use state::{InsertFormat, Remainder, SqlDialect};
 
@@ -687,6 +688,8 @@ mod tests {
         assert_eq!(
             statements,
             [
+                // Held for the settings it may change, not because it writes.
+                "SET x = 1;",
                 "UPDATE users SET name = 'Ana';",
                 "DELETE FROM users WHERE name = 'Ana';",
                 "CREATE TEMP TABLE t AS SELECT 'Ana';",

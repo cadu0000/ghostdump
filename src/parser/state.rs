@@ -386,10 +386,12 @@ impl NormalState {
             {
                 FirstWord::Delimiter
             }
-            // Statements that may write data, and those that change tables,
-            // whose column order an INSERT without a column list relies on.
+            // Statements that may write data, those that change tables,
+            // whose column order an INSERT without a column list relies on,
+            // and SET, which may change how the rest of the dump is read.
             _ if word.is_any(&[
                 "update", "delete", "merge", "with", "select", "load", "alter", "drop", "rename",
+                "set",
             ]) =>
             {
                 FirstWord::Handle(Handling::Hold)

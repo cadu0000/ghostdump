@@ -47,6 +47,21 @@ pub enum TableChange {
     Unknown,
 }
 
+/// A `SET` that changes how the rest of a dump is read.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionSetting {
+    /// The encoding of the text that follows: `SET client_encoding` and
+    /// `SET NAMES` (PostgreSQL), `SET NAMES` and `SET CHARACTER SET`
+    /// (MySQL). `None` when the value is not a name (`DEFAULT`).
+    Encoding(Option<String>),
+    /// PostgreSQL `standard_conforming_strings`: whether a backslash is a
+    /// plain character in `'...'`. `None` for a value other than a word
+    /// for on or off.
+    StandardStrings(Option<bool>),
+    /// MySQL `sql_mode` set to a string of modes.
+    SqlMode(String),
+}
+
 /// A token of SQL text from which comments were removed.
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
@@ -434,6 +449,20 @@ impl Statement {
         names
     }
 
+    /// The settings a `SET` statement changes that decide how the rest of
+    /// the dump is read. A value taken from a variable (`SQL_MODE =
+    /// @OLD_SQL_MODE`, as mysqldump restores its settings at the end) is not
+    /// known, and is left out.
+    pub fn session_settings(&self) -> Vec<SessionSetting> {
+        if !self.starts_with(&["set"]) {
+            return Vec::new();
+        }
+        split_outside_parentheses(&self.tokens[1..])
+            .into_iter()
+            .filter_map(session_setting)
+            .collect()
+    }
+
     /// What the statement changes in the columns of tables, if it creates,
     /// alters, drops or renames one.
     pub fn table_change(&self) -> Option<TableChange> {
@@ -774,6 +803,73 @@ fn keeps_columns(action: &[Token]) -> bool {
         ]
         .iter()
         .any(|word| first.is_word(word))
+    }
+}
+
+/// One assignment of a `SET`: `[@@][scope.]name {= | TO} value`, `NAMES
+/// value` or `CHARACTER SET value`. A user variable (`@name`) is not a
+/// setting.
+fn session_setting(tokens: &[Token]) -> Option<SessionSetting> {
+    let mut at = 0;
+    if tokens.first() == Some(&Token::Symbol(b'@')) {
+        if tokens.get(1) != Some(&Token::Symbol(b'@')) {
+            return None;
+        }
+        at = 2;
+        // `@@SESSION.sql_mode`
+        if tokens.get(at + 1) == Some(&Token::Symbol(b'.')) {
+            at += 2;
+        }
+    }
+    if tokens.get(at).is_some_and(|token| {
+        ["session", "local", "global", "persist", "persist_only"]
+            .iter()
+            .any(|word| token.is_word(word))
+    }) {
+        at += 1;
+    }
+
+    let name = tokens.get(at)?;
+    let value = |at: usize| tokens.get(at).and_then(setting_value);
+    if name.is_word("names") || name.is_word("charset") {
+        return Some(SessionSetting::Encoding(value(at + 1)));
+    }
+    if name.is_word("character") && tokens.get(at + 1)?.is_word("set") {
+        return Some(SessionSetting::Encoding(value(at + 2)));
+    }
+    let value_at = match tokens.get(at + 1)? {
+        Token::Symbol(b'=') => at + 2,
+        token if token.is_word("to") => at + 2,
+        _ => return None,
+    };
+    if name.is_word("client_encoding") {
+        Some(SessionSetting::Encoding(value(value_at)))
+    } else if name.is_word("standard_conforming_strings") {
+        let on = value(value_at).and_then(|value| match value.to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" => Some(true),
+            "off" | "false" | "no" => Some(false),
+            _ => None,
+        });
+        Some(SessionSetting::StandardStrings(on))
+    } else if name.is_word("sql_mode") {
+        match tokens.get(value_at)? {
+            Token::Quoted {
+                quote: b'\'' | b'"',
+                text,
+            } => Some(SessionSetting::SqlMode(text.clone())),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// A setting written as a word or a quoted string; `DEFAULT` is not one.
+fn setting_value(token: &Token) -> Option<String> {
+    match token {
+        Token::Word(word) if !word.eq_ignore_ascii_case("default") => Some(word.clone()),
+        Token::Quoted { text, .. } => Some(text.clone()),
+        _ => None,
     }
 }
 
@@ -1227,6 +1323,64 @@ mod tests {
             changed("RENAME TABLE `a` TO `b`, `c` TO `d`;", mysql),
             ["a", "b", "c", "d"]
         );
+    }
+
+    #[test]
+    fn test_session_settings() {
+        use SessionSetting::{Encoding, SqlMode, StandardStrings};
+        let settings =
+            |sql: &str, dialect| Statement::parse(sql.as_bytes(), dialect).session_settings();
+        let name = |name: &str| Encoding(Some(name.to_string()));
+        let pg = SqlDialect::Postgres;
+        assert_eq!(
+            settings("SET client_encoding = 'LATIN1';", pg),
+            [name("LATIN1")]
+        );
+        assert_eq!(
+            settings("SET SESSION client_encoding TO utf8;", pg),
+            [name("utf8")]
+        );
+        assert_eq!(settings("SET NAMES 'WIN1252';", pg), [name("WIN1252")]);
+        assert_eq!(
+            settings("SET client_encoding TO DEFAULT;", pg),
+            [Encoding(None)]
+        );
+        assert_eq!(
+            settings("SET standard_conforming_strings = on;", pg),
+            [StandardStrings(Some(true))]
+        );
+        assert_eq!(
+            settings("SET standard_conforming_strings TO 'off';", pg),
+            [StandardStrings(Some(false))]
+        );
+        assert_eq!(
+            settings("SET standard_conforming_strings = 0;", pg),
+            [StandardStrings(None)]
+        );
+        assert!(settings("SET statement_timeout = 0;", pg).is_empty());
+
+        // mysqldump's settings, held from their first word inside `/*!...*/`.
+        let my = SqlDialect::Mysql;
+        assert_eq!(settings("SET NAMES utf8mb4 */;", my), [name("utf8mb4")]);
+        assert_eq!(
+            settings("SET NAMES latin1 COLLATE latin1_swedish_ci;", my),
+            [name("latin1")]
+        );
+        assert_eq!(settings("SET CHARACTER SET cp932;", my), [name("cp932")]);
+        assert_eq!(
+            settings(
+                "SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;",
+                my
+            ),
+            [SqlMode("NO_AUTO_VALUE_ON_ZERO".into())]
+        );
+        assert_eq!(
+            settings("SET @@SESSION.sql_mode = 'ANSI,NO_BACKSLASH_ESCAPES';", my),
+            [SqlMode("ANSI,NO_BACKSLASH_ESCAPES".into())]
+        );
+        assert!(settings("SET SQL_MODE=@OLD_SQL_MODE */;", my).is_empty());
+        assert!(settings("SET character_set_client = @saved_cs_client */;", my).is_empty());
+        assert!(settings("SELECT 1;", my).is_empty());
     }
 
     #[test]

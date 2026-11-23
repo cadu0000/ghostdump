@@ -20,7 +20,8 @@ use crate::engine::config::{CompiledColumn, CompiledConfig};
 use crate::engine::sink::{MaskingPlan, ParallelSink, RowContext, SequentialSink, Sink};
 use crate::parser::state::{InsertFormat, SqlDialect};
 use crate::parser::{
-    DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SqlEvent, SqlParser, Statement, has_values,
+    DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SessionSetting, SqlEvent, SqlParser,
+    Statement, has_values,
 };
 
 /// How a dump is processed.
@@ -291,7 +292,9 @@ impl AnonymizerEngine {
                     SqlEvent::Statement(bytes) => {
                         if !self.config.tables.is_empty() {
                             let statement = Statement::parse(&bytes, dialect);
-                            if let Err(e) = self.check_statement(&statement) {
+                            if let Err(e) = check_settings(&statement)
+                                .and_then(|()| self.check_statement(&statement))
+                            {
                                 return stop(sink, e);
                             }
                             if let Some(change) = statement.table_change()
@@ -558,6 +561,65 @@ fn count_rows(rows_by_table: &mut BTreeMap<String, usize>, table: &str, rows: us
 }
 
 /// An error that stops the run because the data cannot be handled safely.
+/// Refuses, when there are rules, a `SET` after which GhostDump would read
+/// the dump differently from the database: text in an encoding other than
+/// UTF-8, or strings whose backslashes do not work the way the lexer takes
+/// them.
+fn check_settings(statement: &Statement) -> io::Result<()> {
+    for setting in statement.session_settings() {
+        match setting {
+            SessionSetting::Encoding(name) if !name.as_deref().is_some_and(is_utf8) => {
+                return Err(refuse(format!(
+                    "the dump sets its encoding to {}; with rules, GhostDump reads only UTF-8 \
+                     dumps: names and values in another encoding would not match the rules, and \
+                     generated text would be written in UTF-8. Dump again in UTF-8 \
+                     (pg_dump -E UTF8, mysqldump --default-character-set=utf8mb4)",
+                    name.map_or("its default".to_string(), |name| format!("`{name}`"))
+                )));
+            }
+            SessionSetting::StandardStrings(on) if on != Some(true) => {
+                return Err(refuse(
+                    "the dump sets standard_conforming_strings to off (or to a value GhostDump \
+                     does not read): backslashes would then escape quotes in '...' strings, \
+                     which GhostDump reads as standard strings, so a row could be misread. \
+                     Dump with standard_conforming_strings on, as pg_dump does"
+                        .into(),
+                ));
+            }
+            SessionSetting::SqlMode(modes)
+                if modes
+                    .split(',')
+                    .any(|mode| mode.trim().eq_ignore_ascii_case("no_backslash_escapes")) =>
+            {
+                return Err(refuse(
+                    "the dump sets NO_BACKSLASH_ESCAPES in sql_mode: backslashes would then be \
+                     plain characters in strings, which GhostDump reads as escapes, so a row \
+                     could be misread. Dump with mysqldump, which escapes with backslashes and \
+                     sets sql_mode itself"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether an encoding name means UTF-8, or ASCII, which is part of it.
+/// PostgreSQL ignores case and every character but letters and digits in
+/// encoding names, and has `UNICODE` as an alias of `UTF8`.
+fn is_utf8(name: &str) -> bool {
+    let name: String = name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    matches!(
+        name.as_str(),
+        "utf8" | "utf8mb3" | "utf8mb4" | "unicode" | "ascii"
+    )
+}
+
 fn refuse(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -1173,6 +1235,47 @@ mod tests {
             let (_, one) = run_threads(THREAD_RULES, &input, 1, Some(limit));
             let (_, four) = run_threads(THREAD_RULES, &input, 4, Some(limit));
             assert!(one == four, "limit {limit}");
+        }
+    }
+
+    #[test]
+    fn test_settings_that_change_how_the_dump_is_read_are_refused() {
+        let check = |sql: &str, dialect| check_settings(&Statement::parse(sql.as_bytes(), dialect));
+        let pg = SqlDialect::Postgres;
+        for read in [
+            "SET client_encoding = 'UTF8';",
+            "SET client_encoding = 'utf_8';",
+            "SET NAMES 'Unicode';",
+            "SET standard_conforming_strings = on;",
+            "SET search_path = '';",
+        ] {
+            assert!(check(read, pg).is_ok(), "{read}");
+        }
+        for refused in [
+            "SET client_encoding = 'LATIN1';",
+            "SET client_encoding = 'SQL_ASCII';",
+            "SET client_encoding TO DEFAULT;",
+            "SET standard_conforming_strings = off;",
+        ] {
+            assert!(check(refused, pg).is_err(), "{refused}");
+        }
+
+        let my = SqlDialect::Mysql;
+        for read in [
+            "SET NAMES utf8mb4 */;",
+            "SET NAMES utf8 */;",
+            "SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;",
+            "SET SQL_MODE=@OLD_SQL_MODE */;",
+        ] {
+            assert!(check(read, my).is_ok(), "{read}");
+        }
+        for refused in [
+            "SET NAMES latin1 */;",
+            "SET NAMES sjis;",
+            "SET CHARACTER SET binary;",
+            "SET sql_mode = 'ANSI,no_backslash_escapes';",
+        ] {
+            assert!(check(refused, my).is_err(), "{refused}");
         }
     }
 
