@@ -29,6 +29,11 @@ const CONSISTENT_RULES: &str = concat!(
 const RR_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rr_rules.toml");
 const DP_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dp_rules.toml");
 const F64_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/f64_rules.toml");
+const MYSQL_BINARY: &[u8] = include_bytes!("fixtures/mysqldump_binary.sql");
+const BINARY_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/binary_rules.toml"
+);
 const TYPO_RULES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/typo_rules.toml"
@@ -513,4 +518,32 @@ fn pg_dump_with_inserts_is_masked() {
     ] {
         assert!(!stdout.contains(value), "{value} in {stdout}");
     }
+}
+
+/// mysqldump writes binary columns as raw bytes (`_binary '...'`), most of
+/// them not UTF-8. Each value is pseudonymized from its own bytes, so values
+/// that differ only there keep different pseudonyms.
+#[test]
+fn binary_values_keep_distinct_pseudonyms() {
+    let output = run(&["-c", BINARY_RULES], Some(GOLDEN_SECRET), MYSQL_BINARY);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let pseudonym = |bytes: &[u8]| ghostdump::engine::mask::hmac_hash(bytes, GOLDEN_SECRET);
+    let tokens: [&[u8]; 3] = [
+        &[0xe9, 0xff, 0, 1],
+        &[0xe8, 0xff, 0, 1],
+        &[b'A', 0xff, 0, 1],
+    ];
+    let names = ["José", "Josè", "Ana"];
+    for (id, (name, token)) in names.iter().zip(tokens).enumerate() {
+        let row = format!(
+            "({},'{}','{}')",
+            id + 1,
+            pseudonym(name.as_bytes()),
+            pseudonym(token)
+        );
+        assert!(stdout.contains(&row), "{row} not in {stdout}");
+    }
+    assert_ne!(pseudonym(tokens[0]), pseudonym(tokens[1]));
 }
