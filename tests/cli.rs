@@ -30,6 +30,11 @@ const RR_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rr_r
 const DP_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dp_rules.toml");
 const F64_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/f64_rules.toml");
 const MYSQL_BINARY: &[u8] = include_bytes!("fixtures/mysqldump_binary.sql");
+const PG_LATIN1: &[u8] = include_bytes!("fixtures/pg_dump_latin1.sql");
+const LATIN1_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/latin1_rules.toml"
+);
 const BINARY_RULES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/binary_rules.toml"
@@ -546,4 +551,40 @@ fn binary_values_keep_distinct_pseudonyms() {
         assert!(stdout.contains(&row), "{row} not in {stdout}");
     }
     assert_ne!(pseudonym(tokens[0]), pseudonym(tokens[1]));
+}
+
+/// pg_dump writes a LATIN1 database in LATIN1 unless told otherwise. With
+/// rules the run stops at that setting, before any row; without rules the
+/// dump is copied as it is.
+#[test]
+fn dumps_in_another_encoding_are_refused_with_rules() {
+    let refused = run(&["-c", LATIN1_RULES], Some(GOLDEN_SECRET), PG_LATIN1);
+    let message = stderr(&refused);
+    assert!(!refused.status.success());
+    assert!(message.contains("`LATIN1`"), "{message}");
+    assert!(message.contains("pg_dump -E UTF8"), "{message}");
+    assert!(PG_LATIN1.starts_with(&refused.stdout));
+    assert!(!String::from_utf8_lossy(&refused.stdout).contains("COPY"));
+
+    let copied = run(&[], None, PG_LATIN1);
+    assert!(copied.status.success(), "stderr: {}", stderr(&copied));
+    assert_eq!(copied.stdout, PG_LATIN1);
+}
+
+/// mysql runs what `/*! ... */` holds, and ends statements at a `;` inside
+/// it, so rows there are masked like any other.
+#[test]
+fn rows_inside_mysql_version_comments_are_masked() {
+    let dump = b"/*!40101 SET NAMES utf8mb4 */;\n/*!40000 INSERT INTO customers (name, email) VALUES ('Ana', 'ana@example.com') */;\n";
+    let output = run(&["-c", MYSQL_RULES, "--dialect", "mysql"], None, dump);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(
+        stdout.contains(
+            "/*!40000 INSERT INTO customers (name, email) VALUES ('Masked O\\'Name', NULL) */;"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("ana@example.com"));
 }
