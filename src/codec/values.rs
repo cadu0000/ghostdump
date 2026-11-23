@@ -93,15 +93,29 @@ fn string_literal(field: &[u8], dialect: SqlDialect) -> Option<SqlValue> {
     Some(SqlValue::Text(String::from_utf8_lossy(&out).into_owned()))
 }
 
-/// MySQL string prefixes: `N'...'` and character set introducers (`_utf8mb4'...'`).
+/// MySQL string prefixes: `N'...'` and character set introducers
+/// (`_utf8mb4'...'`), which may be followed by spaces (mysqldump writes
+/// `_binary '...'`).
 fn mysql_prefix_len(field: &[u8]) -> usize {
     match field.first() {
         Some(b'n' | b'N') if field.get(1) == Some(&b'\'') => 1,
-        Some(b'_') => field
-            .iter()
-            .position(|&b| b == b'\'' || b == b'"')
-            .filter(|&pos| field[1..pos].iter().all(|b| b.is_ascii_alphanumeric()))
-            .unwrap_or(0),
+        Some(b'_') => {
+            let name = field[1..]
+                .iter()
+                .take_while(|b| b.is_ascii_alphanumeric())
+                .count();
+            let quote = 1
+                + name
+                + field[1 + name..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_whitespace())
+                    .count();
+            if name > 0 && matches!(field.get(quote), Some(b'\'' | b'"')) {
+                quote
+            } else {
+                0
+            }
+        }
         _ => 0,
     }
 }
@@ -210,6 +224,11 @@ mod tests {
         let my = SqlDialect::Mysql;
         assert_eq!(decode(b"'O\\'Hara'", my), SqlValue::Text("O'Hara".into()));
         assert_eq!(decode(b"_utf8mb4'x'", my), SqlValue::Text("x".into()));
+        assert_eq!(decode(b"_binary 'x'", my), SqlValue::Text("x".into()));
+        assert_eq!(
+            decode(b"_binary 0x41", my),
+            SqlValue::Raw("_binary 0x41".into())
+        );
         assert_eq!(decode(b"N'y'", my), SqlValue::Text("y".into()));
 
         let lite = SqlDialect::Sqlite;
