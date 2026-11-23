@@ -633,6 +633,31 @@ mod tests {
     }
 
     #[test]
+    fn test_mysql_version_comments_are_read_as_code() {
+        // mysql runs what `/*!` holds, and ends statements inside it.
+        let my = SqlDialect::Mysql;
+        assert!(opens_data_block(
+            my,
+            b"/*!40000 INSERT INTO users (name) VALUES ('x') */;\n"
+        ));
+        assert!(opens_data_block(
+            my,
+            b"/*!40000 SELECT 1; */ INSERT INTO users (name) VALUES ('x');\n"
+        ));
+        let (statements, _) = held(my, b"/*!40000 UPDATE users SET name = 'x' */;\n");
+        assert_eq!(statements, ["UPDATE users SET name = 'x' */;"]);
+        // MariaDB's `/*M!` and optimizer hints stay comments.
+        assert!(!opens_data_block(
+            my,
+            b"/*M!100000 INSERT INTO users (name) VALUES ('x') */;\n"
+        ));
+        assert!(!opens_data_block(
+            my,
+            b"/*+ INSERT INTO users (name) VALUES ('x') */;\n"
+        ));
+    }
+
+    #[test]
     fn test_mysql_data_with_a_custom_delimiter_is_held() {
         let sql = b"DELIMITER //\nINSERT INTO users (name) VALUES ('Ana')//\nDELIMITER ;\n";
         let (statements, opened) = held(SqlDialect::Mysql, sql);

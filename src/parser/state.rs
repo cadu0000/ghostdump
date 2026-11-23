@@ -69,7 +69,8 @@ const LOOKBEHIND: usize = 8;
 enum StatementPhase {
     /// Before the first token of a statement: only whitespace and comments so far.
     Start,
-    /// A `-` or `/` at statement start that may open a comment.
+    /// A `-` or `/` at statement start that may open a comment, or in MySQL
+    /// a `*` that may close a version comment.
     MaybeComment,
     /// Reading the first word of a statement.
     FirstWord,
@@ -323,7 +324,7 @@ impl NormalState {
         match self.phase {
             StatementPhase::Start => self.phase = self.after_start(byte, class),
             StatementPhase::MaybeComment => {
-                self.phase = if class == ByteClass::CommentStart {
+                self.phase = if matches!(class, ByteClass::CommentStart | ByteClass::VersionEnd) {
                     StatementPhase::Start
                 } else {
                     StatementPhase::Body
@@ -342,10 +343,15 @@ impl NormalState {
 
     fn after_start(&self, byte: u8, class: ByteClass) -> StatementPhase {
         match class {
-            ByteClass::Comment | ByteClass::CommentStart => StatementPhase::Start,
+            ByteClass::Comment | ByteClass::CommentStart | ByteClass::VersionEnd => {
+                StatementPhase::Start
+            }
             ByteClass::Literal => StatementPhase::Body,
             ByteClass::Code => match byte {
                 b'-' | b'/' => StatementPhase::MaybeComment,
+                // MySQL: the `*/` of a version comment that a delimiter
+                // inside it split from its start (`/*!40000 SELECT 1; */`).
+                b'*' if self.dialect == SqlDialect::Mysql => StatementPhase::MaybeComment,
                 b'\\' if self.dialect == SqlDialect::Postgres => StatementPhase::MetaCommand,
                 b if b.is_ascii_whitespace() => StatementPhase::Start,
                 b if b.is_ascii_alphabetic() => StatementPhase::FirstWord,
@@ -1103,7 +1109,7 @@ impl ValueState {
 /// Whitespace, comments, and a `-` or `/` that may open a comment.
 fn is_separator(byte: u8, class: ByteClass) -> bool {
     match class {
-        ByteClass::Comment | ByteClass::CommentStart => true,
+        ByteClass::Comment | ByteClass::CommentStart | ByteClass::VersionEnd => true,
         ByteClass::Literal => false,
         ByteClass::Code => byte.is_ascii_whitespace() || byte == b'-' || byte == b'/',
     }

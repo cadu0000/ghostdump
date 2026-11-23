@@ -347,8 +347,8 @@ pub fn extract_metadata(header_bytes: &[u8], dialect: SqlDialect) -> Option<Head
 pub struct Statement {
     tokens: Vec<Token>,
     dialect: SqlDialect,
-    /// MySQL: the word `INVISIBLE` appears, maybe in a version comment
-    /// (`/*!80023 INVISIBLE */`), which the tokens leave out.
+    /// MySQL: the word `INVISIBLE` appears anywhere in the text, maybe in
+    /// a version comment (`/*!80023 INVISIBLE */`).
     invisible: bool,
 }
 
@@ -825,8 +825,8 @@ fn without_comments(header: &[u8], dialect: SqlDialect) -> Vec<u8> {
     for &byte in header {
         match lexer.feed(byte) {
             ByteClass::Comment => out.push(b' '),
-            ByteClass::CommentStart => {
-                // The first byte of the opener was copied as code.
+            ByteClass::CommentStart | ByteClass::VersionEnd => {
+                // The first byte of the opener or closer was copied as code.
                 if let Some(last) = out.last_mut() {
                     *last = b' ';
                 }
