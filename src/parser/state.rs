@@ -195,6 +195,8 @@ pub struct NormalState {
     command: Option<Vec<u8>>,
     /// Whether client commands that dump tools do not write stop the run.
     refuse_commands: bool,
+    /// MySQL `USE`: the mysql client also ends it at the end of its line.
+    ends_at_line_end: bool,
 }
 
 enum Outcome {
@@ -226,6 +228,7 @@ impl NormalState {
             line_start: true,
             command: None,
             refuse_commands: false,
+            ends_at_line_end: false,
         }
     }
 
@@ -407,6 +410,8 @@ impl NormalState {
                     FirstWord::Handle(handling) => {
                         self.handling = handling;
                         held_from = Some(word.len);
+                        // mysql runs `use db` without a `;` as a client command.
+                        self.ends_at_line_end = self.dialect == SqlDialect::Mysql && word.is("use");
                     }
                 }
             } else if self.handling == Handling::AfterCreate {
@@ -445,9 +450,11 @@ impl NormalState {
             _ => {}
         }
 
-        if self.framer.ends_at(byte, class) {
+        let line_end = self.ends_at_line_end && byte == b'\n' && class != ByteClass::Literal;
+        if line_end || self.framer.ends_at(byte, class) {
             self.framer.reset();
             self.phase = StatementPhase::Start;
+            self.ends_at_line_end = false;
             return Some(Outcome::End);
         }
         held_from.map(Outcome::Hold)
@@ -514,6 +521,10 @@ impl NormalState {
                 "set",
             ]) =>
             {
+                FirstWord::Handle(Handling::Hold)
+            }
+            // MySQL `USE`, which sets the database of the table names after it.
+            _ if self.dialect == SqlDialect::Mysql && word.is("use") => {
                 FirstWord::Handle(Handling::Hold)
             }
             _ if word.is("create") => FirstWord::Handle(Handling::AfterCreate),

@@ -463,6 +463,15 @@ impl Statement {
             .collect()
     }
 
+    /// MySQL `USE name`: the database that table names without one refer
+    /// to after it.
+    pub fn used_database(&self) -> Option<String> {
+        if self.dialect != SqlDialect::Mysql || !self.starts_with(&["use"]) {
+            return None;
+        }
+        self.tokens.get(1)?.name(self.dialect).map(str::to_string)
+    }
+
     /// What the statement changes in the columns of tables, if it creates,
     /// alters, drops or renames one.
     pub fn table_change(&self) -> Option<TableChange> {
@@ -1390,6 +1399,16 @@ mod tests {
         assert!(settings("SET SQL_MODE=@OLD_SQL_MODE */;", my).is_empty());
         assert!(settings("SET character_set_client = @saved_cs_client */;", my).is_empty());
         assert!(settings("SELECT 1;", my).is_empty());
+    }
+
+    #[test]
+    fn test_used_database() {
+        let used = |sql: &str, dialect| Statement::parse(sql.as_bytes(), dialect).used_database();
+        let my = SqlDialect::Mysql;
+        assert_eq!(used("USE `shop`;", my).as_deref(), Some("shop"));
+        assert_eq!(used("use shop\n", my).as_deref(), Some("shop"));
+        assert_eq!(used("SELECT 1;", my), None);
+        assert_eq!(used("USE shop;", SqlDialect::Postgres), None);
     }
 
     #[test]

@@ -126,10 +126,13 @@ impl AnonymizerEngine {
 
     /// The columns of a data block that have rules, or `None` when no
     /// column has one (the rows are then copied as they are).
-    fn masking_plan(&self, metadata: &HeaderMetadata, columns: &[String]) -> Option<KeyedPlan<'_>> {
-        let (key, rules) = self
-            .config
-            .rules_for(metadata.schema.as_deref(), &metadata.table)?;
+    fn masking_plan(
+        &self,
+        metadata: &HeaderMetadata,
+        schema: Option<&str>,
+        columns: &[String],
+    ) -> Option<KeyedPlan<'_>> {
+        let (key, rules) = self.config.rules_for(schema, &metadata.table)?;
 
         let plan: MaskingPlan = columns
             .iter()
@@ -146,6 +149,7 @@ impl AnonymizerEngine {
         opaque: bool,
         header: &[u8],
         orders: &ColumnOrders,
+        database: Option<&str>,
     ) -> io::Result<Option<KeyedPlan<'_>>> {
         let Some(metadata) = metadata else {
             if self.config.tables.is_empty() {
@@ -159,11 +163,19 @@ impl AnonymizerEngine {
             )));
         };
         let table = &metadata.table;
+        let schema = metadata.schema.as_deref().or(database);
 
-        let has_rules = self
-            .config
-            .rules_for(metadata.schema.as_deref(), table)
-            .is_some();
+        let has_rules = self.config.rules_for(schema, table).is_some();
+        if schema.is_none()
+            && !has_rules
+            && let Some(key) = self.config.rules_named(None, table)
+        {
+            return Err(refuse(format!(
+                "the rows of table `{table}` name no schema, and its rules name one (`{key}`), \
+                 so GhostDump cannot tell whether they apply. Name the schema in the dump \
+                 (for MySQL, a USE before the rows), or write the rules for `{table}`"
+            )));
+        }
         let columns: &[String] = match &metadata.columns {
             Some(columns) => columns,
             None if !has_rules => &[],
@@ -196,7 +208,7 @@ impl AnonymizerEngine {
             },
         };
 
-        let plan = self.masking_plan(metadata, columns);
+        let plan = self.masking_plan(metadata, schema, columns);
         if opaque && plan.is_some() {
             return Err(refuse(format!(
                 "table `{table}` has rules, but its COPY uses options GhostDump cannot read \
@@ -274,6 +286,9 @@ impl AnonymizerEngine {
         let mut plan: Option<Arc<MaskingPlan>> = None;
         let mut plan_metadata: Option<Arc<HeaderMetadata>> = None;
         let mut orders = ColumnOrders::default();
+        // MySQL: the database of the last `USE`, which table names without
+        // one refer to.
+        let mut database: Option<String> = None;
         // Rules applied at least once, as (table key, column name).
         let mut used: BTreeSet<(&str, &String)> = BTreeSet::new();
 
@@ -299,8 +314,12 @@ impl AnonymizerEngine {
                             {
                                 return stop(sink, e);
                             }
+                            if let Some(name) = statement.used_database() {
+                                database = Some(name);
+                                plan_metadata = None;
+                            }
                             if let Some(change) = statement.table_change()
-                                && orders.apply(change, &self.config)
+                                && orders.apply(change, &self.config, database.as_deref())
                             {
                                 // The next header is planned again, even if
                                 // it repeats the last one.
@@ -333,6 +352,7 @@ impl AnonymizerEngine {
                                 opaque,
                                 &raw_bytes,
                                 &orders,
+                                database.as_deref(),
                             ) {
                                 Ok(Some((key, columns))) => {
                                     used.extend(
@@ -374,9 +394,12 @@ impl AnonymizerEngine {
                     }
 
                     SqlEvent::Footer(footer_bytes) => {
-                        if let Err(e) =
-                            self.check_footer(plan_metadata.as_deref(), &footer_bytes, dialect)
-                        {
+                        if let Err(e) = self.check_footer(
+                            plan_metadata.as_deref(),
+                            &footer_bytes,
+                            dialect,
+                            database.as_deref(),
+                        ) {
                             return stop(sink, e);
                         }
                         sink.write(&footer_bytes)?;
@@ -402,7 +425,12 @@ impl AnonymizerEngine {
                     partial_row: false,
                     footer,
                 } => {
-                    if let Err(e) = self.check_footer(plan_metadata.as_deref(), &footer, dialect) {
+                    if let Err(e) = self.check_footer(
+                        plan_metadata.as_deref(),
+                        &footer,
+                        dialect,
+                        database.as_deref(),
+                    ) {
                         return stop(sink, e);
                     }
                     sink.write(&footer)?;
@@ -507,6 +535,7 @@ impl AnonymizerEngine {
         metadata: Option<&HeaderMetadata>,
         footer: &[u8],
         dialect: SqlDialect,
+        database: Option<&str>,
     ) -> io::Result<()> {
         // Most footers are a bare `;`, with no byte that can start a value.
         let may_hold_values = footer
@@ -516,10 +545,8 @@ impl AnonymizerEngine {
             return Ok(());
         };
         let table = &metadata.table;
-        let has_rules = self
-            .config
-            .rules_for(metadata.schema.as_deref(), table)
-            .is_some();
+        let schema = metadata.schema.as_deref().or(database);
+        let has_rules = self.config.rules_for(schema, table).is_some();
         if has_rules && has_values(footer, dialect) {
             return Err(refuse(format!(
                 "the INSERT into table `{table}`, which has rules, writes values after its rows \

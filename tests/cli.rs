@@ -30,6 +30,11 @@ const RR_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rr_r
 const DP_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dp_rules.toml");
 const F64_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/f64_rules.toml");
 const MYSQL_BINARY: &[u8] = include_bytes!("fixtures/mysqldump_binary.sql");
+const MYSQL_DATABASES: &[u8] = include_bytes!("fixtures/mysqldump_databases.sql");
+const QUALIFIED_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/qualified_rules.toml"
+);
 const PG_LATIN1: &[u8] = include_bytes!("fixtures/pg_dump_latin1.sql");
 const LATIN1_RULES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -607,4 +612,33 @@ fn client_commands_stop_the_run_with_rules() {
     let copied = run(&[], None, dump);
     assert!(copied.status.success(), "stderr: {}", stderr(&copied));
     assert_eq!(copied.stdout, dump);
+}
+
+/// `mysqldump --databases` names the database once, in a `USE`, and the
+/// tables without it. A rule for `shopq.users` applies to them; without the
+/// `USE` the rows cannot be told apart, and the run stops.
+#[test]
+fn rules_with_a_schema_follow_mysql_use() {
+    let output = run(&["-c", QUALIFIED_RULES], None, MYSQL_DATABASES);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(
+        stdout.contains("INSERT INTO `users` VALUES (1,'MASKED');"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Ana Secret"));
+
+    let without_use: Vec<u8> = String::from_utf8_lossy(MYSQL_DATABASES)
+        .lines()
+        .filter(|line| !line.starts_with("USE "))
+        .flat_map(|line| [line.as_bytes(), b"\n"].concat())
+        .collect();
+    let refused = run(&["-c", QUALIFIED_RULES], None, &without_use);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("name no schema"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!String::from_utf8_lossy(&refused.stdout).contains("Ana Secret"));
 }

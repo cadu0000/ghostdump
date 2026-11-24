@@ -789,6 +789,18 @@ mod tests {
     }
 
     #[test]
+    fn test_mysql_use_ends_at_its_line() {
+        // mysql runs `use db` without a `;` as a client command.
+        let my = SqlDialect::Mysql;
+        let sql = b"use shop\nINSERT INTO users (name) VALUES ('x');\n";
+        let (statements, opened) = held(my, sql);
+        assert_eq!(statements, ["use shop\n"]);
+        assert!(opened);
+        let (statements, _) = held(my, b"USE `shop`; SELECT 1;\n");
+        assert_eq!(statements, ["USE `shop`;", "SELECT 1;"]);
+    }
+
+    #[test]
     fn test_mysql_data_with_a_custom_delimiter_is_held() {
         let sql = b"DELIMITER //\nINSERT INTO users (name) VALUES ('Ana')//\nDELIMITER ;\n";
         let (statements, opened) = held(SqlDialect::Mysql, sql);
