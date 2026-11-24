@@ -1270,6 +1270,14 @@ mod tests {
     }
 
     #[test]
+    fn test_settings_are_checked_in_a_statement_that_ends_the_input() {
+        let pg = SqlDialect::Postgres;
+        let unended = b"SET client_encoding = 'LATIN1'";
+        assert!(run_with(NAME_RULES, pg, unended).is_err());
+        assert_eq!(run(unended).unwrap(), unended);
+    }
+
+    #[test]
     fn test_settings_that_change_how_the_dump_is_read_are_refused() {
         let check = |sql: &str, dialect| check_settings(&Statement::parse(sql.as_bytes(), dialect));
         let pg = SqlDialect::Postgres;
