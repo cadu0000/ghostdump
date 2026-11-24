@@ -1,0 +1,5 @@
+[tables.users]
+columns = [{ name = "name", strategy = "fixed", value = "MASKED" }]
+
+[tables.visits]
+columns = [{ name = "note", strategy = "fixed", value = "MASKED" }]

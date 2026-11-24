@@ -36,6 +36,11 @@ const QUALIFIED_RULES: &str = concat!(
     "/tests/fixtures/qualified_rules.toml"
 );
 const PG_LATIN1: &[u8] = include_bytes!("fixtures/pg_dump_latin1.sql");
+const MYSQL_NBE_TRIGGER: &[u8] = include_bytes!("fixtures/mysqldump_nbe_trigger.sql");
+const TRIGGER_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/trigger_rules.toml"
+);
 const LATIN1_RULES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/latin1_rules.toml"
@@ -637,6 +642,27 @@ fn client_commands_stop_the_run_with_rules() {
     let copied = run(&[], None, dump);
     assert!(copied.status.success(), "stderr: {}", stderr(&copied));
     assert_eq!(copied.stdout, dump);
+}
+
+/// mysqldump writes the sql_mode a trigger was created with before it. A
+/// trigger created with NO_BACKSLASH_ESCAPES stops the run there: after the
+/// rows of its table, before the rows of the next one, with the way to dump
+/// the trigger apart.
+#[test]
+fn triggers_without_backslash_escapes_stop_the_run() {
+    let output = run(&["-c", TRIGGER_RULES], None, MYSQL_NBE_TRIGGER);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = stderr(&output);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("NO_BACKSLASH_ESCAPES") && stderr.contains("--skip-triggers"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("INSERT INTO `users` VALUES (1,'MASKED');"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Secret"), "{stdout}");
 }
 
 /// `mysqldump --databases` names the database once, in a `USE`, and the
