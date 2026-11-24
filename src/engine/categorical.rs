@@ -26,6 +26,8 @@ pub struct RandomizedResponse {
     /// ε as an exact fraction num / den.
     num: u128,
     den: u128,
+    /// The rule it belongs to, for the counters of `MaskStats`.
+    rule: usize,
 }
 
 impl RandomizedResponse {
@@ -52,7 +54,13 @@ impl RandomizedResponse {
             categories,
             num,
             den,
+            rule: 0,
         })
+    }
+
+    /// Names the rule whose values `apply` counts in `MaskStats`.
+    pub fn set_rule(&mut self, rule: usize) {
+        self.rule = rule;
     }
 
     pub fn epsilon(&self) -> f64 {
@@ -84,7 +92,7 @@ impl RandomizedResponse {
         let truth = value.as_bytes().map(trimmed).and_then(|bytes| {
             let found = self.categories.iter().position(|c| c.as_bytes() == bytes);
             if found.is_none() {
-                stats.outside_categories += 1;
+                stats.count_outside_category(self.rule);
             }
             found
         });

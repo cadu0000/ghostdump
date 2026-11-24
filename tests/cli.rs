@@ -424,7 +424,10 @@ fn non_numeric_dp_values_are_counted_once() {
 
     assert!(output.status.success(), "stderr: {stderr}");
     assert_eq!(stderr.matches("were not numbers").count(), 1, "{stderr}");
-    assert!(stderr.contains("2 value(s)"), "{stderr}");
+    assert!(
+        stderr.contains("column `users.salary`: 2 value(s)"),
+        "{stderr}"
+    );
 }
 
 /// Regenerate after an intended change (a new `fake` version, for example):
@@ -542,7 +545,11 @@ fn randomized_response_writes_only_declared_categories() {
         let value = &stdout[start..start + stdout[start..].find(')').unwrap()];
         assert!(categories.contains(&value), "{value}");
     }
-    assert!(stderr(&output).contains("1 value(s) of randomized_response columns"));
+    assert!(
+        stderr(&output).contains("column `users.status`: 1 value(s) were not among the categories"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]

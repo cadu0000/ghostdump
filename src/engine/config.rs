@@ -63,6 +63,8 @@ pub struct CompiledConfig {
 
 #[derive(Debug)]
 pub struct CompiledColumn {
+    /// Tells the rules apart in counters, which hold no names.
+    pub id: usize,
     pub name: String,
     pub null_policy: NullPolicy,
     pub masker: Masker,
@@ -96,6 +98,7 @@ impl Config {
     /// Validates every rule and builds its masker, before any data is read.
     pub fn compile(self) -> Result<CompiledConfig, ConfigError> {
         let mut tables = HashMap::with_capacity(self.tables.len());
+        let mut id = 0;
 
         for (table, table_config) in self.tables {
             let key = fold_case(&table);
@@ -118,11 +121,14 @@ impl Config {
                 // Bound to the folded names, so consistent noise does not
                 // depend on how a dump spells them.
                 masker.bind(&key, &fold_case(&column.name));
+                masker.set_rule(id);
                 columns.push(CompiledColumn {
+                    id,
                     name: column.name,
                     null_policy: column.null_policy,
                     masker,
                 });
+                id += 1;
             }
             if tables.insert(key, columns).is_some() {
                 return Err(ConfigError {
@@ -213,6 +219,16 @@ impl CompiledColumn {
 }
 
 impl CompiledConfig {
+    /// The table key and column name of the rule with `id`.
+    pub fn rule(&self, id: usize) -> Option<(&str, &str)> {
+        self.tables.iter().find_map(|(table, columns)| {
+            columns
+                .iter()
+                .find(|column| column.id == id)
+                .map(|column| (table.as_str(), column.name.as_str()))
+        })
+    }
+
     /// The rules of a table and the key they are stored under. A rule for
     /// `schema.table` takes precedence over a rule for `table`, which
     /// applies to the table in any schema.
@@ -303,6 +319,31 @@ impl CompiledConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_each_rule_has_its_own_id() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [tables.users]
+            columns = [
+                { name = "a", strategy = "nullify" },
+                { name = "b", strategy = "nullify" },
+            ]
+            [tables."audit.users"]
+            columns = [{ name = "c", strategy = "nullify" }]
+            "#,
+        )
+        .unwrap()
+        .compile()
+        .unwrap();
+        let mut named: Vec<_> = (0..3).map(|id| config.rule(id).unwrap()).collect();
+        named.sort();
+        assert_eq!(
+            named,
+            [("audit.users", "c"), ("users", "a"), ("users", "b")]
+        );
+        assert_eq!(config.rule(3), None);
+    }
 
     #[test]
     fn test_null_policy_defaults_to_keep() {

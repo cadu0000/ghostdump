@@ -367,21 +367,7 @@ impl AnonymizerEngine {
         }
 
         let stats = sink.finish()?;
-        if stats.non_numeric > 0 {
-            // One warning per run, without the values.
-            warn!(
-                "{} value(s) of dp_laplace columns were not numbers; they were treated as \
-                 the midpoint of their bounds",
-                stats.non_numeric
-            );
-        }
-        if stats.outside_categories > 0 {
-            warn!(
-                "{} value(s) of randomized_response columns were not among their categories; \
-                 they were replaced by a uniformly random category",
-                stats.outside_categories
-            );
-        }
+        self.warn_of_values(&stats);
         if reading.large_object_writes > 0 {
             warn!(
                 "the dump writes {} piece(s) of PostgreSQL large objects, which GhostDump copies \
@@ -395,6 +381,30 @@ impl AnonymizerEngine {
 }
 
 impl AnonymizerEngine {
+    /// One warning per column whose values its rule could not take as they
+    /// were, with their number, never the values. Out of the loop of `run`.
+    #[cold]
+    fn warn_of_values(&self, stats: &MaskStats) {
+        for (&rule, counts) in &stats.by_rule {
+            let (table, column) = self.config.rule(rule).unwrap_or(("?", "?"));
+            if counts.non_numeric > 0 {
+                warn!(
+                    "column `{table}.{column}`: {} value(s) were not numbers; its dp_laplace \
+                     rule treated them as the midpoint of its bounds",
+                    counts.non_numeric
+                );
+            }
+            if counts.outside_categories > 0 {
+                warn!(
+                    "column `{table}.{column}`: {} value(s) were not among the categories of \
+                     its randomized_response rule; they were replaced by a uniformly random \
+                     category",
+                    counts.outside_categories
+                );
+            }
+        }
+    }
+
     /// Refuses a statement that may write data GhostDump cannot mask (see
     /// [`SqlEvent::Statement`]) when it refers to a table with rules. The
     /// check is by name, so a column or keyword spelt like such a table is
