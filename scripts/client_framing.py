@@ -33,7 +33,8 @@ SCHEMA = {
     "sqlite": "CREATE TABLE users (id int, name text);\n",
 }
 
-# (name, dialect, statements after the CREATE TABLE of `users`)
+# (name, dialect, statements after the CREATE TABLE of `users`), as text, or
+# as bytes where a case needs bytes that are not UTF-8.
 CASES = [
     ('pg nested comment with quote', 'postgres', "/* outer /* inner */ it's still a comment */\nINSERT INTO users (id, name) VALUES (1, 'SECRET_P1');\n-- '\n"),
     ('pg dollar quotes with quotes', 'postgres', "SELECT $$ it's $$, $tag$ a ' b $tag$;\nINSERT INTO users (id, name) VALUES (2, 'SECRET_P2');\n"),
@@ -96,6 +97,17 @@ CASES = [
     ('my \\c clears', 'mysql', "SELECT 'x' \\c\nINSERT INTO users (id, name) VALUES (26, 'SECRET_M26');\n"),
     ('my \\d delimiter', 'mysql', "\\d //\nINSERT INTO users (id, name) VALUES (27, 'SECRET_M27')//\n\\d ;\nINSERT INTO users (id, name) VALUES (28, 'SECRET_M28');\n"),
     ('my backslash command with quote', 'mysql', "DO 1 \\! echo it's\n;\nINSERT INTO users (id, name) VALUES (29, 'SECRET_M29');\n"),
+    # Settings that change how the rest is read, also through variables.
+    ('my client charset sjis', 'mysql', b"SET character_set_client = sjis;\nSELECT '\x95\\';\nINSERT INTO users (id, name) VALUES (60, 'SECRET_M60');\nSET character_set_client = utf8mb4;\n"),
+    ('my client charset by number', 'mysql', b"SET character_set_client = 13;\nSELECT '\x95\\';\nINSERT INTO users (id, name) VALUES (61, 'SECRET_M61');\nSET character_set_client = utf8mb4;\n"),
+    ('my client charset from a variable', 'mysql', b"SET @c = 'sjis';\nSET character_set_client = @c;\nSELECT '\x95\\';\nINSERT INTO users (id, name) VALUES (62, 'SECRET_M62');\nSET character_set_client = utf8mb4;\n"),
+    ('my client charset saved and restored', 'mysql', "SET @saved_cs_client = @@character_set_client;\nSET character_set_client = latin1;\nSET character_set_client = @saved_cs_client;\nINSERT INTO users (id, name) VALUES (63, 'SECRET_M63');\n"),
+    ('my sql_mode from a variable', 'mysql', "SET @m = 'NO_BACKSLASH_ESCAPES';\nSET sql_mode = @m;\nSELECT 'a\\';\nINSERT INTO users (id, name) VALUES (64, 'SECRET_M64');\n"),
+    ('my sql_mode by expression', 'mysql', "SET sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES');\nSELECT 'a\\';\nINSERT INTO users (id, name) VALUES (65, 'SECRET_M65');\n"),
+    ('my sql_mode saved and restored', 'mysql', "SET @saved_sql_mode = @@sql_mode;\nSET sql_mode = 'NO_AUTO_VALUE_ON_ZERO';\nSET sql_mode = @saved_sql_mode;\nINSERT INTO users (id, name) VALUES (66, 'SECRET_M66');\n"),
+    ('pg set_config strings off', 'postgres', "SELECT set_config('standard_conforming_strings', 'off', false);\nSELECT 'x\\'';\nINSERT INTO users (id, name) VALUES (30, 'SECRET_P30');\nSELECT '';\n"),
+    ('pg pg_settings strings off', 'postgres', "UPDATE pg_settings SET setting = 'off' WHERE name = 'standard_conforming_strings';\nSELECT 'x\\'';\nINSERT INTO users (id, name) VALUES (31, 'SECRET_P31');\nSELECT '';\n"),
+    ('pg set_config encoding sjis', 'postgres', b"SELECT set_config('client_encoding', 'SJIS', false);\nSELECT E'\x95\\';\nINSERT INTO users (id, name) VALUES (32, 'SECRET_P32');\nSELECT set_config('client_encoding', 'UTF8', false);\n"),
 ]
 
 # Scripts that write the CREATE TABLE themselves.
@@ -146,7 +158,8 @@ STORED = {"postgres": stored_postgres, "mysql": stored_mysql, "sqlite": stored_s
 
 def check(binary, rules, dialect, script):
     """(stored secrets, outcome, leaked secrets, first error line)."""
-    script = script.encode()
+    if isinstance(script, str):
+        script = script.encode()
     secrets = STORED[dialect](script) - {"MASKED"}
     result = run([binary, "--dialect", dialect, "-c", rules], stdin=script)
     output = result.stdout.decode(errors="replace")
@@ -170,7 +183,10 @@ def main():
     args = parser.parse_args()
     wanted = args.dialects.split(",")
 
-    cases = [(name, dialect, SCHEMA[dialect] + body) for name, dialect, body in CASES]
+    cases = [
+        (name, dialect, (SCHEMA[dialect].encode() if isinstance(body, bytes) else SCHEMA[dialect]) + body)
+        for name, dialect, body in CASES
+    ]
     cases += FULL_SCRIPTS
     counts = {}
     with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as rules:
