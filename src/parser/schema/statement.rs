@@ -119,6 +119,14 @@ impl Statement {
         names
     }
 
+    /// Whether the statement calls one of `functions`, by name, with or
+    /// without a schema (`pg_catalog.lowrite(...)`).
+    pub fn calls_any(&self, functions: &[&str]) -> bool {
+        self.tokens.windows(2).any(|pair| {
+            pair[1] == Token::Symbol(b'(') && functions.iter().any(|name| pair[0].is_word(name))
+        })
+    }
+
     /// MySQL `USE name`: the database that table names without one refer
     /// to after it.
     pub fn used_database(&self) -> Option<String> {
@@ -672,6 +680,16 @@ mod tests {
             changed("RENAME TABLE `a` TO `b`, `c` TO `d`;", mysql),
             ["a", "b", "c", "d"]
         );
+    }
+
+    #[test]
+    fn test_function_calls() {
+        let pg = SqlDialect::Postgres;
+        let calls = |sql: &str| Statement::parse(sql.as_bytes(), pg).calls_any(&["lowrite"]);
+        assert!(calls("SELECT pg_catalog.lowrite(0, '\\x5345');"));
+        assert!(calls("SELECT LOWRITE (0, 'x');"));
+        assert!(!calls("SELECT pg_catalog.lo_open('49158', 131072);"));
+        assert!(!calls("SELECT 'lowrite(0)', lowrite;"));
     }
 
     #[test]

@@ -84,6 +84,10 @@ pub struct RunReport {
     /// Rules that matched no table or column of the input: a misspelt name
     /// leaves its column unmasked. Empty when `--limit` stopped the run.
     pub unused_rules: Vec<UnusedRule>,
+    /// Statements that write the bytes of a PostgreSQL large object
+    /// (`lowrite`), which GhostDump copies as they are. Counted only when
+    /// there are rules.
+    pub large_object_writes: usize,
 }
 
 /// A rule that matched nothing in the input.
@@ -367,6 +371,14 @@ impl AnonymizerEngine {
                 stats.outside_categories
             );
         }
+        if reading.large_object_writes > 0 {
+            warn!(
+                "the dump writes {} piece(s) of PostgreSQL large objects, which GhostDump copies \
+                 unmasked: no rule applies to them. Dump with pg_dump --no-large-objects (-B) \
+                 unless they hold no personal data",
+                reading.large_object_writes
+            );
+        }
         Ok(reading.report(&stats, bytes_read, unterminated_data_block, reached_limit))
     }
 }
@@ -463,6 +475,10 @@ impl AnonymizerEngine {
     }
 }
 
+/// The PostgreSQL functions that write the bytes of a large object from
+/// the dump: pg_dump writes `lowrite`, the others write them by hand.
+const LARGE_OBJECT_WRITES: &[&str] = &["lowrite", "lo_put", "lo_from_bytea"];
+
 /// What a run has read so far, and what it decided from it.
 struct Reading<'a> {
     engine: &'a AnonymizerEngine,
@@ -482,6 +498,7 @@ struct Reading<'a> {
     rows_processed: usize,
     data_blocks: usize,
     rows_masked: usize,
+    large_object_writes: usize,
     rows_by_table: BTreeMap<String, usize>,
     /// Rows of the current table, added to `rows_by_table` when the table
     /// changes, so that rows are counted without a map lookup each.
@@ -503,6 +520,7 @@ impl<'a> Reading<'a> {
             rows_processed: 0,
             data_blocks: 0,
             rows_masked: 0,
+            large_object_writes: 0,
             rows_by_table: BTreeMap::new(),
             current_table: String::new(),
             current_rows: 0,
@@ -514,6 +532,9 @@ impl<'a> Reading<'a> {
     fn statement(&mut self, statement: &Statement) -> io::Result<()> {
         check_settings(statement, &mut self.saved)?;
         self.engine.check_statement(statement)?;
+        if self.dialect == SqlDialect::Postgres && statement.calls_any(LARGE_OBJECT_WRITES) {
+            self.large_object_writes += 1;
+        }
         if let Some(name) = statement.used_database() {
             self.database = Some(name);
             self.plan_metadata = None;
@@ -651,6 +672,7 @@ impl<'a> Reading<'a> {
             bytes_read,
             data_blocks: self.data_blocks,
             rows_masked: self.rows_masked,
+            large_object_writes: self.large_object_writes,
             fields_masked: stats.masked_fields,
             rows_by_table: self.rows_by_table,
             // A run cut short by `--limit` has not seen the whole input.
@@ -1177,6 +1199,23 @@ mod tests {
                 assert!(err.to_string().contains("longer than 64 bytes"), "{err}");
             }
         }
+    }
+
+    #[test]
+    fn test_large_object_writes_are_counted_with_rules() {
+        let input = b"SELECT pg_catalog.lo_open('49158', 131072);\n\
+            SELECT pg_catalog.lowrite(0, '\\x5345');\n\
+            SELECT pg_catalog.lo_close(0);\n";
+        let count = |rules: &str| {
+            let mut out = Vec::new();
+            let report = engine(rules)
+                .process_dump(&input[..], &mut out, &RunOptions::new(SqlDialect::Postgres))
+                .unwrap();
+            assert_eq!(out, input);
+            report.large_object_writes
+        };
+        assert_eq!(count(NAME_RULES), 1);
+        assert_eq!(count(""), 0);
     }
 
     #[test]

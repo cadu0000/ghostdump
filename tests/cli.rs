@@ -38,6 +38,7 @@ const QUALIFIED_RULES: &str = concat!(
     "/tests/fixtures/qualified_rules.toml"
 );
 const PG_LATIN1: &[u8] = include_bytes!("fixtures/pg_dump_latin1.sql");
+const PG_LARGE_OBJECT: &[u8] = include_bytes!("fixtures/pg_dump_large_object.sql");
 const MYSQL_NBE_TRIGGER: &[u8] = include_bytes!("fixtures/mysqldump_nbe_trigger.sql");
 const TRIGGER_RULES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -786,6 +787,30 @@ fn client_commands_stop_the_run_with_rules() {
     let copied = run(&[], None, dump);
     assert!(copied.status.success(), "stderr: {}", stderr(&copied));
     assert_eq!(copied.stdout, dump);
+}
+
+/// pg_dump writes the bytes of a large object with `lowrite`. No rule
+/// applies to them, so with rules the run warns, and copies them.
+#[test]
+fn large_objects_are_copied_with_a_warning() {
+    let rules = run(&["-c", TRIGGER_RULES], None, PG_LARGE_OBJECT);
+    assert!(rules.status.success(), "{}", stderr(&rules));
+    assert!(
+        stderr(&rules).contains("--no-large-objects"),
+        "{}",
+        stderr(&rules)
+    );
+    let stdout = String::from_utf8_lossy(&rules.stdout);
+    assert!(stdout.contains("SELECT pg_catalog.lowrite(0, '\\x534543524554204c4f204259544553');"));
+    assert!(stdout.contains("1\tMASKED\t49158"), "{stdout}");
+
+    let copied = run(&[], None, PG_LARGE_OBJECT);
+    assert!(
+        !stderr(&copied).contains("large object"),
+        "{}",
+        stderr(&copied)
+    );
+    assert_eq!(copied.stdout, PG_LARGE_OBJECT);
 }
 
 /// mysqldump writes the sql_mode a trigger was created with before it. A
