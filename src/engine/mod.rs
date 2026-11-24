@@ -414,8 +414,10 @@ impl AnonymizerEngine {
             match parser.finish() {
                 Remainder::Bytes(rest) => sink.write(&rest)?,
                 Remainder::Statement(rest) => {
+                    let statement = Statement::parse(&rest, dialect);
                     if !self.config.tables.is_empty()
-                        && let Err(e) = self.check_statement(&Statement::parse(&rest, dialect))
+                        && let Err(e) = check_settings(&statement)
+                            .and_then(|()| self.check_statement(&statement))
                     {
                         return stop(sink, e);
                     }
