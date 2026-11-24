@@ -3,7 +3,7 @@ use ghostdump::cli::{
     secret_from_file,
 };
 use ghostdump::engine::config::{CompiledConfig, Config};
-use ghostdump::engine::{AnonymizerEngine, RunOptions};
+use ghostdump::engine::{AnonymizerEngine, RunOptions, RunReport};
 use ghostdump::io::{InputSource, OutputSource};
 use ghostdump::parser::detect_dialect;
 use ghostdump::parser::state::SqlDialect;
@@ -15,7 +15,7 @@ use log::{Level, LevelFilter, debug, error, info, warn};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // With glibc's allocator, the threads of --threads end up sharing the main
 // thread's arena and wait on its lock (see docs/benchmarks.md).
@@ -160,6 +160,12 @@ fn run(args: &Args, secret_on_command_line: bool) -> Result<(), Failure> {
             .map_err(|e| Failure::io("could not replace the output file", e))?;
     }
 
+    log_report(&report, duration);
+    Ok(())
+}
+
+/// The summary of a run that succeeded: counts and speed, never values.
+fn log_report(report: &RunReport, duration: Duration) {
     info!("Processing completed successfully!");
     info!("Rows processed: {}", report.rows_processed);
     info!(
@@ -182,7 +188,6 @@ fn run(args: &Args, secret_on_command_line: bool) -> Result<(), Failure> {
             mib
         );
     }
-    Ok(())
 }
 
 /// Loads and compiles the rules: every rule is checked before any data is read.
