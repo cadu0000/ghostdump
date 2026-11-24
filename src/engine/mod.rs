@@ -1114,6 +1114,53 @@ mod tests {
     }
 
     #[test]
+    fn test_rows_at_the_limit_pass_and_longer_ones_stop() {
+        let limit = 64;
+        let options = RunOptions {
+            max_row_bytes: limit,
+            ..RunOptions::new(SqlDialect::Postgres)
+        };
+        let run = |rules: &str, input: &[u8]| {
+            let mut out = Vec::new();
+            engine(rules)
+                .process_dump(input, &mut out, &options)
+                .map(|_| out)
+        };
+        let x = |len: usize| vec![b'x'; len];
+        // A COPY row is counted without its line ending, a VALUES row from
+        // `(` to `)`, and a statement held for checking without its `;`.
+        let copy = |len: usize| {
+            [
+                b"COPY users (name) FROM stdin;\n".as_slice(),
+                &x(len),
+                b"\n\\.\n",
+            ]
+            .concat()
+        };
+        let values = |len: usize| {
+            [
+                b"INSERT INTO users (name) VALUES ('".as_slice(),
+                &x(len - 4),
+                b"');\n",
+            ]
+            .concat()
+        };
+        let held = |len: usize| [b"UPDATE t SET a = '".as_slice(), &x(len - 19), b"';"].concat();
+
+        for rules in ["", NAME_RULES] {
+            for build in [&copy as &dyn Fn(usize) -> Vec<u8>, &values, &held] {
+                let at_limit = build(limit);
+                let out = run(rules, &at_limit).unwrap();
+                if rules.is_empty() {
+                    assert_eq!(out, at_limit);
+                }
+                let err = run(rules, &build(limit + 1)).unwrap_err();
+                assert!(err.to_string().contains("longer than 64 bytes"), "{err}");
+            }
+        }
+    }
+
+    #[test]
     fn test_run_report_counts() {
         let input = b"INSERT INTO users (id, name) VALUES (1, 'a'), (2, NULL);\n\
             INSERT INTO users (id, name) VALUES (3, 'c');\n\
