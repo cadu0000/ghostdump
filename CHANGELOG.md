@@ -41,6 +41,7 @@ The V1 stabilization, stages 1.1 to 1.6 of the [roadmap](docs/roadmap.md), again
 
 ### Security
 
+- The temporary output file is created no more open than the file it replaces. Since the output was first written under a temporary name, it was created with the default permissions and given the target's only after, so a local user could open it in between and read the whole output of a run whose target was 0600 (19 of 2,000 runs, with a reader started on each new file).
 - Values are masked from their bytes. They used to be decoded as UTF-8, so different values that are not valid UTF-8 got one `hmac` pseudonym (the `_binary` values of a mysqldump, LATIN1 text of a pg_dump); with rules, a dump in an encoding other than UTF-8 is now refused.
 - With `mysqldump --databases`, rows name no schema and follow a `USE`; rules that named the schema did not apply, and the rows passed in clear.
 - 22 of 73 scripts written by hand leaked a stored value through psql, mysql or sqlite3: version comments, `--` without a space, sqlite3's `#` lines, client commands, and settings that change how strings are read. None leaks now. With rules, these now stop the run: statements that write to a table with rules in a form that cannot be masked (`UPDATE`, `INSERT ... SELECT`, `CREATE TABLE ... AS SELECT`), values written after the rows (`ON DUPLICATE KEY UPDATE`), settings that change how strings are read, and client commands that dump tools do not write.
