@@ -80,8 +80,19 @@ fn run(args: &Args) -> Result<(), Failure> {
     };
     let mut input = BufReader::with_capacity(64 * 1024, input);
     let dialect = resolve_dialect(args.dialect, &mut input)?;
-    let output = OutputSource::new(args.output.clone())
-        .map_err(|e| Failure::io("could not open the output", e))?;
+    // --dry-run writes nothing, so it does not even open the output file.
+    let output_path = if args.dry_run {
+        None
+    } else {
+        args.output.as_deref()
+    };
+    let (output, pending) =
+        OutputSource::open(output_path).map_err(|e| Failure::io("could not open the output", e))?;
+    // What an error means for an output file: it is written only at the end.
+    let not_written = match &pending {
+        Some(pending) => format!(" {} was not written.", pending.target().display()),
+        None => String::new(),
+    };
     let engine = AnonymizerEngine::new(config, secret);
     let options = RunOptions {
         dry_run: args.dry_run,
@@ -110,7 +121,7 @@ fn run(args: &Args) -> Result<(), Failure> {
             io::ErrorKind::InvalidData => ExitStatus::Input,
             _ => ExitStatus::Io,
         };
-        Failure(status, e.to_string())
+        Failure(status, format!("{e}{not_written}"))
     })?;
     let duration = start_time.elapsed();
     if let Some(bar) = &progress {
@@ -121,14 +132,22 @@ fn run(args: &Args) -> Result<(), Failure> {
         warn!("unused rule: {rule}. Check the name: a misspelt rule leaves its column unmasked.");
     }
     if args.strict && !report.unused_rules.is_empty() {
+        let written = match pending {
+            Some(_) => not_written,
+            None => " The output was written, but columns may be unmasked.".to_string(),
+        };
         return Err(Failure(
             ExitStatus::Rules,
             format!(
-                "{} rule(s) matched nothing in the input (--strict). The output was written, \
-                 but columns may be unmasked.",
+                "{} rule(s) matched nothing in the input (--strict).{written}",
                 report.unused_rules.len()
             ),
         ));
+    }
+    if let Some(pending) = pending {
+        pending
+            .commit()
+            .map_err(|e| Failure::io("could not replace the output file", e))?;
     }
 
     info!("Processing completed successfully!");
