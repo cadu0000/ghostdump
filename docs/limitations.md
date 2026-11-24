@@ -47,6 +47,7 @@ With rules, these stop the run (exit status 65); the error names the input line 
 ## Tools
 
 * **`init` suggests rules from column names.** It is a hint, not a classification: a column `name` of a table of products gets `faker_name`, and personal data in a column named `notes` gets no rule. Review every line. Source: `inventory::tests::test_suggestions_follow_the_column_name`.
+* **`init` checks that its rules file does not exist when it starts**; a file created at that path while it reads the dump is replaced, because the rules are written under a temporary name and renamed at the end. Source: `run_init` and `PendingOutput::commit` in the code.
 * **`check` runs `hmac` rules with a placeholder secret**: it shows what a run would apply and refuse, not the pseudonyms.
 
 ## Scope of the verification
