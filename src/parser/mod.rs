@@ -801,6 +801,20 @@ mod tests {
     }
 
     #[test]
+    fn test_a_delimiter_inside_a_word_ends_the_statement_there() {
+        // mysql ends `END$$INSERT` at `$$`: the INSERT starts a statement.
+        let my = SqlDialect::Mysql;
+        let sql = b"DELIMITER $$\nSELECT 1 END$$INSERT INTO users (name) VALUES ('x')$$\n";
+        let (statements, _) = held(my, sql);
+        assert_eq!(
+            statements,
+            ["SELECT 1 END$$", "INSERT INTO users (name) VALUES ('x')$$"]
+        );
+        // Found by fuzzing: a word cut by the delimiter used to carry over.
+        assert_passes_through(my, b"DELIMITER T\nUPDATE UPDATE ");
+    }
+
+    #[test]
     fn test_mysql_data_with_a_custom_delimiter_is_held() {
         let sql = b"DELIMITER //\nINSERT INTO users (name) VALUES ('Ana')//\nDELIMITER ;\n";
         let (statements, opened) = held(SqlDialect::Mysql, sql);

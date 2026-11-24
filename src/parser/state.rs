@@ -455,6 +455,9 @@ impl NormalState {
             self.framer.reset();
             self.phase = StatementPhase::Start;
             self.ends_at_line_end = false;
+            // A delimiter made of letters (`DELIMITER $$`) can end a statement
+            // inside a word: what follows starts a new one.
+            self.word = None;
             return Some(Outcome::End);
         }
         held_from.map(Outcome::Hold)
