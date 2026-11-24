@@ -530,6 +530,31 @@ fn pg_dump_with_inserts_is_masked() {
     }
 }
 
+#[test]
+fn pg_dump_default_format_is_masked() {
+    // pg_dump 16 with no options: COPY blocks, and psql's \\restrict.
+    let dump = include_bytes!("fixtures/pg_dump_default.sql");
+    let output = run(&["-c", DUMP_FORMS_RULES], None, dump);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout.contains(
+        "COPY public.users (id, name, email) FROM stdin;\n1\tMasked\t\\N\n2\tMasked\t\\N\n\\.\n"
+    ));
+    assert!(stdout.contains("COPY public.\"my table\" (\"first name\") FROM stdin;\n\\N\n\\.\n"));
+    assert!(stdout.contains("COPY public.log (x) FROM stdin;\n\\N\n\\N\n\\.\n"));
+    for value in [
+        "Alice Example",
+        "alice@example.com",
+        "O'Brien",
+        "Carol Example",
+    ] {
+        assert!(!stdout.contains(value), "{value} in {stdout}");
+    }
+    // The rule on "my table" is schema, copied as it is, with its literal.
+    assert!(stdout.contains("  VALUES ('second action'::text);\n);"));
+}
+
 /// mysqldump writes binary columns as raw bytes (`_binary '...'`), most of
 /// them not UTF-8. Each value is pseudonymized from its own bytes, so values
 /// that differ only there keep different pseudonyms.
