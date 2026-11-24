@@ -105,6 +105,7 @@ CASES = [
     ('my sql_mode from a variable', 'mysql', "SET @m = 'NO_BACKSLASH_ESCAPES';\nSET sql_mode = @m;\nSELECT 'a\\';\nINSERT INTO users (id, name) VALUES (64, 'SECRET_M64');\n"),
     ('my sql_mode by expression', 'mysql', "SET sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES');\nSELECT 'a\\';\nINSERT INTO users (id, name) VALUES (65, 'SECRET_M65');\n"),
     ('my sql_mode saved and restored', 'mysql', "SET @saved_sql_mode = @@sql_mode;\nSET sql_mode = 'NO_AUTO_VALUE_ON_ZERO';\nSET sql_mode = @saved_sql_mode;\nINSERT INTO users (id, name) VALUES (66, 'SECRET_M66');\n"),
+    ('my sql_mode saved then selected into', 'mysql', "SET @m = @@sql_mode;\nSELECT 'NO_BACKSLASH_ESCAPES' INTO @m;\nSET sql_mode = @m;\nSELECT 'a\\';\nINSERT INTO users (id, name) VALUES (67, 'SECRET_M67');\n"),
     ('pg set_config strings off', 'postgres', "SELECT set_config('standard_conforming_strings', 'off', false);\nSELECT 'x\\'';\nINSERT INTO users (id, name) VALUES (30, 'SECRET_P30');\nSELECT '';\n"),
     ('pg pg_settings strings off', 'postgres', "UPDATE pg_settings SET setting = 'off' WHERE name = 'standard_conforming_strings';\nSELECT 'x\\'';\nINSERT INTO users (id, name) VALUES (31, 'SECRET_P31');\nSELECT '';\n"),
     ('pg set_config encoding sjis', 'postgres', b"SELECT set_config('client_encoding', 'SJIS', false);\nSELECT E'\x95\\';\nINSERT INTO users (id, name) VALUES (32, 'SECRET_P32');\nSELECT set_config('client_encoding', 'UTF8', false);\n"),
