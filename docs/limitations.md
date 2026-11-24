@@ -51,8 +51,10 @@ With rules, these stop the run (exit status 65); the error names the input line 
 ## Scope of the verification
 
 * **Clients and dump tools**: psql and pg_dump 16.15, mysql and mysqldump 8.0.46, sqlite3 3.45.1.
+* **Compilers**: Rust 1.88, the minimum, in CI, and 1.97 on the development machine.
 * **Real dumps**: 30, of which 12 from pg_dump 16.15, 14 from mysqldump 8.0.46 and 4 from sqlite3, in their default formats and with the options that change how rows are written. Every change is checked to keep their output byte for byte.
 * **Edge cases**: 73 scripts written by hand, run in the real clients ([client framing](experiments/client-framing.md)).
-* **Fuzzing**: 15 minutes per target in stage 1.3 (1,754,900 inputs for the parser, 199,864 for the engine), and 5 minutes on the engine after each later change to it; no long campaign yet.
+* **Fuzzing**: 15 minutes per target in stage 1.3 (1,754,900 inputs for the parser, 199,864 for the engine), and 5 minutes on the engine after each later change to it; no long campaign yet. Since stage 1.6 the full pipeline fuzzes each target for 15 minutes, by hand and before each release.
+* **Property tests**: 256 cases per property in every run of the tests, 1,000,000 in the full pipeline.
 * **Utility**: synthetic data only ([utility evaluation](experiments/utility.md), Limitations).
 * **Performance**: one shared machine ([benchmarks](benchmarks.md)).
