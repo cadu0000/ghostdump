@@ -326,6 +326,12 @@ impl NormalState {
             StatementPhase::MaybeComment => {
                 self.phase = if matches!(class, ByteClass::CommentStart | ByteClass::VersionEnd) {
                     StatementPhase::Start
+                } else if class == ByteClass::Code
+                    && byte == b'-'
+                    && self.dialect == SqlDialect::Mysql
+                {
+                    // MySQL: `--` opens a comment only if a space follows.
+                    StatementPhase::MaybeComment
                 } else {
                     StatementPhase::Body
                 };

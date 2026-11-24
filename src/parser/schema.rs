@@ -922,10 +922,15 @@ fn without_comments(header: &[u8], dialect: SqlDialect) -> Vec<u8> {
         match lexer.feed(byte) {
             ByteClass::Comment => out.push(b' '),
             ByteClass::CommentStart | ByteClass::VersionEnd => {
-                // The first byte of the opener or closer was copied as code.
-                if let Some(last) = out.last_mut() {
-                    *last = b' ';
-                }
+                // The bytes of the opener or closer before this one were
+                // copied as code: both dashes of MySQL's `-- `, else one.
+                let copied = if dialect == SqlDialect::Mysql && byte != b'*' && byte != b'/' {
+                    2
+                } else {
+                    1
+                };
+                let start = out.len().saturating_sub(copied);
+                out[start..].fill(b' ');
                 out.push(b' ');
             }
             _ => out.push(byte),
@@ -1175,6 +1180,10 @@ mod tests {
             mysql
         ));
         assert!(!has_values(b"ON CONFLICT DO NOTHING;", pg));
+        // MySQL reads `--1` as two minus signs and `-- 1` as a comment.
+        assert!(has_values(b"--1;", mysql));
+        assert!(!has_values(b"-- 1\n;", mysql));
+        assert!(!has_values(b"--1;", pg));
     }
 
     #[test]

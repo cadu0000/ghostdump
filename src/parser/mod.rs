@@ -659,6 +659,26 @@ mod tests {
     }
 
     #[test]
+    fn test_mysql_double_dash_is_a_comment_only_before_a_space() {
+        let my = SqlDialect::Mysql;
+        assert!(opens_data_block(
+            my,
+            b"-- c\nINSERT INTO users (name) VALUES ('x');\n"
+        ));
+        assert!(opens_data_block(
+            my,
+            b"--\tc\nINSERT INTO users (name) VALUES ('x');\n"
+        ));
+        // `1--1` is arithmetic: the statement ends at its `;`.
+        assert!(opens_data_block(
+            my,
+            b"DO 1--1;\nINSERT INTO users (name) VALUES ('x');\n"
+        ));
+        let (statements, _) = held(my, b"SET @x = 1--1, @y = 'it''s';\n");
+        assert_eq!(statements, ["SET @x = 1--1, @y = 'it''s';"]);
+    }
+
+    #[test]
     fn test_mysql_data_with_a_custom_delimiter_is_held() {
         let sql = b"DELIMITER //\nINSERT INTO users (name) VALUES ('Ana')//\nDELIMITER ;\n";
         let (statements, opened) = held(SqlDialect::Mysql, sql);

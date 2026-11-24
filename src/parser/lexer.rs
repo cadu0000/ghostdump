@@ -17,6 +17,8 @@ pub enum ByteClass {
     Comment,
     /// Second byte of a `--` or `/*` comment opener. The first byte was
     /// reported as `Code`, before the lexer could know it opened a comment.
+    /// In MySQL, `--` opens a comment only before a space or a control
+    /// character: this is then that byte, and both dashes were `Code`.
     CommentStart,
     /// The `/` of the `*/` that closes a MySQL `/*! ... */` comment, whose
     /// content is code. The `*` was reported as `Code`.
@@ -26,6 +28,9 @@ pub enum ByteClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LexState {
     Code,
+    /// MySQL: after `--`, which opens a comment only if a space or a
+    /// control character follows.
+    DashDash,
     LineComment,
     BlockComment,
     /// After `/*!` in MySQL: the version number, then code.
@@ -82,6 +87,19 @@ impl Lexer {
     pub fn feed(&mut self, byte: u8) -> ByteClass {
         match self.state {
             LexState::Code => self.code_byte(byte),
+            LexState::DashDash => {
+                if byte <= b' ' || byte == 0x7f {
+                    if byte == b'\n' {
+                        self.back_to_code(byte);
+                    } else {
+                        self.state = LexState::LineComment;
+                    }
+                    return ByteClass::CommentStart;
+                }
+                // `1--1` is one minus another in MySQL.
+                self.state = LexState::Code;
+                self.code_byte(byte)
+            }
             LexState::LineComment => {
                 if byte == b'\n' {
                     self.back_to_code(byte);
@@ -116,6 +134,10 @@ impl Lexer {
             return ByteClass::VersionEnd;
         }
         let class = match byte {
+            b'-' if self.prev == b'-' && self.dialect == SqlDialect::Mysql => {
+                self.state = LexState::DashDash;
+                ByteClass::Code
+            }
             b'-' if self.prev == b'-' => {
                 self.state = LexState::LineComment;
                 ByteClass::CommentStart
@@ -349,6 +371,18 @@ mod tests {
         // Elsewhere `*/` is plain code, and `/*!` a comment.
         assert_eq!(classes(mysql, b"a*/b"), "cccc");
         assert_eq!(classes(SqlDialect::Postgres, b"/*!a*/b"), "csmmmmc");
+    }
+
+    #[test]
+    fn test_mysql_double_dash_needs_a_space() {
+        let mysql = SqlDialect::Mysql;
+        // `1--1` is 1 - (-1); the quote after it opens a string.
+        assert_eq!(classes(mysql, b"1--1,'x'"), "ccccclll");
+        assert_eq!(classes(mysql, b"a-- 'x\nb"), "cccsmmmc");
+        assert_eq!(classes(mysql, b"a--\tx\nb"), "cccsmmc");
+        assert_eq!(classes(mysql, b"a--\nb"), "cccsc");
+        assert_eq!(classes(mysql, b"a--- x"), "ccccsm");
+        assert_eq!(classes(SqlDialect::Postgres, b"1--1,'x'"), "ccsmmmmm");
     }
 
     #[test]
