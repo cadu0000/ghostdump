@@ -59,7 +59,40 @@ pub enum NormalEvent {
     Statement(Vec<u8>),
     /// A statement held whole grew past the size limit without ending.
     TooLarge,
+    /// A client command that dump tools do not write (psql `\echo`, mysql
+    /// `\g` or `source`, sqlite3 `.print`), found while such commands are
+    /// refused.
+    ClientCommand(Vec<u8>),
 }
+
+/// Longest client command name kept for messages.
+const MAX_COMMAND: usize = 32;
+
+/// mysql client commands that may start a statement, besides `DELIMITER`,
+/// which is read, and `USE`, which is SQL too (`mysql --help` lists them).
+const MYSQL_COMMANDS: &[&str] = &[
+    "clear",
+    "connect",
+    "edit",
+    "ego",
+    "exit",
+    "go",
+    "help",
+    "nopager",
+    "notee",
+    "pager",
+    "print",
+    "prompt",
+    "quit",
+    "rehash",
+    "source",
+    "status",
+    "system",
+    "tee",
+    "charset",
+    "warnings",
+    "nowarning",
+];
 
 /// Bytes held back so that the first word of a statement (up to `REPLACE`)
 /// and the byte after it are still available when the keyword is recognized.
@@ -99,6 +132,8 @@ enum Handling {
 enum FirstWord {
     Data(DataKeyword),
     Delimiter,
+    /// A mysql client command (`source`, `charset`, ...).
+    Command,
     Handle(Handling),
 }
 
@@ -153,6 +188,13 @@ pub struct NormalState {
     /// Bytes of a UTF-8 BOM matched so far; `None` once past the input start.
     bom_matched: Option<usize>,
     max_bytes: usize,
+    /// Whether the next byte starts a line.
+    line_start: bool,
+    /// A client command whose name is being read: its prefix (`\` or `.`)
+    /// and name, up to the first space.
+    command: Option<Vec<u8>>,
+    /// Whether client commands that dump tools do not write stop the run.
+    refuse_commands: bool,
 }
 
 enum Outcome {
@@ -162,6 +204,8 @@ enum Outcome {
     /// statement is held from it on.
     Hold(usize),
     End,
+    /// A client command, given as written, to be refused.
+    Refuse(Vec<u8>),
 }
 
 impl NormalState {
@@ -179,7 +223,20 @@ impl NormalState {
             delimiter_line: Vec::new(),
             bom_matched: None,
             max_bytes,
+            line_start: true,
+            command: None,
+            refuse_commands: false,
         }
+    }
+
+    /// Reports the client commands that dump tools do not write, instead of
+    /// passing them through: psql meta-commands other than `\connect`,
+    /// `\restrict` and `\unrestrict`, every mysql command but `DELIMITER`,
+    /// and sqlite3 dot-commands. Their effect (variables, other files,
+    /// another delimiter or encoding) is not modelled.
+    pub fn refusing_commands(mut self, refuse: bool) -> Self {
+        self.refuse_commands = refuse;
+        self
     }
 
     /// State for the very beginning of the input, where a UTF-8 BOM may appear.
@@ -199,6 +256,7 @@ impl NormalState {
         }
 
         match self.advance(byte) {
+            Some(Outcome::Refuse(command)) => return NormalEvent::ClientCommand(command),
             Some(Outcome::Data(keyword, len)) => {
                 let start = self.pending.len() - len - 1;
                 return NormalEvent::StartInsertHeader {
@@ -266,10 +324,30 @@ impl NormalState {
         if self.skip_bom(byte) {
             return None;
         }
+        let at_line_start = std::mem::replace(&mut self.line_start, byte == b'\n');
+
+        // A client command's name ends at the first space or control byte.
+        if let Some(command) = self.command.as_mut() {
+            if byte > b' ' {
+                if command.len() < MAX_COMMAND {
+                    command.push(byte);
+                }
+            } else {
+                let command = self.command.take().unwrap_or_default();
+                if self.refuse_commands && !dump_tool_command(self.dialect, &command) {
+                    return Some(Outcome::Refuse(command));
+                }
+            }
+        }
 
         match self.phase {
             StatementPhase::MetaCommand => {
                 // The line is not SQL: its quotes must not reach the lexer.
+                // psql reads another meta-command, or SQL after `\\`, at an
+                // unquoted backslash.
+                if byte == b'\\' && self.dialect == SqlDialect::Postgres && self.command.is_none() {
+                    self.command = Some(vec![byte]);
+                }
                 if byte == b'\n' {
                     self.phase = StatementPhase::Start;
                 }
@@ -291,6 +369,24 @@ impl NormalState {
         let in_word = class == ByteClass::Code && is_ident_byte(byte);
         let mut held_from = None;
 
+        // psql and mysql read an unquoted backslash as a client command; a
+        // psql one that starts a statement is read with its line, below.
+        let statement_start = matches!(
+            self.phase,
+            StatementPhase::Start | StatementPhase::MaybeComment
+        );
+        if class == ByteClass::Code
+            && byte == b'\\'
+            && self.command.is_none()
+            && match self.dialect {
+                SqlDialect::Postgres => !statement_start,
+                SqlDialect::Mysql => true,
+                SqlDialect::Sqlite => false,
+            }
+        {
+            self.command = Some(vec![byte]);
+        }
+
         if !in_word && let Some(word) = self.word.take() {
             self.framer.word(&word);
             if self.phase == StatementPhase::FirstWord {
@@ -302,6 +398,11 @@ impl NormalState {
                         self.delimiter_line.clear();
                         return None;
                     }
+                    FirstWord::Command if self.refuse_commands => {
+                        let len = word.len.min(word.start.len());
+                        return Some(Outcome::Refuse(word.start[..len].to_vec()));
+                    }
+                    FirstWord::Command => {}
                     FirstWord::Handle(Handling::Stream) => {}
                     FirstWord::Handle(handling) => {
                         self.handling = handling;
@@ -322,7 +423,12 @@ impl NormalState {
         }
 
         match self.phase {
-            StatementPhase::Start => self.phase = self.after_start(byte, class),
+            StatementPhase::Start => {
+                self.phase = self.after_start(byte, class, at_line_start);
+                if self.phase == StatementPhase::MetaCommand && byte != b'#' {
+                    self.command = Some(vec![byte]);
+                }
+            }
             StatementPhase::MaybeComment => {
                 self.phase = if matches!(class, ByteClass::CommentStart | ByteClass::VersionEnd) {
                     StatementPhase::Start
@@ -347,7 +453,7 @@ impl NormalState {
         held_from.map(Outcome::Hold)
     }
 
-    fn after_start(&self, byte: u8, class: ByteClass) -> StatementPhase {
+    fn after_start(&self, byte: u8, class: ByteClass, at_line_start: bool) -> StatementPhase {
         match class {
             ByteClass::Comment | ByteClass::CommentStart | ByteClass::VersionEnd => {
                 StatementPhase::Start
@@ -359,6 +465,11 @@ impl NormalState {
                 // inside it split from its start (`/*!40000 SELECT 1; */`).
                 b'*' if self.dialect == SqlDialect::Mysql => StatementPhase::MaybeComment,
                 b'\\' if self.dialect == SqlDialect::Postgres => StatementPhase::MetaCommand,
+                // sqlite3 reads a line that starts with `.` as a dot-command,
+                // and one that starts with `#` as a comment.
+                b'.' | b'#' if self.dialect == SqlDialect::Sqlite && at_line_start => {
+                    StatementPhase::MetaCommand
+                }
                 b if b.is_ascii_whitespace() => StatementPhase::Start,
                 b if b.is_ascii_alphabetic() => StatementPhase::FirstWord,
                 _ => StatementPhase::Body,
@@ -391,6 +502,9 @@ impl NormalState {
                 && (byte == b' ' || byte == b'\t') =>
             {
                 FirstWord::Delimiter
+            }
+            _ if self.dialect == SqlDialect::Mysql && word.is_any(MYSQL_COMMANDS) => {
+                FirstWord::Command
             }
             // Statements that may write data, those that change tables,
             // whose column order an INSERT without a column list relies on,
@@ -457,6 +571,15 @@ impl NormalState {
             false
         }
     }
+}
+
+/// The psql meta-commands that pg_dump and pg_dumpall write.
+fn dump_tool_command(dialect: SqlDialect, command: &[u8]) -> bool {
+    dialect == SqlDialect::Postgres
+        && matches!(
+            command,
+            b"\\connect" | b"\\c" | b"\\restrict" | b"\\unrestrict"
+        )
 }
 
 /// mysql reads at most this many bytes of a client command line.

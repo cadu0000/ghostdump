@@ -588,3 +588,23 @@ fn rows_inside_mysql_version_comments_are_masked() {
     );
     assert!(!stdout.contains("ana@example.com"));
 }
+
+/// psql reads `\\echo it's` as a command, not SQL; a quote there would
+/// hide the INSERT after it. With rules, a client command that dump tools
+/// do not write stops the run; without rules the dump is copied.
+#[test]
+fn client_commands_stop_the_run_with_rules() {
+    let dump = b"\\echo it's\nINSERT INTO users (name) VALUES ('Ana');\n";
+    let refused = run(&["-c", PG_RULES], Some(GOLDEN_SECRET), dump);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("`\\echo`"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!String::from_utf8_lossy(&refused.stdout).contains("Ana"));
+
+    let copied = run(&[], None, dump);
+    assert!(copied.status.success(), "stderr: {}", stderr(&copied));
+    assert_eq!(copied.stdout, dump);
+}

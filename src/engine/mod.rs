@@ -254,7 +254,9 @@ impl AnonymizerEngine {
             ..
         } = *options;
         let mut reader = BufReader::new(input);
-        let mut parser = SqlParser::new(dialect).with_max_row_bytes(max_row_bytes);
+        let mut parser = SqlParser::new(dialect)
+            .with_max_row_bytes(max_row_bytes)
+            .refusing_client_commands(!self.config.tables.is_empty());
 
         let mut buffer = [0u8; 64 * 1024];
         let mut rows_processed = 0;
