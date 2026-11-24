@@ -41,6 +41,8 @@ Found in November 2026, in stage 1.4, and fixed in it; each was reproduced with 
 
 Found in November 2026, in stage 1.6, and fixed in it, reproduced with the build before the fix: a `.gz` input made of several gzip members (`cat a.gz b.gz`, which gunzip reads whole) was read only up to the end of the first member, and the rest of the dump was dropped with exit status 0. Every member is read now; bytes after the last one stop the run ([limitations](limitations.md)).
 
+Found in November 2026, in the security review of stage 1.7, and fixed at once: since stage 1.4 the temporary output file was created with the default permissions (0644 with the usual umask) and given the target's only after, so a local user who opened it in between kept reading the whole output of a run whose target was 0600. An unprivileged reader that opened each new file on inotify's report did so in 19 of 2,000 runs, and read the columns without rules in clear; the file is now created no more open than its target, and the same reader got in 0 of 2,000 times.
+
 ## V1: stabilization
 
 Goal: a version that can be trusted. Branch `release/v1`; ends with the tag `v1.0.0` on `main`. Only what affects correctness, security or the ability to diagnose a run belongs here.
