@@ -81,6 +81,7 @@ impl LaplaceMechanism {
         self.rule = rule;
     }
 
+    /// Whether equal values get equal noise (`consistent = true`).
     pub fn is_consistent(&self) -> bool {
         self.consistent.is_some()
     }

@@ -26,7 +26,10 @@ pub enum Guarantee {
     /// Deterministic keyed hash: linkable and not differentially private.
     Pseudonymization,
     /// ε-LDP per value, assuming exact arithmetic (f64 sampler).
-    Ldp { epsilon: f64 },
+    Ldp {
+        /// The ε of one value.
+        epsilon: f64,
+    },
 }
 
 /// Counters that a run reports instead of logging one line per value.
@@ -46,7 +49,9 @@ pub struct MaskStats {
 /// The values of one rule that its strategy could not take as they were.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct RuleStats {
+    /// Values that `dp_laplace` could not read as numbers.
     pub non_numeric: usize,
+    /// Values outside the categories of `randomized_response`.
     pub outside_categories: usize,
 }
 
@@ -76,28 +81,47 @@ impl MaskStats {
     }
 }
 
+/// How a rule masks the values of its column.
 #[derive(Debug, Clone)]
 pub enum Masker {
+    /// Replaces the value with a generated one.
     Synthetic(Synthetic),
+    /// Replaces the value with a pseudonym, its HMAC-SHA256 under the secret
+    /// (`hmac`).
     Hmac,
+    /// Replaces the value with NULL (`nullify`).
     Nullify,
+    /// Adds Laplace noise to a number (`dp_laplace`).
     Laplace(LaplaceMechanism),
+    /// Keeps the category, or replaces it with another one at random
+    /// (`randomized_response`).
     RandomizedResponse(RandomizedResponse),
 }
 
 /// Generators whose output does not depend on the original value.
 #[derive(Debug, Clone)]
 pub enum Synthetic {
+    /// A person's name (`faker_name`).
     FakerName,
+    /// An e-mail address (`faker_email`).
     FakerEmail,
+    /// An IPv4 address (`faker_ip`).
     Ipv4,
+    /// A version 4 UUID (`random_uuid`).
     Uuid,
+    /// Sixteen random digits in groups of four (`fake_credit_card`).
     CreditCard,
+    /// A Brazilian mobile number (`faker_phone_br`).
     PhoneBr,
+    /// A CPF with valid check digits (`cpf`).
     Cpf,
+    /// A CNPJ with valid check digits (`cnpj`).
     Cnpj,
+    /// The same text for every value (`fixed`).
     Fixed(String),
+    /// One of the given options, at random (`random_choice`).
     Choice(Vec<String>),
+    /// Random ASCII letters and digits, as many as given (`random_string`).
     Alphanumeric(usize),
 }
 
@@ -124,6 +148,7 @@ impl Masker {
         }
     }
 
+    /// What the masker protects, for the summary printed at startup.
     pub fn guarantee(&self) -> Guarantee {
         match self {
             Masker::Synthetic(_) | Masker::Nullify => Guarantee::InputIndependent,
@@ -137,6 +162,8 @@ impl Masker {
         }
     }
 
+    /// Whether the output depends on the secret: `hmac`, and `dp_laplace`
+    /// with consistent noise.
     pub fn uses_secret(&self) -> bool {
         match self {
             Masker::Hmac => true,
@@ -206,6 +233,8 @@ impl Synthetic {
     }
 }
 
+/// Sixteen random digits in four groups joined by hyphens; the last digit
+/// is not computed as a check digit.
 pub fn generate_fake_credit_card(rng: &mut impl Rng) -> String {
     format!(
         "{:04}-{:04}-{:04}-{:04}",
@@ -216,6 +245,8 @@ pub fn generate_fake_credit_card(rng: &mut impl Rng) -> String {
     )
 }
 
+/// A Brazilian mobile number, `(NN) 9NNNN-NNNN`, with an area code drawn
+/// from 11 to 99.
 pub fn generate_fake_phone_br(rng: &mut impl Rng) -> String {
     format!(
         "({:02}) 9{:04}-{:04}",

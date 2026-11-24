@@ -146,6 +146,8 @@ static ESCAPED: [u8; 256] = {
     table
 };
 
+/// Writes a value as a field of a VALUES row: NULL as `NULL`, a raw literal
+/// as it is, and text as a string literal quoted for `dialect`.
 pub fn encode(value: &SqlValue, dialect: SqlDialect, out: &mut impl Write) -> io::Result<()> {
     match value {
         SqlValue::Null => out.write_all(b"NULL"),

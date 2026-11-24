@@ -1,3 +1,6 @@
+//! A run: applies the rules to the rows of the tables that have them,
+//! refuses what it cannot mask safely, and copies everything else as it is.
+
 pub(crate) mod categorical;
 pub(crate) mod columns;
 pub mod config;
@@ -29,6 +32,7 @@ use crate::parser::{
 /// How a dump is processed.
 #[derive(Debug, Clone)]
 pub struct RunOptions {
+    /// The dialect of the dump.
     pub dialect: SqlDialect,
     /// Process the input without writing anything.
     pub dry_run: bool,
@@ -46,6 +50,8 @@ pub struct RunOptions {
 }
 
 impl RunOptions {
+    /// Options for a run that writes every row, on one thread, with rows
+    /// up to [`DEFAULT_MAX_ROW_BYTES`].
     pub fn new(dialect: SqlDialect) -> Self {
         Self {
             dialect,
@@ -61,6 +67,7 @@ impl RunOptions {
 /// Summary of a run, returned to the caller instead of printed.
 #[derive(Debug, Default, PartialEq)]
 pub struct RunReport {
+    /// Data rows read, masked or not.
     pub rows_processed: usize,
     /// The input ended inside a data block, before its terminator.
     pub unterminated_data_block: bool,
@@ -85,8 +92,8 @@ pub struct RunReport {
     /// leaves its column unmasked. Empty when `--limit` stopped the run.
     pub unused_rules: Vec<UnusedRule>,
     /// Statements that write the bytes of a PostgreSQL large object
-    /// (`lowrite`), which GhostDump copies as they are. Counted only when
-    /// there are rules.
+    /// (`lowrite`, `lo_put`, `lo_from_bytea`), which GhostDump copies as
+    /// they are. Counted only when there are rules.
     pub large_object_writes: usize,
     /// The rules applied at least once, as (table key, column).
     pub applied_rules: BTreeSet<(String, String)>,
@@ -98,6 +105,7 @@ pub struct RunReport {
 /// A rule that matched nothing in the input.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnusedRule {
+    /// The key of the table's rules: `table` or `schema.table`, case folded.
     pub table: String,
     /// `None` when no rule of the table matched: the table is absent from
     /// the input, or none of the columns with rules is in it.
@@ -116,12 +124,14 @@ impl fmt::Display for UnusedRule {
 /// A masking plan and the key of the rules it comes from.
 type KeyedPlan<'a> = (&'a str, MaskingPlan<'a>);
 
+/// Masks dumps with a set of compiled rules.
 pub struct AnonymizerEngine {
     config: CompiledConfig,
     secret: String,
 }
 
 impl AnonymizerEngine {
+    /// An engine for `config`; `secret` keys `hmac` and consistent noise.
     pub fn new(config: CompiledConfig, secret: String) -> Self {
         for (table, columns) in &config.tables {
             for column in columns {
@@ -231,6 +241,13 @@ impl AnonymizerEngine {
         Ok(plan)
     }
 
+    /// Reads a dump from `input` and writes it to `output` with the rules
+    /// applied, in one pass.
+    ///
+    /// An error of kind [`io::ErrorKind::InvalidData`] means the input
+    /// cannot be masked safely, or is not a dump GhostDump reads; its message
+    /// names the input line where the run stopped. Other errors come from
+    /// reading or writing.
     pub fn process_dump(
         &self,
         input: impl Read,

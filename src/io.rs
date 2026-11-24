@@ -1,3 +1,5 @@
+//! Where a run reads the dump and writes its output.
+
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -6,13 +8,19 @@ use std::path::{Path, PathBuf};
 use flate2::read::GzDecoder;
 use log::warn;
 
+/// Where the dump is read from.
 pub enum InputSource {
+    /// A file read as it is.
     File(File),
+    /// A file whose name ends in `.gz`, decompressed while it is read.
     Gzip(GzDecoder<File>),
+    /// The standard input.
     Stdin(io::Stdin),
 }
 
 impl InputSource {
+    /// Opens `path`, decompressing it when its name ends in `.gz` (in any
+    /// case); stdin when `None`.
     pub fn new(path: Option<PathBuf>) -> io::Result<Self> {
         match path {
             Some(p) => {
@@ -27,6 +35,7 @@ impl InputSource {
         }
     }
 
+    /// Wraps the source in a [`BufReader`].
     pub fn into_buffered(self) -> BufReader<Self> {
         BufReader::new(self)
     }
@@ -42,8 +51,12 @@ impl Read for InputSource {
     }
 }
 
+/// Where the masked dump is written.
 pub enum OutputSource {
+    /// A file: a temporary one when the target is a regular file (see
+    /// [`PendingOutput`]), the target itself otherwise.
     File(File),
+    /// The standard output.
     Stdout(io::Stdout),
 }
 
@@ -81,6 +94,7 @@ impl OutputSource {
         Ok((OutputSource::File(file), Some(pending)))
     }
 
+    /// Wraps the output in a [`BufWriter`].
     pub fn into_buffered(self) -> BufWriter<Self> {
         BufWriter::new(self)
     }

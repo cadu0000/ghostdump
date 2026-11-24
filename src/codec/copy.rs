@@ -30,6 +30,8 @@ fn content_end(row: &[u8]) -> usize {
     }
 }
 
+/// The value of a COPY field: `\N` is NULL, and anything else is text,
+/// with its backslash escapes undone.
 pub fn decode(field: &[u8]) -> SqlValue {
     if field == b"\\N" {
         return SqlValue::Null;
@@ -91,6 +93,8 @@ fn hex_value(byte: u8) -> u8 {
     }
 }
 
+/// Writes a value as a COPY field: NULL as `\N`, and any other value with
+/// its backslashes, tabs, line feeds and carriage returns escaped.
 pub fn encode(value: &SqlValue, out: &mut impl Write) -> io::Result<()> {
     let Some(bytes) = value.as_bytes() else {
         return out.write_all(b"\\N");
