@@ -179,6 +179,24 @@ fn only_a_run_that_succeeds_writes_the_output_file() {
 
 /// `check` runs the rules over a dump without writing it, and lists what
 /// they do; a rule that matches nothing makes it fail.
+/// `.cargo/config.toml` builds mimalloc to commit memory on demand, which
+/// keeps the peak memory of a run at about half (docs/benchmarks.md). A
+/// `CFLAGS` variable in the environment of the build replaces that setting.
+#[test]
+fn the_allocator_commits_memory_on_demand() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ghostdump"))
+        .arg("--version")
+        .env("MIMALLOC_VERBOSE", "1")
+        .env_remove("MIMALLOC_ARENA_EAGER_COMMIT")
+        .output()
+        .expect("the binary runs");
+    assert!(
+        stderr(&output).contains("option 'arena_eager_commit': 0"),
+        "mimalloc was built without MI_DEFAULT_ARENA_EAGER_COMMIT=0 (is CFLAGS set?):\n{}",
+        stderr(&output)
+    );
+}
+
 #[test]
 fn every_member_of_a_gzip_input_is_read() {
     use flate2::Compression;
