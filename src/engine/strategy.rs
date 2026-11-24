@@ -10,10 +10,14 @@ use crate::engine::mask::{Masker, Synthetic};
 /// Most decimal places `dp_laplace` accepts in `scale`.
 const MAX_SCALE: u32 = 12;
 
+/// A strategy and its parameters. A key the strategy does not take is an
+/// error, not ignored: a misspelt `null_policy` or `consistent` would
+/// weaken a rule without a word. Strategies without parameters are empty
+/// structs for this, because serde lets a unit variant take any key.
 #[derive(Debug, Deserialize, Clone)]
-#[serde(tag = "strategy", rename_all = "snake_case")]
+#[serde(tag = "strategy", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StrategyConfig {
-    Hmac,
+    Hmac {},
     DpLaplace {
         epsilon: f64,
         /// `[lo, hi]`: values are clamped to it before noise is added.
@@ -33,15 +37,15 @@ pub enum StrategyConfig {
         #[serde(default)]
         consistent: bool,
     },
-    FakerName,
-    FakerEmail,
-    FakeCreditCard,
-    FakerPhoneBr,
-    FakerIp,
-    RandomUuid,
-    Cpf,
-    Cnpj,
-    Nullify,
+    FakerName {},
+    FakerEmail {},
+    FakeCreditCard {},
+    FakerPhoneBr {},
+    FakerIp {},
+    RandomUuid {},
+    Cpf {},
+    Cnpj {},
+    Nullify {},
     Fixed {
         value: String,
     },
@@ -73,16 +77,16 @@ impl StrategyConfig {
     pub fn compile(&self) -> Result<Masker, String> {
         let synthetic = |kind| Ok(Masker::Synthetic(kind));
         match self {
-            StrategyConfig::Hmac => Ok(Masker::Hmac),
-            StrategyConfig::Nullify => Ok(Masker::Nullify),
-            StrategyConfig::FakerName => synthetic(Synthetic::FakerName),
-            StrategyConfig::FakerEmail => synthetic(Synthetic::FakerEmail),
-            StrategyConfig::FakerIp => synthetic(Synthetic::Ipv4),
-            StrategyConfig::RandomUuid => synthetic(Synthetic::Uuid),
-            StrategyConfig::FakeCreditCard => synthetic(Synthetic::CreditCard),
-            StrategyConfig::FakerPhoneBr => synthetic(Synthetic::PhoneBr),
-            StrategyConfig::Cpf => synthetic(Synthetic::Cpf),
-            StrategyConfig::Cnpj => synthetic(Synthetic::Cnpj),
+            StrategyConfig::Hmac {} => Ok(Masker::Hmac),
+            StrategyConfig::Nullify {} => Ok(Masker::Nullify),
+            StrategyConfig::FakerName {} => synthetic(Synthetic::FakerName),
+            StrategyConfig::FakerEmail {} => synthetic(Synthetic::FakerEmail),
+            StrategyConfig::FakerIp {} => synthetic(Synthetic::Ipv4),
+            StrategyConfig::RandomUuid {} => synthetic(Synthetic::Uuid),
+            StrategyConfig::FakeCreditCard {} => synthetic(Synthetic::CreditCard),
+            StrategyConfig::FakerPhoneBr {} => synthetic(Synthetic::PhoneBr),
+            StrategyConfig::Cpf {} => synthetic(Synthetic::Cpf),
+            StrategyConfig::Cnpj {} => synthetic(Synthetic::Cnpj),
             StrategyConfig::Fixed { value } => synthetic(Synthetic::Fixed(value.clone())),
             StrategyConfig::RandomChoice { options } => {
                 if options.is_empty() {
