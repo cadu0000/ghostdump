@@ -72,27 +72,30 @@ impl OutputSource {
         let Some(path) = path else {
             return Ok((OutputSource::Stdout(io::stdout()), None));
         };
-        let target = match fs::metadata(path) {
-            Ok(metadata) if metadata.is_file() => fs::canonicalize(path)?,
+        let (target, permissions) = match fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                (fs::canonicalize(path)?, Some(metadata.permissions()))
+            }
             Ok(_) => return Ok((OutputSource::File(File::create(path)?), None)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 if fs::symlink_metadata(path).is_ok() {
                     return Ok((OutputSource::File(File::create(path)?), None));
                 }
-                path.to_path_buf()
+                (path.to_path_buf(), None)
             }
             Err(e) => return Err(e),
         };
-        let (file, temp) = create_temporary(&target)?;
+        let (file, temp) = create_temporary(&target, permissions.as_ref())?;
         let pending = PendingOutput {
             file: file.try_clone()?,
             temp,
             target,
             committed: false,
         };
-        // A file that is replaced keeps its permissions.
-        if let Ok(metadata) = fs::metadata(&pending.target) {
-            fs::set_permissions(&pending.temp, metadata.permissions())?;
+        // A file that is replaced keeps its permissions, also the ones the
+        // umask removed when the temporary file was created.
+        if let Some(permissions) = permissions {
+            fs::set_permissions(&pending.temp, permissions)?;
         }
         Ok((OutputSource::File(file), Some(pending)))
     }
@@ -158,8 +161,13 @@ impl Drop for PendingOutput {
 }
 
 /// Creates `.<name>.<random>.tmp` next to `target`, so that renaming it
-/// over the target stays on one file system.
-fn create_temporary(target: &Path) -> io::Result<(File, PathBuf)> {
+/// over the target stays on one file system. When the target exists, its
+/// `permissions` are the most the file is created with: a reader who opens
+/// it while it is more open keeps reading what is written to it.
+fn create_temporary(
+    target: &Path,
+    permissions: Option<&fs::Permissions>,
+) -> io::Result<(File, PathBuf)> {
     let name = target.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "the output path names no file")
     })?;
@@ -167,12 +175,21 @@ fn create_temporary(target: &Path) -> io::Result<(File, PathBuf)> {
         Some(directory) if !directory.as_os_str().is_empty() => directory,
         _ => Path::new("."),
     };
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(permissions) = permissions {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(permissions.mode() & 0o777);
+    }
+    #[cfg(not(unix))]
+    let _ = permissions;
     loop {
         let mut temp = OsString::from(".");
         temp.push(name);
         temp.push(format!(".{:016x}.tmp", rand::random::<u64>()));
         let temp = directory.join(temp);
-        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+        match options.open(&temp) {
             Ok(file) => return Ok((file, temp)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
@@ -203,4 +220,22 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn sync_directory(_: &Path) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_temporary_file_is_never_more_open_than_its_target() {
+        let directory = std::env::temp_dir().join(format!("ghostdump-io-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("out.sql");
+        let created = create_temporary(&target, Some(&fs::Permissions::from_mode(0o600)))
+            .map(|(_, temp)| fs::metadata(temp).unwrap().permissions().mode());
+        fs::remove_dir_all(&directory).unwrap();
+        let mode = created.unwrap();
+        assert_eq!(mode & 0o077, 0, "created with mode {mode:o}");
+    }
 }
