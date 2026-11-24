@@ -18,6 +18,7 @@ use std::thread;
 
 use crate::engine::columns::{ColumnOrders, Columns};
 use crate::engine::config::{CompiledColumn, CompiledConfig};
+use crate::engine::mask::MaskStats;
 use crate::engine::settings::{SavedSettings, check_settings};
 use crate::engine::sink::{MaskingPlan, ParallelSink, RowContext, SequentialSink, Sink};
 use crate::parser::state::{InsertFormat, SqlDialect};
@@ -266,43 +267,27 @@ impl AnonymizerEngine {
             max_row_bytes,
             ..
         } = *options;
+        // Without rules nothing is refused: the dump is copied as it is.
+        let checks = !self.config.tables.is_empty();
         let mut reader = BufReader::new(input);
         let mut parser = SqlParser::new(dialect)
             .with_max_row_bytes(max_row_bytes)
-            .refusing_client_commands(!self.config.tables.is_empty());
+            .refusing_client_commands(checks);
+        let mut reading = Reading::new(self, dialect);
 
         let mut buffer = [0u8; 64 * 1024];
-        let mut rows_processed = 0;
-        let mut bytes_read_total = 0u64;
-        let mut data_blocks = 0;
-        let mut rows_masked = 0;
-        let mut rows_by_table: BTreeMap<String, usize> = BTreeMap::new();
-        // Rows of the current table, added to `rows_by_table` when the table
-        // changes, so that rows are counted without a map lookup each.
-        let mut current_table = String::new();
-        let mut current_rows = 0usize;
+        let mut bytes_read = 0u64;
         let mut reached_limit = false;
         let mut unterminated_data_block = false;
 
-        let mut plan: Option<Arc<MaskingPlan>> = None;
-        let mut plan_metadata: Option<Arc<HeaderMetadata>> = None;
-        let mut orders = ColumnOrders::default();
-        // MySQL: the database of the last `USE`, which table names without
-        // one refer to.
-        let mut database: Option<String> = None;
-        // MySQL user variables that hold a saved setting.
-        let mut saved = SavedSettings::default();
-        // Rules applied at least once, as (table key, column name).
-        let mut used: BTreeSet<(&str, &String)> = BTreeSet::new();
-
-        'leitura: loop {
-            let bytes_read = reader.read(&mut buffer)?;
-            if bytes_read == 0 {
+        'reading: loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
                 break;
             }
-            bytes_read_total += bytes_read as u64;
+            bytes_read += read as u64;
 
-            for &byte in &buffer[..bytes_read] {
+            for &byte in &buffer[..read] {
                 let Some(event) = parser.handle_byte(byte) else {
                     continue;
                 };
@@ -310,102 +295,39 @@ impl AnonymizerEngine {
                     SqlEvent::DefaultStatement(b) => sink.write(&[b])?,
                     SqlEvent::Passthrough(bytes) => sink.write(&bytes)?,
                     SqlEvent::Statement(bytes) => {
-                        if !self.config.tables.is_empty() {
-                            let statement = Statement::parse(&bytes, dialect);
-                            if let Err(e) = check_settings(&statement, &mut saved)
-                                .and_then(|()| self.check_statement(&statement))
-                            {
-                                return stop(sink, e);
-                            }
-                            if let Some(name) = statement.used_database() {
-                                database = Some(name);
-                                plan_metadata = None;
-                            }
-                            if let Some(change) = statement.table_change()
-                                && orders.apply(change, &self.config, database.as_deref())
-                            {
-                                // The next header is planned again, even if
-                                // it repeats the last one.
-                                plan_metadata = None;
-                            }
+                        if checks
+                            && let Err(e) = reading.statement(&Statement::parse(&bytes, dialect))
+                        {
+                            return stop(sink, e);
                         }
                         sink.write(&bytes)?;
                     }
-
                     SqlEvent::Header {
                         raw_bytes,
                         metadata,
                         opaque,
                     } => {
-                        // pg_dump --inserts repeats the same header on every row.
-                        let same = match (&metadata, &plan_metadata) {
-                            (Some(new), Some(old)) => Arc::ptr_eq(new, old),
-                            _ => false,
-                        };
-                        data_blocks += 1;
-                        if !same {
-                            let table = metadata.as_deref().map_or("<unknown>", |m| &m.table);
-                            if table != current_table {
-                                count_rows(&mut rows_by_table, &current_table, current_rows);
-                                current_table = table.to_string();
-                                current_rows = 0;
-                            }
-                            plan = match self.plan_block(
-                                metadata.as_deref(),
-                                opaque,
-                                &raw_bytes,
-                                &orders,
-                                database.as_deref(),
-                            ) {
-                                Ok(Some((key, columns))) => {
-                                    used.extend(
-                                        columns.iter().flatten().map(|rule| (key, &rule.name)),
-                                    );
-                                    Some(Arc::new(columns))
-                                }
-                                Ok(None) => None,
-                                Err(e) => return stop(sink, e),
-                            };
-                            plan_metadata = metadata;
+                        if let Err(e) = reading.header(&raw_bytes, metadata, opaque) {
+                            return stop(sink, e);
                         }
                         sink.write(&raw_bytes)?;
                     }
-
                     SqlEvent::Tuple(row, format) => {
-                        match &plan {
-                            None => sink.write(&row)?,
-                            Some(columns) => {
-                                sink.mask(row, format, columns)?;
-                                rows_masked += 1;
-                            }
-                        }
-
-                        rows_processed += 1;
-                        current_rows += 1;
-
-                        if let Some(l) = limit
-                            && rows_processed >= l
-                        {
+                        if reading.row(&mut sink, row, format, limit)? {
                             // Close the statement, so the output still loads.
                             sink.write(match format {
                                 InsertFormat::Values => b";\n",
                                 InsertFormat::Copy => b"\\.\n",
                             })?;
                             reached_limit = true;
-                            break 'leitura;
+                            break 'reading;
                         }
                     }
-
-                    SqlEvent::Footer(footer_bytes) => {
-                        if let Err(e) = self.check_footer(
-                            plan_metadata.as_deref(),
-                            &footer_bytes,
-                            dialect,
-                            database.as_deref(),
-                        ) {
+                    SqlEvent::Footer(footer) => {
+                        if let Err(e) = reading.footer(&footer) {
                             return stop(sink, e);
                         }
-                        sink.write(&footer_bytes)?;
+                        sink.write(&footer)?;
                     }
                     SqlEvent::Error(e) => return stop(sink, refuse(e.to_string())),
                 }
@@ -414,53 +336,22 @@ impl AnonymizerEngine {
 
         // With `--limit` the output stops on purpose, in the middle of the input.
         if !reached_limit {
-            match parser.finish() {
-                Remainder::Bytes(rest) => sink.write(&rest)?,
-                Remainder::Statement(rest) => {
-                    let statement = Statement::parse(&rest, dialect);
-                    if !self.config.tables.is_empty()
-                        && let Err(e) = check_settings(&statement, &mut saved)
-                            .and_then(|()| self.check_statement(&statement))
-                    {
-                        return stop(sink, e);
-                    }
+            match reading.rest(parser.finish(), checks) {
+                Ok((rest, unterminated)) => {
                     sink.write(&rest)?;
-                }
-                Remainder::UnterminatedData {
-                    partial_row: false,
-                    footer,
-                } => {
-                    if let Err(e) = self.check_footer(
-                        plan_metadata.as_deref(),
-                        &footer,
-                        dialect,
-                        database.as_deref(),
-                    ) {
-                        return stop(sink, e);
+                    if unterminated {
+                        warn!(
+                            "the input ended inside a data block, before its terminator \
+                             (`;` or `\\.`)"
+                        );
+                        unterminated_data_block = true;
                     }
-                    sink.write(&footer)?;
-                    warn!(
-                        "the input ended inside a data block, before its terminator (`;` or `\\.`)"
-                    );
-                    unterminated_data_block = true;
                 }
-                Remainder::UnterminatedData {
-                    partial_row: true, ..
-                } => {
-                    return stop(
-                        sink,
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "the input ended in the middle of a data row (truncated dump?). \
-                             The incomplete row was not written, because it could not be masked.",
-                        ),
-                    );
-                }
+                Err(e) => return stop(sink, e),
             }
         }
 
         let stats = sink.finish()?;
-        count_rows(&mut rows_by_table, &current_table, current_rows);
         if stats.non_numeric > 0 {
             // One warning per run, without the values.
             warn!(
@@ -476,23 +367,7 @@ impl AnonymizerEngine {
                 stats.outside_categories
             );
         }
-        Ok(RunReport {
-            rows_processed,
-            unterminated_data_block,
-            non_numeric_dp_values: stats.non_numeric,
-            values_outside_categories: stats.outside_categories,
-            bytes_read: bytes_read_total,
-            data_blocks,
-            rows_masked,
-            fields_masked: stats.masked_fields,
-            rows_by_table,
-            // A run cut short by `--limit` has not seen the whole input.
-            unused_rules: if reached_limit {
-                Vec::new()
-            } else {
-                self.unused_rules(&used)
-            },
-        })
+        Ok(reading.report(&stats, bytes_read, unterminated_data_block, reached_limit))
     }
 }
 
@@ -585,6 +460,206 @@ impl AnonymizerEngine {
         }
         unused.sort_by(|a, b| (&a.table, &a.column).cmp(&(&b.table, &b.column)));
         unused
+    }
+}
+
+/// What a run has read so far, and what it decided from it.
+struct Reading<'a> {
+    engine: &'a AnonymizerEngine,
+    dialect: SqlDialect,
+    /// The masking plan of the current data block; `None` copies its rows.
+    plan: Option<Arc<MaskingPlan<'a>>>,
+    /// The header the plan was made for.
+    plan_metadata: Option<Arc<HeaderMetadata>>,
+    orders: ColumnOrders,
+    /// MySQL: the database of the last `USE`, which table names without
+    /// one refer to.
+    database: Option<String>,
+    /// MySQL user variables that hold a saved setting.
+    saved: SavedSettings,
+    /// Rules applied at least once, as (table key, column name).
+    used: BTreeSet<(&'a str, &'a String)>,
+    rows_processed: usize,
+    data_blocks: usize,
+    rows_masked: usize,
+    rows_by_table: BTreeMap<String, usize>,
+    /// Rows of the current table, added to `rows_by_table` when the table
+    /// changes, so that rows are counted without a map lookup each.
+    current_table: String,
+    current_rows: usize,
+}
+
+impl<'a> Reading<'a> {
+    fn new(engine: &'a AnonymizerEngine, dialect: SqlDialect) -> Self {
+        Self {
+            engine,
+            dialect,
+            plan: None,
+            plan_metadata: None,
+            orders: ColumnOrders::default(),
+            database: None,
+            saved: SavedSettings::default(),
+            used: BTreeSet::new(),
+            rows_processed: 0,
+            data_blocks: 0,
+            rows_masked: 0,
+            rows_by_table: BTreeMap::new(),
+            current_table: String::new(),
+            current_rows: 0,
+        }
+    }
+
+    /// Checks a statement held whole, then follows the database it uses
+    /// and the columns of the tables it changes. An error refuses it.
+    fn statement(&mut self, statement: &Statement) -> io::Result<()> {
+        check_settings(statement, &mut self.saved)?;
+        self.engine.check_statement(statement)?;
+        if let Some(name) = statement.used_database() {
+            self.database = Some(name);
+            self.plan_metadata = None;
+        }
+        if let Some(change) = statement.table_change()
+            && self
+                .orders
+                .apply(change, &self.engine.config, self.database.as_deref())
+        {
+            // The next header is planned again, even if it repeats the last one.
+            self.plan_metadata = None;
+        }
+        Ok(())
+    }
+
+    /// Plans the masking of the data block a header opens. An error
+    /// refuses the block.
+    fn header(
+        &mut self,
+        raw_bytes: &[u8],
+        metadata: Option<Arc<HeaderMetadata>>,
+        opaque: bool,
+    ) -> io::Result<()> {
+        self.data_blocks += 1;
+        // pg_dump --inserts repeats the same header on every row.
+        if let (Some(new), Some(old)) = (&metadata, &self.plan_metadata)
+            && Arc::ptr_eq(new, old)
+        {
+            return Ok(());
+        }
+        let table = metadata.as_deref().map_or("<unknown>", |m| &m.table);
+        if table != self.current_table {
+            count_rows(
+                &mut self.rows_by_table,
+                &self.current_table,
+                self.current_rows,
+            );
+            self.current_table = table.to_string();
+            self.current_rows = 0;
+        }
+        self.plan = self
+            .engine
+            .plan_block(
+                metadata.as_deref(),
+                opaque,
+                raw_bytes,
+                &self.orders,
+                self.database.as_deref(),
+            )?
+            .map(|(key, columns)| {
+                self.used
+                    .extend(columns.iter().flatten().map(|rule| (key, &rule.name)));
+                Arc::new(columns)
+            });
+        self.plan_metadata = metadata;
+        Ok(())
+    }
+
+    /// Writes a row, masked when its block has rules, and returns whether
+    /// it is the last one `--limit` allows.
+    fn row(
+        &mut self,
+        sink: &mut impl Sink<'a>,
+        row: Vec<u8>,
+        format: InsertFormat,
+        limit: Option<usize>,
+    ) -> io::Result<bool> {
+        match &self.plan {
+            None => sink.write(&row)?,
+            Some(columns) => {
+                sink.mask(row, format, columns)?;
+                self.rows_masked += 1;
+            }
+        }
+        self.rows_processed += 1;
+        self.current_rows += 1;
+        Ok(limit.is_some_and(|limit| self.rows_processed >= limit))
+    }
+
+    /// Checks what follows the rows of a data block. An error refuses it.
+    fn footer(&self, footer: &[u8]) -> io::Result<()> {
+        self.engine.check_footer(
+            self.plan_metadata.as_deref(),
+            footer,
+            self.dialect,
+            self.database.as_deref(),
+        )
+    }
+
+    /// What the parser held when the input ended, to be written, and
+    /// whether the input ended inside a data block. An error refuses it.
+    fn rest(&mut self, remainder: Remainder, checks: bool) -> io::Result<(Vec<u8>, bool)> {
+        match remainder {
+            Remainder::Bytes(rest) => Ok((rest, false)),
+            Remainder::Statement(rest) => {
+                if checks {
+                    self.statement(&Statement::parse(&rest, self.dialect))?;
+                }
+                Ok((rest, false))
+            }
+            Remainder::UnterminatedData {
+                partial_row: false,
+                footer,
+            } => {
+                self.footer(&footer)?;
+                Ok((footer, true))
+            }
+            Remainder::UnterminatedData {
+                partial_row: true, ..
+            } => Err(refuse(
+                "the input ended in the middle of a data row (truncated dump?). The \
+                 incomplete row was not written, because it could not be masked."
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn report(
+        mut self,
+        stats: &MaskStats,
+        bytes_read: u64,
+        unterminated_data_block: bool,
+        reached_limit: bool,
+    ) -> RunReport {
+        count_rows(
+            &mut self.rows_by_table,
+            &self.current_table,
+            self.current_rows,
+        );
+        RunReport {
+            rows_processed: self.rows_processed,
+            unterminated_data_block,
+            non_numeric_dp_values: stats.non_numeric,
+            values_outside_categories: stats.outside_categories,
+            bytes_read,
+            data_blocks: self.data_blocks,
+            rows_masked: self.rows_masked,
+            fields_masked: stats.masked_fields,
+            rows_by_table: self.rows_by_table,
+            // A run cut short by `--limit` has not seen the whole input.
+            unused_rules: if reached_limit {
+                Vec::new()
+            } else {
+                self.engine.unused_rules(&self.used)
+            },
+        }
     }
 }
 
