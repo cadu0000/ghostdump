@@ -88,6 +88,11 @@ pub struct RunReport {
     /// (`lowrite`), which GhostDump copies as they are. Counted only when
     /// there are rules.
     pub large_object_writes: usize,
+    /// The rules applied at least once, as (table key, column).
+    pub applied_rules: BTreeSet<(String, String)>,
+    /// Tables of the input, as they are named there, whose rows no rule
+    /// changed: copied as they are.
+    pub copied_tables: BTreeSet<String>,
 }
 
 /// A rule that matched nothing in the input.
@@ -367,24 +372,17 @@ impl AnonymizerEngine {
         }
 
         let stats = sink.finish()?;
-        self.warn_of_values(&stats);
-        if reading.large_object_writes > 0 {
-            warn!(
-                "the dump writes {} piece(s) of PostgreSQL large objects, which GhostDump copies \
-                 unmasked: no rule applies to them. Dump with pg_dump --no-large-objects (-B) \
-                 unless they hold no personal data",
-                reading.large_object_writes
-            );
-        }
+        self.warn_at_end(&stats, reading.large_object_writes);
         Ok(reading.report(&stats, bytes_read, unterminated_data_block, reached_limit))
     }
 }
 
 impl AnonymizerEngine {
-    /// One warning per column whose values its rule could not take as they
-    /// were, with their number, never the values. Out of the loop of `run`.
+    /// The warnings of a run that ends: one per column whose values its rule
+    /// could not take as they were, with their number, never the values; and
+    /// the large objects copied unmasked. Out of the loop of `run`.
     #[cold]
-    fn warn_of_values(&self, stats: &MaskStats) {
+    fn warn_at_end(&self, stats: &MaskStats, large_object_writes: usize) {
         for (&rule, counts) in &stats.by_rule {
             let (table, column) = self.config.rule(rule).unwrap_or(("?", "?"));
             if counts.non_numeric > 0 {
@@ -402,6 +400,14 @@ impl AnonymizerEngine {
                     counts.outside_categories
                 );
             }
+        }
+        if large_object_writes > 0 {
+            warn!(
+                "the dump writes {} piece(s) of PostgreSQL large objects, which GhostDump copies \
+                 unmasked: no rule applies to them. Dump with pg_dump --no-large-objects (-B) \
+                 unless they hold no personal data",
+                large_object_writes
+            );
         }
     }
 
@@ -520,6 +526,10 @@ struct Reading<'a> {
     data_blocks: usize,
     rows_masked: usize,
     large_object_writes: usize,
+    /// Tables whose rows a rule changed, and tables whose rows none did,
+    /// as the input names them.
+    masked_tables: BTreeSet<String>,
+    copied_tables: BTreeSet<String>,
     rows_by_table: BTreeMap<String, usize>,
     /// Rows of the current table, added to `rows_by_table` when the table
     /// changes, so that rows are counted without a map lookup each.
@@ -542,6 +552,8 @@ impl<'a> Reading<'a> {
             data_blocks: 0,
             rows_masked: 0,
             large_object_writes: 0,
+            masked_tables: BTreeSet::new(),
+            copied_tables: BTreeSet::new(),
             rows_by_table: BTreeMap::new(),
             current_table: String::new(),
             current_rows: 0,
@@ -610,6 +622,16 @@ impl<'a> Reading<'a> {
                     .extend(columns.iter().flatten().map(|rule| (key, &rule.name)));
                 Arc::new(columns)
             });
+        if let Some(metadata) = metadata.as_deref() {
+            let name = match &metadata.schema {
+                Some(schema) => format!("{schema}.{}", metadata.table),
+                None => metadata.table.clone(),
+            };
+            match &self.plan {
+                Some(plan) if plan.iter().any(Option::is_some) => self.masked_tables.insert(name),
+                _ => self.copied_tables.insert(name),
+            };
+        }
         self.plan_metadata = metadata;
         Ok(())
     }
@@ -694,6 +716,16 @@ impl<'a> Reading<'a> {
             data_blocks: self.data_blocks,
             rows_masked: self.rows_masked,
             large_object_writes: self.large_object_writes,
+            applied_rules: self
+                .used
+                .iter()
+                .map(|(table, column)| (table.to_string(), column.to_string()))
+                .collect(),
+            copied_tables: self
+                .copied_tables
+                .difference(&self.masked_tables)
+                .cloned()
+                .collect(),
             fields_masked: stats.masked_fields,
             rows_by_table: self.rows_by_table,
             // A run cut short by `--limit` has not seen the whole input.
