@@ -1,15 +1,18 @@
-use ghostdump::cli::{Args, DialectArg, MIN_SECRET_BYTES, SecretError, SecretLength, check_secret};
+use ghostdump::cli::{
+    Args, DialectArg, ExitStatus, MIN_SECRET_BYTES, SecretError, SecretLength, check_secret,
+};
 use ghostdump::engine::config::{CompiledConfig, Config};
 use ghostdump::engine::{AnonymizerEngine, RunOptions};
 use ghostdump::io::{InputSource, OutputSource};
 use ghostdump::parser::detect_dialect;
 use ghostdump::parser::state::SqlDialect;
 
-use clap::Parser as ClapParser;
+use clap::{CommandFactory, FromArgMatches};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{Level, LevelFilter, debug, error, info, warn};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
+use std::process::ExitCode;
 use std::time::Instant;
 
 // With glibc's allocator, the threads of --threads end up sharing the main
@@ -17,31 +20,43 @@ use std::time::Instant;
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Why a run stopped: its exit status, and the message for the user.
+struct Failure(ExitStatus, String);
+
+impl Failure {
+    fn io(context: &str, error: io::Error) -> Self {
+        Failure(ExitStatus::Io, format!("{context}: {error}"))
+    }
+}
+
 // Every message goes to stderr: stdout may carry the sanitized dump.
-fn main() {
-    let args = Args::parse();
+fn main() -> ExitCode {
+    let matches = match Args::command().try_get_matches() {
+        Ok(matches) => matches,
+        Err(e) if e.use_stderr() => {
+            let _ = e.print();
+            return ExitCode::from(ExitStatus::Usage as u8);
+        }
+        // --help and --version.
+        Err(e) => e.exit(),
+    };
+    let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     init_logger(args.verbose);
 
+    match run(&args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(Failure(status, message)) => {
+            error!("{message}");
+            ExitCode::from(status as u8)
+        }
+    }
+}
+
+fn run(args: &Args) -> Result<(), Failure> {
     info!("Starting GhostDump...");
 
-    let config = match args.config {
-        Some(ref path) => {
-            let config = Config::load_from_file(path).unwrap_or_else(|e| {
-                fatal(&format!("could not load the rules file: {}", e));
-            });
-            // Every rule is checked before any data is read.
-            let config = config
-                .compile()
-                .unwrap_or_else(|e| fatal(&format!("invalid rule in {}: {}", path.display(), e)));
-            debug!(
-                "loaded rules for {} table(s) from {}",
-                config.tables.len(),
-                path.display()
-            );
-            check_f64_sampler(&config, args.experimental_f64_sampler);
-            log_guarantees(&config);
-            config
-        }
+    let config = match &args.config {
+        Some(path) => load_rules(path, args.experimental_f64_sampler)?,
         None => {
             info!(
                 "No rules (-c) provided. GhostDump will perform an exact copy of the original data."
@@ -51,22 +66,22 @@ fn main() {
     };
 
     let secret = if config.uses_secret() {
-        resolve_secret(args.secret.as_deref())
+        resolve_secret(args)?
     } else {
         String::new()
     };
 
     let input = InputSource::new(args.input.clone())
-        .unwrap_or_else(|e| fatal(&format!("could not open the input: {}", e)));
+        .map_err(|e| Failure::io("could not open the input", e))?;
     let progress = args.progress.then(|| progress_bar(args.input.as_deref()));
     let input: Box<dyn Read> = match &progress {
         Some(bar) => Box::new(bar.wrap_read(input)),
         None => Box::new(input),
     };
     let mut input = BufReader::with_capacity(64 * 1024, input);
-    let dialect = resolve_dialect(args.dialect, &mut input);
+    let dialect = resolve_dialect(args.dialect, &mut input)?;
     let output = OutputSource::new(args.output.clone())
-        .unwrap_or_else(|e| fatal(&format!("could not open the output: {}", e)));
+        .map_err(|e| Failure::io("could not open the output", e))?;
     let engine = AnonymizerEngine::new(config, secret);
     let options = RunOptions {
         dry_run: args.dry_run,
@@ -90,9 +105,13 @@ fn main() {
     }
 
     let start_time = Instant::now();
-    let report = engine
-        .process_dump(input, output, &options)
-        .unwrap_or_else(|e| fatal(&e.to_string()));
+    let report = engine.process_dump(input, output, &options).map_err(|e| {
+        let status = match e.kind() {
+            io::ErrorKind::InvalidData => ExitStatus::Input,
+            _ => ExitStatus::Io,
+        };
+        Failure(status, e.to_string())
+    })?;
     let duration = start_time.elapsed();
     if let Some(bar) = &progress {
         bar.finish_and_clear();
@@ -102,10 +121,13 @@ fn main() {
         warn!("unused rule: {rule}. Check the name: a misspelt rule leaves its column unmasked.");
     }
     if args.strict && !report.unused_rules.is_empty() {
-        fatal(&format!(
-            "{} rule(s) matched nothing in the input (--strict). The output was written, \
-             but columns may be unmasked.",
-            report.unused_rules.len()
+        return Err(Failure(
+            ExitStatus::Rules,
+            format!(
+                "{} rule(s) matched nothing in the input (--strict). The output was written, \
+                 but columns may be unmasked.",
+                report.unused_rules.len()
+            ),
         ));
     }
 
@@ -131,28 +153,58 @@ fn main() {
             mib
         );
     }
+    Ok(())
+}
+
+/// Loads and compiles the rules: every rule is checked before any data is read.
+fn load_rules(path: &Path, f64_allowed: bool) -> Result<CompiledConfig, Failure> {
+    let config = Config::load_from_file(path).map_err(|e| {
+        let status = if e.downcast_ref::<io::Error>().is_some() {
+            ExitStatus::Io
+        } else {
+            ExitStatus::Rules
+        };
+        Failure(status, format!("could not load the rules file: {e}"))
+    })?;
+    let config = config.compile().map_err(|e| {
+        Failure(
+            ExitStatus::Rules,
+            format!("invalid rule in {}: {}", path.display(), e),
+        )
+    })?;
+    debug!(
+        "loaded rules for {} table(s) from {}",
+        config.tables.len(),
+        path.display()
+    );
+    check_f64_sampler(&config, f64_allowed)?;
+    log_guarantees(&config);
+    Ok(config)
 }
 
 /// What the rules protect, one line per table. ε adds up over the rows of
 /// a person and over repeated releases, which GhostDump cannot see.
 /// `mechanism = "f64"` runs only with `--experimental-f64-sampler`, and
 /// then with a warning.
-fn check_f64_sampler(config: &CompiledConfig, allowed: bool) {
+fn check_f64_sampler(config: &CompiledConfig, allowed: bool) -> Result<(), Failure> {
     if !config.uses_f64_sampler() {
-        return;
+        return Ok(());
     }
     if !allowed {
-        fatal(
+        return Err(Failure(
+            ExitStatus::Rules,
             "mechanism = \"f64\" is kept for experiments: its guarantee holds only while \
              rounding hides the low-order bits of floating-point noise. Use the exact sampler \
-             (the default), or pass --experimental-f64-sampler to measure it",
-        );
+             (the default), or pass --experimental-f64-sampler to measure it"
+                .to_string(),
+        ));
     }
     warn!(
         "--experimental-f64-sampler: the f64 sampler's guarantee holds only while rounding \
          hides the low-order bits of floating-point noise (see \
          docs/experiments/floating-point.md). Use it for experiments, never on real data."
     );
+    Ok(())
 }
 
 fn log_guarantees(config: &CompiledConfig) {
@@ -223,7 +275,7 @@ fn progress_bar(input: Option<&Path>) -> ProgressBar {
     bar
 }
 
-fn resolve_dialect(choice: DialectArg, input: &mut impl BufRead) -> SqlDialect {
+fn resolve_dialect(choice: DialectArg, input: &mut impl BufRead) -> Result<SqlDialect, Failure> {
     let dialect = match choice {
         DialectArg::Postgres => SqlDialect::Postgres,
         DialectArg::Mysql => SqlDialect::Mysql,
@@ -232,7 +284,7 @@ fn resolve_dialect(choice: DialectArg, input: &mut impl BufRead) -> SqlDialect {
             // Peek without consuming: the engine still reads these bytes.
             let prefix = input
                 .fill_buf()
-                .unwrap_or_else(|e| fatal(&format!("could not read the input: {}", e)));
+                .map_err(|e| Failure::io("could not read the input", e))?;
             detect_dialect(prefix).unwrap_or_else(|| {
                 warn!("could not detect the SQL dialect; assuming PostgreSQL (use --dialect)");
                 SqlDialect::Postgres
@@ -240,10 +292,11 @@ fn resolve_dialect(choice: DialectArg, input: &mut impl BufRead) -> SqlDialect {
         }
     };
     debug!("dialect: {dialect:?}");
-    dialect
+    Ok(dialect)
 }
 
-fn resolve_secret(secret: Option<&str>) -> String {
+fn resolve_secret(args: &Args) -> Result<String, Failure> {
+    let secret = args.secret.as_deref();
     match check_secret(secret) {
         Ok(SecretLength::Recommended) => {}
         Ok(SecretLength::Short) => warn!(
@@ -253,17 +306,20 @@ fn resolve_secret(secret: Option<&str>) -> String {
             MIN_SECRET_BYTES
         ),
         Err(SecretError::Missing) => {
-            fatal("the rules use `hmac`, but no secret was given. Pass -s or set GHOSTDUMP_SECRET.")
+            return Err(Failure(
+                ExitStatus::Usage,
+                "the rules use `hmac`, but no secret was given. Pass -s or set GHOSTDUMP_SECRET."
+                    .to_string(),
+            ));
         }
-        Err(SecretError::Empty) => fatal(
-            "the secret is empty. Pass -s or set GHOSTDUMP_SECRET to 32 or more random bytes.",
-        ),
+        Err(SecretError::Empty) => {
+            return Err(Failure(
+                ExitStatus::Usage,
+                "the secret is empty. Pass -s or set GHOSTDUMP_SECRET to 32 or more random \
+                 bytes."
+                    .to_string(),
+            ));
+        }
     }
-
-    secret.unwrap_or_default().to_string()
-}
-
-fn fatal(message: &str) -> ! {
-    error!("{}", message);
-    std::process::exit(1);
+    Ok(secret.unwrap_or_default().to_string())
 }

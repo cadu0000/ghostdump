@@ -125,6 +125,21 @@ pub enum SecretError {
     Empty,
 }
 
+/// Exit statuses of a run that fails, from sysexits.h. A run that succeeds
+/// exits with 0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExitStatus {
+    /// The command line is wrong (`EX_USAGE`).
+    Usage = 64,
+    /// The input cannot be masked safely, or is not a dump GhostDump reads
+    /// (`EX_DATAERR`).
+    Input = 65,
+    /// Reading or writing a file failed (`EX_IOERR`).
+    Io = 74,
+    /// The rules are invalid, or match nothing with `--strict` (`EX_CONFIG`).
+    Rules = 78,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum SecretLength {
     Recommended,

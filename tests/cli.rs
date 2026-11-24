@@ -93,6 +93,27 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// Exit statuses follow sysexits.h: 64 for the command line, 65 for an
+/// input that cannot be masked safely, 74 for files that cannot be read or
+/// written, 78 for the rules.
+#[test]
+fn exit_statuses_tell_what_failed() {
+    let dump = b"INSERT INTO users (name) VALUES ('Ana');\n";
+    let status = |args: &[&str], stdin: &[u8]| run(args, None, stdin).status.code();
+    assert_eq!(status(&[], dump), Some(0));
+    assert_eq!(status(&["--threads", "0"], dump), Some(64));
+    assert_eq!(status(&["-c", HMAC_RULES], dump), Some(64));
+    assert_eq!(
+        status(&["-c", TYPO_RULES], b"INSERT INTO users VALUES ('Ana');\n"),
+        Some(65)
+    );
+    assert_eq!(status(&["-i", "/nonexistent/dump.sql"], b""), Some(74));
+    assert_eq!(status(&["-c", "/nonexistent/rules.toml"], dump), Some(74));
+    assert_eq!(status(&["-o", "/dev/full"], dump), Some(74));
+    assert_eq!(status(&["-c", INVALID_RULES], dump), Some(78));
+    assert_eq!(status(&["-c", TYPO_RULES, "--strict"], dump), Some(78));
+}
+
 #[test]
 fn stdout_carries_only_the_dump() {
     let output = run(&[], None, PASSTHROUGH);
