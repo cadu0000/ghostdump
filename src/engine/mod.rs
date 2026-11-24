@@ -1,11 +1,11 @@
-pub mod categorical;
-pub mod columns;
+pub(crate) mod categorical;
+pub(crate) mod columns;
 pub mod config;
 pub mod laplace;
 pub mod mask;
 mod settings;
-pub mod sink;
-pub mod strategy;
+pub(crate) mod sink;
+pub(crate) mod strategy;
 
 use log::{debug, warn};
 use rand::SeedableRng;

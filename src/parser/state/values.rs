@@ -36,7 +36,6 @@ pub struct ValueState {
     pub tuple_buffer: Vec<u8>,
     /// VALUES: the clause after the rows, up to the `;`.
     trailer: Vec<u8>,
-    pub dialect: SqlDialect,
     pub format: InsertFormat,
     phase: RowPhase,
     lexer: Lexer,
@@ -49,7 +48,6 @@ impl ValueState {
             max_row_bytes,
             tuple_buffer: Vec::with_capacity(1024),
             trailer: Vec::new(),
-            dialect,
             format,
             phase: match format {
                 InsertFormat::Values => RowPhase::BeforeRow,

@@ -1,13 +1,13 @@
-pub mod lexer;
-pub mod schema;
-pub mod state;
+pub(crate) mod lexer;
+pub(crate) mod schema;
+pub(crate) mod state;
 
 use std::fmt;
 use std::sync::Arc;
 
-pub use schema::{
-    HeaderMetadata, SessionSetting, SettingValue, Statement, TableChange, TableName,
-    detect_dialect, extract_metadata, has_values,
+pub use schema::{HeaderMetadata, detect_dialect};
+pub(crate) use schema::{
+    SessionSetting, SettingValue, Statement, TableChange, TableName, extract_metadata, has_values,
 };
 pub use state::{InsertFormat, Remainder, SqlDialect};
 
