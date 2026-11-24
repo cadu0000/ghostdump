@@ -1,9 +1,10 @@
 use ghostdump::cli::{
-    Args, DialectArg, ExitStatus, MIN_SECRET_BYTES, SecretError, SecretLength, check_secret,
-    secret_from_file,
+    Args, CheckArgs, Command, DialectArg, ExitStatus, InitArgs, MIN_SECRET_BYTES, SecretError,
+    SecretLength, check_secret, secret_from_file,
 };
 use ghostdump::engine::config::{CompiledConfig, Config};
 use ghostdump::engine::{AnonymizerEngine, RunOptions, RunReport};
+use ghostdump::inventory::{read_tables, starting_rules};
 use ghostdump::io::{InputSource, OutputSource};
 use ghostdump::parser::detect_dialect;
 use ghostdump::parser::state::SqlDialect;
@@ -12,6 +13,7 @@ use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{Level, LevelFilter, debug, error, info, warn};
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -46,7 +48,12 @@ fn main() -> ExitCode {
     init_logger(args.verbose);
 
     let secret_on_command_line = matches.value_source("secret") == Some(ValueSource::CommandLine);
-    match run(&args, secret_on_command_line) {
+    let result = match &args.command {
+        Some(Command::Check(check)) => run_check(check),
+        Some(Command::Init(init)) => run_init(init),
+        None => run(&args, secret_on_command_line),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure(status, message)) => {
             error!("{message}");
@@ -162,6 +169,139 @@ fn run(args: &Args, secret_on_command_line: bool) -> Result<(), Failure> {
 
     log_report(&report, duration);
     Ok(())
+}
+
+/// `ghostdump check`: runs the rules over the dump without writing it,
+/// and writes on stdout what they do. Nothing is written, so no secret is
+/// needed: `hmac` rules run with a placeholder.
+fn run_check(args: &CheckArgs) -> Result<(), Failure> {
+    let config = load_rules(&args.config, true)?;
+    let secret = if config.uses_secret() {
+        "ghostdump check: no output is written".to_string()
+    } else {
+        String::new()
+    };
+    let (input, dialect) = open_dump(args.input.as_deref(), args.dialect)?;
+    let engine = AnonymizerEngine::new(config, secret);
+    let options = RunOptions {
+        dry_run: true,
+        max_row_bytes: args.max_row_size.saturating_mul(1024 * 1024),
+        ..RunOptions::new(dialect)
+    };
+    let report = engine
+        .process_dump(input, io::sink(), &options)
+        .map_err(|e| {
+            let status = match e.kind() {
+                io::ErrorKind::InvalidData => ExitStatus::Input,
+                _ => ExitStatus::Io,
+            };
+            Failure(status, format!("a run would stop: {e}"))
+        })?;
+
+    let mut masked: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (table, column) in &report.applied_rules {
+        masked.entry(table).or_default().push(column);
+    }
+    println!(
+        "{} row(s) in {} data statement(s), read as {}",
+        report.rows_processed,
+        report.data_blocks,
+        dialect_name(dialect)
+    );
+    for (table, columns) in &masked {
+        println!("masked: table `{table}`, columns {}", columns.join(", "));
+    }
+    for table in &report.copied_tables {
+        println!("copied as it is: table `{table}`");
+    }
+    for rule in &report.unused_rules {
+        println!("unused: {rule}");
+    }
+    if report.unused_rules.is_empty() {
+        Ok(())
+    } else {
+        Err(Failure(
+            ExitStatus::Rules,
+            format!(
+                "{} rule(s) matched nothing in the input: a misspelt rule leaves its column \
+                 unmasked",
+                report.unused_rules.len()
+            ),
+        ))
+    }
+}
+
+/// `ghostdump init`: writes a starting rules file with every table and
+/// column of the dump. An existing file is never replaced: it may hold
+/// rules someone wrote.
+fn run_init(args: &InitArgs) -> Result<(), Failure> {
+    if let Some(path) = &args.output
+        && std::fs::symlink_metadata(path).is_ok()
+    {
+        return Err(Failure(
+            ExitStatus::Usage,
+            format!(
+                "{} exists, and init does not replace a rules file. Remove it, or write to \
+                 another path",
+                path.display()
+            ),
+        ));
+    }
+    let (input, dialect) = open_dump(args.input.as_deref(), args.dialect)?;
+    let tables = read_tables(
+        input,
+        dialect,
+        args.max_row_size.saturating_mul(1024 * 1024),
+    )
+    .map_err(|e| {
+        let status = match e.kind() {
+            io::ErrorKind::InvalidData => ExitStatus::Input,
+            _ => ExitStatus::Io,
+        };
+        Failure(status, e.to_string())
+    })?;
+    let source = match &args.input {
+        Some(path) => format!("{} ({})", path.display(), dialect_name(dialect)),
+        None => format!("stdin ({})", dialect_name(dialect)),
+    };
+    let rules = starting_rules(&tables, &source);
+
+    let (mut output, pending) = OutputSource::open(args.output.as_deref())
+        .map_err(|e| Failure::io("could not open the output", e))?;
+    output
+        .write_all(rules.as_bytes())
+        .and_then(|()| output.flush())
+        .map_err(|e| Failure::io("could not write the rules", e))?;
+    if let Some(pending) = pending {
+        pending
+            .commit()
+            .map_err(|e| Failure::io("could not write the rules file", e))?;
+    }
+    info!(
+        "{} table(s) found; review every rule before use: a column without one is copied as it is",
+        tables.len()
+    );
+    Ok(())
+}
+
+/// Opens the input dump and works out its dialect from its first lines.
+fn open_dump(
+    path: Option<&Path>,
+    choice: DialectArg,
+) -> Result<(BufReader<InputSource>, SqlDialect), Failure> {
+    let input = InputSource::new(path.map(Path::to_path_buf))
+        .map_err(|e| Failure::io("could not open the input", e))?;
+    let mut input = BufReader::with_capacity(64 * 1024, input);
+    let dialect = resolve_dialect(choice, &mut input)?;
+    Ok((input, dialect))
+}
+
+fn dialect_name(dialect: SqlDialect) -> &'static str {
+    match dialect {
+        SqlDialect::Postgres => "PostgreSQL",
+        SqlDialect::Mysql => "MySQL",
+        SqlDialect::Sqlite => "SQLite",
+    }
 }
 
 /// The summary of a run that succeeded: counts and speed, never values.

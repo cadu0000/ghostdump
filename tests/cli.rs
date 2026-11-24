@@ -177,6 +177,73 @@ fn only_a_run_that_succeeds_writes_the_output_file() {
     assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
 }
 
+/// `check` runs the rules over a dump without writing it, and lists what
+/// they do; a rule that matches nothing makes it fail.
+#[test]
+fn check_lists_what_the_rules_do() {
+    let dump = include_bytes!("fixtures/pg_dump_default.sql");
+    let output = run(&["check", "-c", TRIGGER_RULES], None, dump);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(78), "{}", stderr(&output));
+    assert!(
+        stdout.contains("masked: table `users`, columns name"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("copied as it is: table `public.log`"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("unused: no rule of table `visits` matched the input"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Alice"), "{stdout}");
+
+    let refused = run(
+        &["check", "-c", TRIGGER_RULES],
+        None,
+        b"INSERT INTO users VALUES ('Ana');\n",
+    );
+    assert_eq!(refused.status.code(), Some(65));
+    assert!(
+        stderr(&refused).contains("(line 1 of the input)"),
+        "{}",
+        stderr(&refused)
+    );
+}
+
+/// `init` writes every table and column of a dump, with rules for the
+/// columns whose names suggest personal data, and the rules pass `check`.
+/// It never replaces a file.
+#[test]
+fn init_writes_rules_that_pass_check() {
+    let directory = scratch("init");
+    let rules = directory.join("rules.toml");
+    let dump = include_bytes!("fixtures/pg_dump_default.sql");
+    let init = run(&["init", "-o", path(&rules)], None, dump);
+    assert!(init.status.success(), "{}", stderr(&init));
+    let text = fs::read_to_string(&rules).unwrap();
+    assert!(text.contains("[tables.users]"), "{text}");
+    assert!(
+        text.contains("    { name = \"name\", strategy = \"faker_name\" },"),
+        "{text}"
+    );
+    assert!(
+        text.contains("    # { name = \"id\", strategy = \"nullify\" },"),
+        "{text}"
+    );
+
+    let check = run(&["check", "-c", path(&rules)], None, dump);
+    assert!(check.status.success(), "{}", stderr(&check));
+    let masked = run(&["-c", path(&rules)], None, dump);
+    assert!(masked.status.success(), "{}", stderr(&masked));
+    assert!(!String::from_utf8_lossy(&masked.stdout).contains("Alice Example"));
+
+    let again = run(&["init", "-o", path(&rules)], None, dump);
+    assert_eq!(again.status.code(), Some(64));
+    assert_eq!(fs::read_to_string(&rules).unwrap(), text);
+}
+
 /// `--secret-file` gives the same secret as GHOSTDUMP_SECRET, without the
 /// line ending at its end. The secret is given once; `-s` warns that it
 /// shows in the process list.

@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
@@ -7,9 +7,14 @@ use std::path::PathBuf;
     name = "ghostdump",
     version,
     about = "High-Throughput SQL Stream Sanitizer",
-    long_about = "Masks the values of a SQL dump in one streaming pass, with rules per column: deterministic pseudonyms, generated values and local differential privacy. Everything without a rule is copied byte for byte."
+    long_about = "Masks the values of a SQL dump in one streaming pass, with rules per column: deterministic pseudonyms, generated values and local differential privacy. Everything without a rule is copied byte for byte.",
+    args_conflicts_with_subcommands = true
 )]
 pub struct Args {
+    /// Without one, the dump is masked: `ghostdump -c rules.toml -i dump.sql`.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     #[arg(
         short = 'c',
         long,
@@ -116,6 +121,81 @@ pub struct Args {
     pub experimental_f64_sampler: bool,
 }
 
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Check rules against a dump without writing it: the rules applied,
+    /// the tables copied as they are, the rules that match nothing, and
+    /// what would stop a run
+    Check(CheckArgs),
+    /// Write a starting rules file from the tables and columns of a dump
+    Init(InitArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CheckArgs {
+    #[arg(short = 'c', long, value_name = "FILE", help = "Rules file (TOML)")]
+    pub config: PathBuf,
+
+    #[arg(
+        short = 'i',
+        long,
+        value_name = "INPUT_FILE",
+        help = "Input dump, decompressed when it ends in .gz (stdin when absent)"
+    )]
+    pub input: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = DialectArg::Auto,
+        help = "SQL dialect of the dump; auto detects it from its first lines"
+    )]
+    pub dialect: DialectArg,
+
+    #[arg(
+        long,
+        value_name = "MiB",
+        default_value_t = 256,
+        help = "Largest data row, or statement held for checking, in MiB"
+    )]
+    pub max_row_size: usize,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct InitArgs {
+    #[arg(
+        short = 'i',
+        long,
+        value_name = "INPUT_FILE",
+        help = "Input dump, decompressed when it ends in .gz (stdin when absent)"
+    )]
+    pub input: Option<PathBuf>,
+
+    #[arg(
+        short = 'o',
+        long,
+        value_name = "FILE",
+        help = "Rules file to write, which must not exist yet (stdout when absent)"
+    )]
+    pub output: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = DialectArg::Auto,
+        help = "SQL dialect of the dump; auto detects it from its first lines"
+    )]
+    pub dialect: DialectArg,
+
+    #[arg(
+        long,
+        value_name = "MiB",
+        default_value_t = 256,
+        help = "Largest data row, or statement held for checking, in MiB"
+    )]
+    pub max_row_size: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
 pub enum DialectArg {
     Auto,
@@ -196,6 +276,21 @@ mod tests {
         assert_eq!(parse(&[]).unwrap().threads.get(), 1);
         assert_eq!(parse(&["-j", "4"]).unwrap().threads.get(), 4);
         assert!(parse(&["--threads", "0"]).is_err());
+    }
+
+    #[test]
+    fn test_subcommands_keep_the_default_form() {
+        let parse = |args: &[&str]| Args::try_parse_from([&["ghostdump"], args].concat());
+        let masked = parse(&["-c", "rules.toml", "-i", "dump.sql"]).unwrap();
+        assert!(masked.command.is_none());
+        let check = parse(&["check", "-c", "rules.toml", "-i", "dump.sql"]).unwrap();
+        assert!(matches!(check.command, Some(Command::Check(_))));
+        assert!(matches!(
+            parse(&["init", "-i", "dump.sql"]).unwrap().command,
+            Some(Command::Init(_))
+        ));
+        assert!(parse(&["-c", "rules.toml", "check", "-c", "rules.toml"]).is_err());
+        assert!(parse(&["check", "-i", "dump.sql"]).is_err());
     }
 
     #[test]
