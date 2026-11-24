@@ -39,7 +39,7 @@ With glibc's allocator the threads gave no speedup: the full rule set on COPY to
 
 mimalloc's heaps are per thread, and with it the same run takes 1.8 s with three threads. Its default on Linux commits whole arenas, which raised the peak memory from 6 to 15.5 MiB with one thread and to up to 66 MiB with threads. Built with `MI_DEFAULT_ARENA_EAGER_COMMIT=0`, set in `.cargo/config.toml`, it peaks at 6.6 MiB with one thread and at most 13.6 MiB with four, at the same speed. The option cannot be set from `main`, because mimalloc reserves its first arena before `main` runs.
 
-What it costs: a C dependency built by `cc`, 157 KiB of binary, and a build setting that a `CFLAGS` variable in the environment replaces. If that happens, the binary is still correct, but its peak memory is higher. The library and the Criterion benchmarks keep the system allocator.
+What it costs: a C dependency built by `cc`, 157 KiB of binary, and a build setting that a `CFLAGS` variable in the environment replaces. If that happens, the binary is still correct, but its peak memory is higher; since stage 1.6 the test `cli::the_allocator_commits_memory_on_demand` fails then, as it does with `CFLAGS=-O2`. The library and the Criterion benchmarks keep the system allocator.
 
 ## Consequences
 
