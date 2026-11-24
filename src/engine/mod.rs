@@ -281,6 +281,8 @@ impl AnonymizerEngine {
 
         let mut buffer = [0u8; 64 * 1024];
         let mut bytes_read = 0u64;
+        // Line ends in the buffers already read.
+        let mut lines_before = 0u64;
         let mut reached_limit = false;
         let mut unterminated_data_block = false;
 
@@ -290,8 +292,14 @@ impl AnonymizerEngine {
                 break;
             }
             bytes_read += read as u64;
+            // A refusal names the line where GhostDump stopped: the line
+            // that ends the statement, header or row it refuses.
+            let at_line = |error: io::Error, at: usize| {
+                let line = lines_before + newlines(&buffer[..at]) + 1;
+                io::Error::new(error.kind(), format!("{error} (line {line} of the input)"))
+            };
 
-            for &byte in &buffer[..read] {
+            for (at, &byte) in buffer[..read].iter().enumerate() {
                 let Some(event) = parser.handle_byte(byte) else {
                     continue;
                 };
@@ -302,7 +310,7 @@ impl AnonymizerEngine {
                         if checks
                             && let Err(e) = reading.statement(&Statement::parse(&bytes, dialect))
                         {
-                            return stop(sink, e);
+                            return stop(sink, at_line(e, at));
                         }
                         sink.write(&bytes)?;
                     }
@@ -312,7 +320,7 @@ impl AnonymizerEngine {
                         opaque,
                     } => {
                         if let Err(e) = reading.header(&raw_bytes, metadata, opaque) {
-                            return stop(sink, e);
+                            return stop(sink, at_line(e, at));
                         }
                         sink.write(&raw_bytes)?;
                     }
@@ -329,13 +337,16 @@ impl AnonymizerEngine {
                     }
                     SqlEvent::Footer(footer) => {
                         if let Err(e) = reading.footer(&footer) {
-                            return stop(sink, e);
+                            return stop(sink, at_line(e, at));
                         }
                         sink.write(&footer)?;
                     }
-                    SqlEvent::Error(e) => return stop(sink, refuse(e.to_string())),
+                    SqlEvent::Error(e) => {
+                        return stop(sink, at_line(refuse(e.to_string()), at));
+                    }
                 }
             }
+            lines_before += newlines(&buffer[..read]);
         }
 
         // With `--limit` the output stops on purpose, in the middle of the input.
@@ -689,6 +700,12 @@ fn count_rows(rows_by_table: &mut BTreeMap<String, usize>, table: &str, rows: us
     if rows > 0 {
         *rows_by_table.entry(table.to_string()).or_default() += rows;
     }
+}
+
+fn newlines(bytes: &[u8]) -> u64 {
+    // memchr counts with vector instructions: about 1% of the instructions
+    // of a run that copies a COPY block.
+    memchr::memchr_iter(b'\n', bytes).count() as u64
 }
 
 /// An error that stops the run because the data cannot be handled safely.
@@ -1199,6 +1216,26 @@ mod tests {
                 assert!(err.to_string().contains("longer than 64 bytes"), "{err}");
             }
         }
+    }
+
+    #[test]
+    fn test_refusals_name_the_line_where_they_stop() {
+        let refused = |input: &[u8]| {
+            let mut out = Vec::new();
+            engine(NAME_RULES)
+                .process_dump(input, &mut out, &RunOptions::new(SqlDialect::Postgres))
+                .unwrap_err()
+                .to_string()
+        };
+        let err = refused(
+            b"SELECT 1;\nINSERT INTO users (name)\nVALUES ('a');\nUPDATE users\nSET name = 'b';\n",
+        );
+        assert!(err.ends_with("(line 5 of the input)"), "{err}");
+        // Past the first buffers read, which hold 64 KiB each.
+        let mut long = b"SELECT 1;\n".repeat(20_000);
+        long.extend_from_slice(b"INSERT INTO users VALUES ('a');\n");
+        let err = refused(&long);
+        assert!(err.ends_with("(line 20001 of the input)"), "{err}");
     }
 
     #[test]
