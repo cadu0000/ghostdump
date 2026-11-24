@@ -5,15 +5,16 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use log::warn;
 
 /// Where the dump is read from.
 pub enum InputSource {
     /// A file read as it is.
     File(File),
-    /// A file whose name ends in `.gz`, decompressed while it is read.
-    Gzip(GzDecoder<File>),
+    /// A file whose name ends in `.gz`, decompressed while it is read:
+    /// every gzip member, as `gunzip` reads them, not only the first.
+    Gzip(MultiGzDecoder<File>),
     /// The standard input.
     Stdin(io::Stdin),
 }
@@ -27,7 +28,7 @@ impl InputSource {
                 let file = File::open(&p)?;
                 let path_str = p.to_string_lossy().to_lowercase();
                 if path_str.ends_with(".gz") {
-                    return Ok(InputSource::Gzip(GzDecoder::new(file)));
+                    return Ok(InputSource::Gzip(MultiGzDecoder::new(file)));
                 }
                 Ok(InputSource::File(file))
             }
@@ -45,7 +46,9 @@ impl Read for InputSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             InputSource::File(f) => f.read(buf),
-            InputSource::Gzip(gz) => gz.read(buf),
+            InputSource::Gzip(gz) => gz.read(buf).map_err(|e| {
+                io::Error::new(e.kind(), format!("could not decompress the input: {e}."))
+            }),
             InputSource::Stdin(s) => s.read(buf),
         }
     }
