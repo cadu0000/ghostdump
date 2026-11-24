@@ -43,6 +43,14 @@ pub struct Args {
     )]
     pub secret: Option<String>,
 
+    /// Kept out of the process list and the shell history, unlike `-s`.
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Read the HMAC secret from a file (one line ending at its end is ignored)"
+    )]
+    pub secret_file: Option<PathBuf>,
+
     #[arg(short = 'v', long, action = clap::ArgAction::SetTrue, help = "Ativa logs detalhados (Debug)")]
     pub verbose: bool,
 
@@ -160,6 +168,17 @@ pub fn check_secret(secret: Option<&str>) -> Result<SecretLength, SecretError> {
     }
 }
 
+/// The secret held in a file: its text, without one line ending at its
+/// end, which editors and `echo` add. `None` when it is not UTF-8.
+pub fn secret_from_file(contents: Vec<u8>) -> Option<String> {
+    let text = String::from_utf8(contents).ok()?;
+    let secret = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(&text);
+    Some(secret.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +196,17 @@ mod tests {
         assert_eq!(parse(&[]).unwrap().threads.get(), 1);
         assert_eq!(parse(&["-j", "4"]).unwrap().threads.get(), 4);
         assert!(parse(&["--threads", "0"]).is_err());
+    }
+
+    #[test]
+    fn test_secret_files_lose_one_line_ending() {
+        let read = |contents: &[u8]| secret_from_file(contents.to_vec());
+        assert_eq!(read(b"s3cret\n").as_deref(), Some("s3cret"));
+        assert_eq!(read(b"s3cret\r\n").as_deref(), Some("s3cret"));
+        assert_eq!(read(b"s3cret").as_deref(), Some("s3cret"));
+        assert_eq!(read(b"s3cret\n\n").as_deref(), Some("s3cret\n"));
+        assert_eq!(read(b" s3cret ").as_deref(), Some(" s3cret "));
+        assert_eq!(read(&[0xff, b'a']), None);
     }
 
     #[test]

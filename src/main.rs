@@ -1,5 +1,6 @@
 use ghostdump::cli::{
     Args, DialectArg, ExitStatus, MIN_SECRET_BYTES, SecretError, SecretLength, check_secret,
+    secret_from_file,
 };
 use ghostdump::engine::config::{CompiledConfig, Config};
 use ghostdump::engine::{AnonymizerEngine, RunOptions};
@@ -7,6 +8,7 @@ use ghostdump::io::{InputSource, OutputSource};
 use ghostdump::parser::detect_dialect;
 use ghostdump::parser::state::SqlDialect;
 
+use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{Level, LevelFilter, debug, error, info, warn};
@@ -43,7 +45,8 @@ fn main() -> ExitCode {
     let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     init_logger(args.verbose);
 
-    match run(&args) {
+    let secret_on_command_line = matches.value_source("secret") == Some(ValueSource::CommandLine);
+    match run(&args, secret_on_command_line) {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure(status, message)) => {
             error!("{message}");
@@ -52,8 +55,15 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: &Args) -> Result<(), Failure> {
+fn run(args: &Args, secret_on_command_line: bool) -> Result<(), Failure> {
     info!("Starting GhostDump...");
+    if secret_on_command_line {
+        warn!(
+            "the secret given with -s can be read by other users of this machine in the \
+             process list, and stays in the shell history. Use --secret-file or \
+             GHOSTDUMP_SECRET."
+        );
+    }
 
     let config = match &args.config {
         Some(path) => load_rules(path, args.experimental_f64_sampler)?,
@@ -314,9 +324,22 @@ fn resolve_dialect(choice: DialectArg, input: &mut impl BufRead) -> Result<SqlDi
     Ok(dialect)
 }
 
+/// The HMAC secret, from `--secret-file`, `-s` or `GHOSTDUMP_SECRET`: one
+/// of them, so that a forgotten variable never takes the place of the file.
 fn resolve_secret(args: &Args) -> Result<String, Failure> {
-    let secret = args.secret.as_deref();
-    match check_secret(secret) {
+    let secret = match (&args.secret, &args.secret_file) {
+        (Some(_), Some(_)) => {
+            return Err(Failure(
+                ExitStatus::Usage,
+                "the secret is given twice, with --secret-file and with -s or \
+                 GHOSTDUMP_SECRET. Give it once."
+                    .to_string(),
+            ));
+        }
+        (_, Some(path)) => Some(read_secret_file(path)?),
+        (secret, None) => secret.clone(),
+    };
+    match check_secret(secret.as_deref()) {
         Ok(SecretLength::Recommended) => {}
         Ok(SecretLength::Short) => warn!(
             "the secret is shorter than {} bytes. HMAC pseudonyms of low-entropy \
@@ -327,18 +350,57 @@ fn resolve_secret(args: &Args) -> Result<String, Failure> {
         Err(SecretError::Missing) => {
             return Err(Failure(
                 ExitStatus::Usage,
-                "the rules use `hmac`, but no secret was given. Pass -s or set GHOSTDUMP_SECRET."
+                "the rules use `hmac`, but no secret was given. Pass --secret-file, -s or \
+                 set GHOSTDUMP_SECRET."
                     .to_string(),
             ));
         }
         Err(SecretError::Empty) => {
             return Err(Failure(
                 ExitStatus::Usage,
-                "the secret is empty. Pass -s or set GHOSTDUMP_SECRET to 32 or more random \
-                 bytes."
+                "the secret is empty. Give 32 or more random bytes with --secret-file, -s or \
+                 GHOSTDUMP_SECRET."
                     .to_string(),
             ));
         }
     }
-    Ok(secret.unwrap_or_default().to_string())
+    Ok(secret.unwrap_or_default())
 }
+
+fn read_secret_file(path: &Path) -> Result<String, Failure> {
+    let contents = std::fs::read(path).map_err(|e| {
+        Failure::io(
+            &format!("could not read the secret file {}", path.display()),
+            e,
+        )
+    })?;
+    warn_if_others_can_read(path);
+    secret_from_file(contents).ok_or_else(|| {
+        Failure(
+            ExitStatus::Usage,
+            format!(
+                "the secret file {} does not hold UTF-8 text",
+                path.display()
+            ),
+        )
+    })
+}
+
+/// A secret file that its group or other users can read exposes the secret.
+#[cfg(unix)]
+fn warn_if_others_can_read(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o044 != 0 {
+            warn!(
+                "the secret file {} can be read by its group or by other users (mode {mode:o}). \
+                 Restrict it with chmod 600.",
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_others_can_read(_: &Path) {}

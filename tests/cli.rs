@@ -176,6 +176,67 @@ fn only_a_run_that_succeeds_writes_the_output_file() {
     assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
 }
 
+/// `--secret-file` gives the same secret as GHOSTDUMP_SECRET, without the
+/// line ending at its end. The secret is given once; `-s` warns that it
+/// shows in the process list.
+#[test]
+fn secret_files_hold_the_secret() {
+    let directory = scratch("secret_file");
+    let file = directory.join("secret");
+    fs::write(&file, format!("{GOLDEN_SECRET}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let from_environment = run(&["-c", HMAC_RULES], Some(GOLDEN_SECRET), PG_DATA);
+    let from_file = run(
+        &["-c", HMAC_RULES, "--secret-file", path(&file)],
+        None,
+        PG_DATA,
+    );
+    assert!(from_file.status.success(), "{}", stderr(&from_file));
+    assert_eq!(from_file.stdout, from_environment.stdout);
+    assert!(
+        !stderr(&from_file).contains("secret"),
+        "{}",
+        stderr(&from_file)
+    );
+
+    let twice = run(
+        &["-c", HMAC_RULES, "--secret-file", path(&file)],
+        Some(GOLDEN_SECRET),
+        PG_DATA,
+    );
+    assert_eq!(twice.status.code(), Some(64));
+
+    let on_command_line = run(&["-c", HMAC_RULES, "-s", GOLDEN_SECRET], None, PG_DATA);
+    assert!(on_command_line.status.success());
+    assert!(
+        stderr(&on_command_line).contains("process list"),
+        "{}",
+        stderr(&on_command_line)
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let readable = run(
+            &["-c", HMAC_RULES, "--secret-file", path(&file)],
+            None,
+            PG_DATA,
+        );
+        assert!(readable.status.success());
+        assert!(
+            stderr(&readable).contains("chmod 600"),
+            "{}",
+            stderr(&readable)
+        );
+    }
+}
+
 #[test]
 fn stdout_carries_only_the_dump() {
     let output = run(&[], None, PASSTHROUGH);
