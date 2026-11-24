@@ -433,14 +433,16 @@ fn init_logger(verbose: bool) {
 
 /// Text for the terminal, with its control characters escaped: names come
 /// from the dump, and a quoted name can hold any of them, such as the
-/// escape sequences that move the cursor or recolor the terminal.
+/// escape sequences that move the cursor or recolor the terminal. Line
+/// breaks and tabs stay, for the messages that span lines (TOML errors).
 fn printable(text: &str) -> Cow<'_, str> {
-    if !text.chars().any(char::is_control) {
+    let escaped = |c: char| c.is_control() && c != '\n' && c != '\t';
+    if !text.chars().any(escaped) {
         return Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len() + 8);
     for c in text.chars() {
-        if c.is_control() {
+        if escaped(c) {
             out.extend(c.escape_debug());
         } else {
             out.push(c);
