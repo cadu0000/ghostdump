@@ -1484,6 +1484,11 @@ mod tests {
                 "SET @m := 'x';",
                 "SET sql_mode = @m;",
             ],
+            &[
+                "SET @m = @@sql_mode;",
+                "SELECT 'NO_BACKSLASH_ESCAPES' INTO @m;",
+                "SET sql_mode = @m;",
+            ],
             // Saved from the global value, or from another setting.
             &["SET @m = @@GLOBAL.sql_mode;", "SET sql_mode = @m;"],
             &["SET @m = @@character_set_client;", "SET sql_mode = @m;"],

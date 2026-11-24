@@ -495,8 +495,9 @@ impl Statement {
 
     /// The changes the statement makes to settings that decide how the
     /// rest of the dump is read: those of a `SET`, with the MySQL user
-    /// variables it assigns, and in PostgreSQL the `set_config` calls and
-    /// writes to `pg_settings` of any statement.
+    /// variables it assigns, the user variables any other MySQL statement
+    /// names, and in PostgreSQL the `set_config` calls and writes to
+    /// `pg_settings` of any statement.
     pub fn session_settings(&self) -> Vec<SessionSetting> {
         let mut settings = Vec::new();
         if self.starts_with(&["set"]) {
@@ -516,6 +517,18 @@ impl Statement {
                     .into_iter()
                     .filter_map(session_setting),
             );
+        } else if self.dialect == SqlDialect::Mysql {
+            // Any other statement may assign the user variables it names
+            // (`SELECT ... INTO @v`, `SELECT @v := ...`).
+            let mentioned = self.tokens.windows(2).enumerate().filter_map(|(at, pair)| {
+                let after_at = at > 0 && self.tokens[at - 1] == Token::Symbol(b'@');
+                match pair {
+                    [Token::Symbol(b'@'), name] if !after_at => variable_name(name),
+                    _ => None,
+                }
+            });
+            settings
+                .extend(mentioned.map(|name| SessionSetting::UserVariable { name, saves: None }));
         }
         if self.dialect == SqlDialect::Postgres {
             settings.extend(set_config_calls(&self.tokens));
@@ -1642,7 +1655,11 @@ mod tests {
             settings("SET @g = @@GLOBAL.sql_mode, @s = @@session.SQL_MODE;", my),
             [saves("g", None), saves("s", Some("sql_mode"))]
         );
-        assert!(settings("SELECT 1;", my).is_empty());
+        assert!(settings("SELECT 1, @@sql_mode;", my).is_empty());
+        assert_eq!(
+            settings("SELECT 'x', @@sql_mode INTO @a, @`B c`;", my),
+            [saves("a", None), saves("b c", None)]
+        );
         assert!(
             settings(
                 "SELECT set_config('standard_conforming_strings', 'off');",
