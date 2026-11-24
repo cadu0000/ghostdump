@@ -594,11 +594,18 @@ fn count_rows(rows_by_table: &mut BTreeMap<String, usize>, table: &str, rows: us
 }
 
 /// MySQL character sets in which a character can hold a byte below 0x80
-/// (`\\` among them in all but euckr), so the server would end a string
+/// (`\` among them in all but euckr), so the server would end a string
 /// where GhostDump does not. Found by converting, on MySQL 8.0, every
 /// two-byte sequence with a lead byte from 0x80 and a second byte below it;
 /// ucs2, utf16, utf16le and utf32 cannot be the character set of a client.
 const ASCII_IN_CHARACTERS: &[&str] = &["big5", "cp932", "euckr", "gb18030", "gbk", "sjis"];
+
+/// How to dump a MySQL database whose triggers, routines or events were
+/// created with a setting GhostDump refuses: mysqldump writes the setting
+/// before each of them.
+const DUMP_CODE_APART: &str = "Dump the data without them (mysqldump --skip-triggers, \
+     without --routines and --events), and the triggers, routines and events apart: \
+     they hold no rows (mysqldump --no-data --no-create-info --routines --events)";
 
 /// MySQL user variables that hold a saved setting (`SET @saved_sql_mode =
 /// @@sql_mode`), so that restoring it (`SET sql_mode = @saved_sql_mode`)
@@ -662,22 +669,22 @@ fn check_settings(statement: &Statement, saved: &mut SavedSettings) -> io::Resul
                     .split(',')
                     .any(|mode| mode.trim().eq_ignore_ascii_case("no_backslash_escapes")) =>
             {
-                return Err(refuse(
-                    "the dump sets NO_BACKSLASH_ESCAPES in sql_mode: backslashes would then be \
-                     plain characters in strings, which GhostDump reads as escapes, so a row \
-                     could be misread. Dump with mysqldump, which escapes with backslashes and \
-                     sets sql_mode itself"
-                        .into(),
-                ));
+                return Err(refuse(format!(
+                    "the dump sets NO_BACKSLASH_ESCAPES in sql_mode, as mysqldump does before \
+                     a trigger, routine or event created in that mode: backslashes would then \
+                     be plain characters in strings, which GhostDump reads as escapes, so a \
+                     later row could be misread. {DUMP_CODE_APART}"
+                )));
             }
             SessionSetting::ClientCharset(SettingValue::Literal(charset))
                 if ASCII_IN_CHARACTERS.contains(&charset.to_ascii_lowercase().as_str()) =>
             {
                 return Err(refuse(format!(
                     "the dump sets character_set_client to `{charset}`, in which a character \
-                     can hold an ASCII byte such as a backslash: the server would end strings \
-                     where GhostDump does not, so a row could be misread. Dump again in UTF-8 \
-                     (mysqldump --default-character-set=utf8mb4)"
+                     can hold an ASCII byte such as a backslash, as mysqldump does before a \
+                     trigger, routine or event created in that character set: the server \
+                     would end strings where GhostDump does not, so a later row could be \
+                     misread. {DUMP_CODE_APART}"
                 )));
             }
             SessionSetting::SqlMode(value) => check_restored("sql_mode", value, saved)?,
