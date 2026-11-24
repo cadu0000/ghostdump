@@ -28,6 +28,7 @@ The V1 stabilization, stages 1.1 to 1.6 of the [roadmap](docs/roadmap.md), again
 - The `f64` Laplace sampler needs the hidden option `--experimental-f64-sampler`.
 - The help is in English, like the rest of the interface, and says what each `--dialect` value means.
 - Rust 1.88 or later is required (`rust-version`).
+- A key that the rules file does not know is an error (exit status 78): in a rule, in a table, or at the top. Unknown keys used to be ignored.
 
 ### Fixed
 
@@ -45,5 +46,8 @@ The V1 stabilization, stages 1.1 to 1.6 of the [roadmap](docs/roadmap.md), again
 - Values are masked from their bytes. They used to be decoded as UTF-8, so different values that are not valid UTF-8 got one `hmac` pseudonym (the `_binary` values of a mysqldump, LATIN1 text of a pg_dump); with rules, a dump in an encoding other than UTF-8 is now refused.
 - With `mysqldump --databases`, rows name no schema and follow a `USE`; rules that named the schema did not apply, and the rows passed in clear.
 - 22 of 73 scripts written by hand leaked a stored value through psql, mysql or sqlite3: version comments, `--` without a space, sqlite3's `#` lines, client commands, and settings that change how strings are read. None leaks now. With rules, these now stop the run: statements that write to a table with rules in a form that cannot be masked (`UPDATE`, `INSERT ... SELECT`, `CREATE TABLE ... AS SELECT`), values written after the rows (`ON DUPLICATE KEY UPDATE`), settings that change how strings are read, and client commands that dump tools do not write.
+- A misspelt optional key of a rule, such as `null_polcy = "generate"`, was ignored without a word, so the rule protected less than it said: here, NULL values kept their pattern. Such keys are now errors.
+- Names from the dump reach the terminal with their control characters escaped: a quoted name could hold escape sequences that recolor the terminal or move its cursor.
+- The CI workflows run with a read-only token.
 - `rand` 0.8.6, patched for RUSTSEC-2026-0097. GhostDump was not exposed: the advisory needs a custom logger that calls `rand::thread_rng()`.
 - CI audits the dependencies with `cargo audit`.
