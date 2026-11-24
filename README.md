@@ -203,10 +203,10 @@ All status messages and warnings are written to stderr, so stdout carries only t
 
 ### Building from Source
 
-Clone the repository and build using Cargo:
+Clone the repository and build it with Cargo. It needs Rust 1.88 or later, and a C compiler for the allocator (mimalloc):
 
 ```bash
-git clone [https://github.com/cadu0000/ghostdump](https://github.com/cadu0000/ghostdump)
+git clone https://github.com/cadu0000/ghostdump
 cd ghostdump
 cargo build --release
 
@@ -296,11 +296,11 @@ cargo test -- --nocapture
 
 ```
 
-Continuous integration (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on every push and pull request. The integration tests in `tests/` run the binary on fixture dumps and compare its output with expected files.
+Continuous integration has two pipelines. The fast one (`.github/workflows/ci.yml`) runs on every push and pull request, and weekly: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo doc` without warnings, `cargo test`, the validation of the Laplace samplers, the tests again on Rust 1.88, the minimum supported version, and `cargo audit` on both lockfiles. The full one (`.github/workflows/full.yml`) runs by hand and on every pull request into `main`: the property tests with 1,000,000 cases each, 15 minutes of fuzzing per target, and a short run of the microbenchmarks. The integration tests in `tests/` run the binary on fixture dumps and compare its output with expected files.
 
 `tests/properties.rs` holds property-based tests (proptest): on inputs built from SQL fragments and arbitrary bytes, the parser reports every byte, a run without rules is an exact copy or a clean error, and masking keeps the rows and the unmasked columns. `cargo test` runs 256 cases per property; for a deeper search, run `PROPTEST_CASES=100000 cargo test --release --test properties`.
 
-The statistical validation of the Laplace samplers is slow and ignored by default; run it with `cargo test --release -- --ignored`.
+The statistical validation of the Laplace samplers is ignored by default, because it is slow in a debug build (26 s, against under a second in release); run it with `cargo test --release -- --ignored`.
 
 `fuzz/` holds two [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets built from the property tests: `parser` (no byte is lost) and `engine` (without rules, an exact copy or a clean error; with rules, no panic, and the same output on one and three threads). They need the nightly compiler:
 
