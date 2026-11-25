@@ -89,7 +89,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 | 114bd151f8fb0
 
 ##  Supported SQL Dialects
 
-GhostDump's FSM parser is designed to handle the most common SQL dump formats. The dialect is detected from the dump header (`--dialect auto`, the default) or chosen with `--dialect postgres|mysql|sqlite`. A statement ends where the client that loads the dump ends it: psql at a `;` outside parentheses and outside the `BEGIN ATOMIC ... END` body of a function, mysql at its delimiter (changed by `DELIMITER`), sqlite3 at a `;`, or at `; END;` for a trigger. The bodies of functions, procedures, triggers and rules are code: they are copied as they are.
+GhostDump's FSM parser is designed to handle the most common SQL dump formats. The dialect is detected from the dump header (`--dialect auto`, the default) or chosen with `--dialect postgres|mysql|sqlite`. A statement ends where the client that loads the dump ends it: psql at a `;` outside parentheses and outside the `BEGIN ATOMIC ... END` body of a function, mysql at its delimiter (changed by `DELIMITER`, and also at the end of a `USE` line), sqlite3 at a `;`, or at `; END;` for a trigger. Comments are read as each client reads them: MySQL runs what a `/*! ... */` comment holds, so GhostDump reads it as code; MySQL opens a comment at `--` only before a space (`1--1` is arithmetic); sqlite3 skips a line that starts with `#`. The bodies of functions, procedures, triggers and rules are code: they are copied as they are.
 
 * **PostgreSQL**: `COPY ... FROM stdin;` blocks in text format and `INSERT` statements (`pg_dump --inserts` and `--column-inserts`, also with `--rows-per-insert` and `--on-conflict-do-nothing`, and with `OVERRIDING SYSTEM VALUE` for identity columns).
 * **MySQL**: multi-row `INSERT`, `INSERT IGNORE` and `REPLACE` statements, as mysqldump writes them with or without `--complete-insert`.
@@ -99,16 +99,21 @@ An `INSERT` without a column list fills the columns of the table in order. Ghost
 
 Quoted names are read with their spaces and escaped quotes: `"my table"`, `` `my table` ``, `[my table]`.
 
-GhostDump fails closed: when a table has rules that cannot be applied, it stops with an error instead of writing the values unmasked. This happens when:
+GhostDump fails closed: when its rules cannot be applied with certainty, it stops with an error instead of writing the values unmasked. This happens when:
 
 * an `INSERT` has no column list and the dump does not show the columns with certainty: no `CREATE TABLE` for the table comes before (a data-only dump, such as `sqlite3`'s `.dump --data-only` or `mysqldump --no-create-info`), its `CREATE TABLE` does not list them all (`AS SELECT`, `LIKE`, `INHERITS`, `PARTITION OF`, `OF`, MySQL `INVISIBLE` columns), or a later statement may have changed them (`ALTER TABLE ... ADD COLUMN`, `DROP COLUMN`, `RENAME`, `DROP TABLE`);
 * a `COPY ... FROM stdin` uses options such as `WITH (FORMAT csv)`, or the table name of a data block cannot be read;
 * a statement that writes data in another form names a table with rules: `INSERT ... SELECT`, MySQL's `INSERT ... SET`, `UPDATE`, `DELETE`, `MERGE`, `LOAD DATA`, `COPY ... FROM 'file'`, `CREATE TABLE ... AS SELECT`, `SELECT ... INTO`, and `WITH` holding any of these. The check is by name, so a column or keyword spelt like such a table stops the run too. pg_dump, mysqldump and sqlite3 never write these statements;
-* the clause after the rows of an `INSERT` into a table with rules holds a value, as `ON DUPLICATE KEY UPDATE name = 'x'` does (`ON CONFLICT DO NOTHING` holds none).
+* the clause after the rows of an `INSERT` into a table with rules holds a value, as `ON DUPLICATE KEY UPDATE name = 'x'` does (`ON CONFLICT DO NOTHING` holds none);
+* there are rules and the dump changes how it must be read: it declares an encoding other than UTF-8 (`SET client_encoding`, `SET NAMES`, PostgreSQL's `set_config('client_encoding', ...)`), sets PostgreSQL's `standard_conforming_strings` to anything but `on`, sets MySQL's `NO_BACKSLASH_ESCAPES`, or sets MySQL's `character_set_client` to a character set in which a character can hold an ASCII byte (big5, cp932, euckr, gb18030, gbk, sjis). A value GhostDump cannot work out is refused too: `DEFAULT`, a number, an expression, a variable that does not hold a value saved from the same setting (`SET @v = @@sql_mode`, as mysqldump does), a `set_config` whose setting is not a string, an `UPDATE` of `pg_settings`. Dump in UTF-8: `pg_dump -E UTF8`, `mysqldump --default-character-set=utf8mb4` (the default of mysqldump 8.0). mysqldump also writes the `sql_mode` and character set a trigger, routine or event was created with before it: when those stop the run, dump the data without them (`mysqldump --skip-triggers`, without `--routines` and `--events`) and dump them apart, which gives no rows (`mysqldump --no-data --no-create-info --routines --events`);
+* there are rules and the dump runs a client command that pg_dump, mysqldump and sqlite3 do not write: a psql meta-command other than `\connect` (`\c`), `\restrict` and `\unrestrict` (such as `\set`, `\copy` or `\g`), a mysql command (`\g`, `\d`, `source`, `charset`, ...) other than `DELIMITER` and `USE`, or a sqlite3 dot-command. These commands can carry data, read other files, or change the delimiter or the encoding;
+* the rows of a table name no schema, the dump does not say which schema they go to (`mysqldump --databases` says it, with `USE`), and the only rules for the table name a schema, as `[tables."shop.users"]` does.
 
 Rows, and the statements GhostDump holds to check them, also stop the run when they are larger than `--max-row-size` (256 MiB by default).
 
-What GhostDump does not see: data that reaches a table through code (the body of a function, procedure, trigger or rule, a `DO` block, a prepared statement, a variable), statements inside MySQL version comments (`/*! ... */`), which may also change the columns of a table, and PostgreSQL large objects, which pg_dump writes as `SELECT pg_catalog.lowrite(...)`. Dump with `pg_dump --no-large-objects` (`-B`) when large objects hold personal data.
+Values are masked from their bytes, unescaped but not decoded: two values that differ in any byte, such as binary data, keep different `hmac` pseudonyms.
+
+What GhostDump does not see: data that reaches a table through code (the body of a function, procedure, trigger or rule, a `DO` block, a prepared statement, an SQL variable such as MySQL's `SET @v = ...`), settings that code changes, and PostgreSQL large objects, which pg_dump writes as `SELECT pg_catalog.lowrite(...)`. Dump with `pg_dump --no-large-objects` (`-B`) when large objects hold personal data.
 
 ---
 
@@ -265,6 +270,17 @@ Continuous integration (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `c
 
 The statistical validation of the Laplace samplers is slow and ignored by default; run it with `cargo test --release -- --ignored`.
 
+`fuzz/` holds two [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets built from the property tests: `parser` (no byte is lost) and `engine` (without rules, an exact copy or a clean error; with rules, no panic, and the same output on one and three threads). They need the nightly compiler:
+
+```bash
+cargo install cargo-fuzz
+sh fuzz/seed.sh   # the dump fixtures, once per dialect
+cargo +nightly fuzz run parser -- -max_total_time=900 -dict=fuzz/sql.dict
+cargo +nightly fuzz run engine -- -max_total_time=900 -dict=fuzz/sql.dict
+```
+
+`scripts/client_framing.py` checks 73 unusual scripts (comments, quoting, client commands, settings) against psql, mysql and sqlite3: a value the database stores must not leave GhostDump in clear ([docs/experiments/client-framing.md](docs/experiments/client-framing.md)).
+
 For reproducible experiments, the hidden `--seed <N>` option fixes every random choice (generated values and Laplace noise). Anyone who knows the seed can recompute them, so never use it on real data. A seeded run writes the same output for any `--threads`.
 
 ---
@@ -276,6 +292,7 @@ For reproducible experiments, the hidden `--seed <N>` option fixes every random 
 | [docs/guarantees.md](docs/guarantees.md) | What each strategy protects, under which conditions, and the propositions behind it |
 | [docs/experiments/utility.md](docs/experiments/utility.md) | Utility of masked dumps: local arms, SQL and estimator analysts, central-DP comparator (`scripts/utility_eval.py`) |
 | [docs/experiments/floating-point.md](docs/experiments/floating-point.md) | Floating-point distinguishing experiment on the Laplace samplers (`examples/fp_distinguisher.rs`) |
+| [docs/experiments/client-framing.md](docs/experiments/client-framing.md) | Unusual comments, quoting, client commands and settings, checked against psql, mysql and sqlite3 (`scripts/client_framing.py`) |
 | [docs/benchmarks.md](docs/benchmarks.md) | Microbenchmarks, end-to-end throughput and memory, and parallel masking (`benches/`, `scripts/bench_grid.py`) |
 | [docs/decisions/0001-laplace-sampler.md](docs/decisions/0001-laplace-sampler.md) | Why the exact integer sampler, and why not OpenDP |
 | [docs/decisions/0002-parallel-masking.md](docs/decisions/0002-parallel-masking.md) | How `--threads` keeps the output ordered, reproducible and in bounded memory, and why mimalloc |

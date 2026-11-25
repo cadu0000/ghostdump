@@ -1,0 +1,29 @@
+[package]
+name = "ghostdump-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+toml = "1.0.3"
+
+[dependencies.ghostdump]
+path = ".."
+
+[[bin]]
+name = "parser"
+path = "fuzz_targets/parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "engine"
+path = "fuzz_targets/engine.rs"
+test = false
+doc = false
+bench = false

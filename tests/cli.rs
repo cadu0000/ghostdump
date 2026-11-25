@@ -29,6 +29,26 @@ const CONSISTENT_RULES: &str = concat!(
 const RR_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rr_rules.toml");
 const DP_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dp_rules.toml");
 const F64_RULES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/f64_rules.toml");
+const MYSQL_BINARY: &[u8] = include_bytes!("fixtures/mysqldump_binary.sql");
+const MYSQL_DATABASES: &[u8] = include_bytes!("fixtures/mysqldump_databases.sql");
+const QUALIFIED_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/qualified_rules.toml"
+);
+const PG_LATIN1: &[u8] = include_bytes!("fixtures/pg_dump_latin1.sql");
+const MYSQL_NBE_TRIGGER: &[u8] = include_bytes!("fixtures/mysqldump_nbe_trigger.sql");
+const TRIGGER_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/trigger_rules.toml"
+);
+const LATIN1_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/latin1_rules.toml"
+);
+const BINARY_RULES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/binary_rules.toml"
+);
 const TYPO_RULES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/typo_rules.toml"
@@ -513,4 +533,163 @@ fn pg_dump_with_inserts_is_masked() {
     ] {
         assert!(!stdout.contains(value), "{value} in {stdout}");
     }
+}
+
+#[test]
+fn pg_dump_default_format_is_masked() {
+    // pg_dump 16 with no options: COPY blocks, and psql's \\restrict.
+    let dump = include_bytes!("fixtures/pg_dump_default.sql");
+    let output = run(&["-c", DUMP_FORMS_RULES], None, dump);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout.contains(
+        "COPY public.users (id, name, email) FROM stdin;\n1\tMasked\t\\N\n2\tMasked\t\\N\n\\.\n"
+    ));
+    assert!(stdout.contains("COPY public.\"my table\" (\"first name\") FROM stdin;\n\\N\n\\.\n"));
+    assert!(stdout.contains("COPY public.log (x) FROM stdin;\n\\N\n\\N\n\\.\n"));
+    for value in [
+        "Alice Example",
+        "alice@example.com",
+        "O'Brien",
+        "Carol Example",
+    ] {
+        assert!(!stdout.contains(value), "{value} in {stdout}");
+    }
+    // The rule on "my table" is schema, copied as it is, with its literal.
+    assert!(stdout.contains("  VALUES ('second action'::text);\n);"));
+}
+
+/// mysqldump writes binary columns as raw bytes (`_binary '...'`), most of
+/// them not UTF-8. Each value is pseudonymized from its own bytes, so values
+/// that differ only there keep different pseudonyms.
+#[test]
+fn binary_values_keep_distinct_pseudonyms() {
+    let output = run(&["-c", BINARY_RULES], Some(GOLDEN_SECRET), MYSQL_BINARY);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let pseudonym = |bytes: &[u8]| ghostdump::engine::mask::hmac_hash(bytes, GOLDEN_SECRET);
+    let tokens: [&[u8]; 3] = [
+        &[0xe9, 0xff, 0, 1],
+        &[0xe8, 0xff, 0, 1],
+        &[b'A', 0xff, 0, 1],
+    ];
+    let names = ["José", "Josè", "Ana"];
+    for (id, (name, token)) in names.iter().zip(tokens).enumerate() {
+        let row = format!(
+            "({},'{}','{}')",
+            id + 1,
+            pseudonym(name.as_bytes()),
+            pseudonym(token)
+        );
+        assert!(stdout.contains(&row), "{row} not in {stdout}");
+    }
+    assert_ne!(pseudonym(tokens[0]), pseudonym(tokens[1]));
+}
+
+/// pg_dump writes a LATIN1 database in LATIN1 unless told otherwise. With
+/// rules the run stops at that setting, before any row; without rules the
+/// dump is copied as it is.
+#[test]
+fn dumps_in_another_encoding_are_refused_with_rules() {
+    let refused = run(&["-c", LATIN1_RULES], Some(GOLDEN_SECRET), PG_LATIN1);
+    let message = stderr(&refused);
+    assert!(!refused.status.success());
+    assert!(message.contains("`LATIN1`"), "{message}");
+    assert!(message.contains("pg_dump -E UTF8"), "{message}");
+    assert!(PG_LATIN1.starts_with(&refused.stdout));
+    assert!(!String::from_utf8_lossy(&refused.stdout).contains("COPY"));
+
+    let copied = run(&[], None, PG_LATIN1);
+    assert!(copied.status.success(), "stderr: {}", stderr(&copied));
+    assert_eq!(copied.stdout, PG_LATIN1);
+}
+
+/// mysql runs what `/*! ... */` holds, and ends statements at a `;` inside
+/// it, so rows there are masked like any other.
+#[test]
+fn rows_inside_mysql_version_comments_are_masked() {
+    let dump = b"/*!40101 SET NAMES utf8mb4 */;\n/*!40000 INSERT INTO customers (name, email) VALUES ('Ana', 'ana@example.com') */;\n";
+    let output = run(&["-c", MYSQL_RULES, "--dialect", "mysql"], None, dump);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(
+        stdout.contains(
+            "/*!40000 INSERT INTO customers (name, email) VALUES ('Masked O\\'Name', NULL) */;"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("ana@example.com"));
+}
+
+/// psql reads `\\echo it's` as a command, not SQL; a quote there would
+/// hide the INSERT after it. With rules, a client command that dump tools
+/// do not write stops the run; without rules the dump is copied.
+#[test]
+fn client_commands_stop_the_run_with_rules() {
+    let dump = b"\\echo it's\nINSERT INTO users (name) VALUES ('Ana');\n";
+    let refused = run(&["-c", PG_RULES], Some(GOLDEN_SECRET), dump);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("`\\echo`"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!String::from_utf8_lossy(&refused.stdout).contains("Ana"));
+
+    let copied = run(&[], None, dump);
+    assert!(copied.status.success(), "stderr: {}", stderr(&copied));
+    assert_eq!(copied.stdout, dump);
+}
+
+/// mysqldump writes the sql_mode a trigger was created with before it. A
+/// trigger created with NO_BACKSLASH_ESCAPES stops the run there: after the
+/// rows of its table, before the rows of the next one, with the way to dump
+/// the trigger apart.
+#[test]
+fn triggers_without_backslash_escapes_stop_the_run() {
+    let output = run(&["-c", TRIGGER_RULES], None, MYSQL_NBE_TRIGGER);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = stderr(&output);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("NO_BACKSLASH_ESCAPES") && stderr.contains("--skip-triggers"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("INSERT INTO `users` VALUES (1,'MASKED');"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Secret"), "{stdout}");
+}
+
+/// `mysqldump --databases` names the database once, in a `USE`, and the
+/// tables without it. A rule for `shopq.users` applies to them; without the
+/// `USE` the rows cannot be told apart, and the run stops.
+#[test]
+fn rules_with_a_schema_follow_mysql_use() {
+    let output = run(&["-c", QUALIFIED_RULES], None, MYSQL_DATABASES);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(
+        stdout.contains("INSERT INTO `users` VALUES (1,'MASKED');"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Ana Secret"));
+
+    let without_use: Vec<u8> = String::from_utf8_lossy(MYSQL_DATABASES)
+        .lines()
+        .filter(|line| !line.starts_with("USE "))
+        .flat_map(|line| [line.as_bytes(), b"\n"].concat())
+        .collect();
+    let refused = run(&["-c", QUALIFIED_RULES], None, &without_use);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("name no schema"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!String::from_utf8_lossy(&refused.stdout).contains("Ana Secret"));
 }

@@ -29,11 +29,17 @@ pub struct ColumnOrders {
 
 impl ColumnOrders {
     /// Takes what a statement changed. Returns whether what is known about
-    /// a table with rules changed.
-    pub fn apply(&mut self, change: TableChange, config: &CompiledConfig) -> bool {
+    /// a table with rules changed. `database` is the schema of names
+    /// without one (MySQL `USE`).
+    pub fn apply(
+        &mut self,
+        change: TableChange,
+        config: &CompiledConfig,
+        database: Option<&str>,
+    ) -> bool {
         let has_rules = |table: &TableName| {
             config
-                .rules_for(table.schema.as_deref(), &table.table)
+                .rules_for(table.schema.as_deref().or(database), &table.table)
                 .is_some()
         };
         match change {
@@ -88,7 +94,7 @@ mod tests {
         let change = Statement::parse(sql.as_bytes(), SqlDialect::Postgres)
             .table_change()
             .expect("a statement that changes tables");
-        orders.apply(change, &config())
+        orders.apply(change, &config(), None)
     }
 
     #[test]

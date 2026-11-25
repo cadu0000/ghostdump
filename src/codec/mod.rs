@@ -13,21 +13,32 @@ use std::ops::Range;
 use crate::parser::state::{InsertFormat, SqlDialect};
 
 /// A column value, with the type information the dump carries.
+///
+/// Values are bytes, unescaped but not decoded: a field may hold binary
+/// data, or text in an encoding other than UTF-8, and two different values
+/// must stay different.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlValue {
     Null,
     /// Text, written as a string literal in VALUES.
-    Text(String),
+    Text(Vec<u8>),
     /// A literal written as it is: a number, a boolean, a function call.
-    Raw(String),
+    Raw(Vec<u8>),
 }
 
 impl SqlValue {
-    pub fn as_str(&self) -> Option<&str> {
+    /// The bytes of the value; `None` for NULL.
+    pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             SqlValue::Null => None,
-            SqlValue::Text(text) | SqlValue::Raw(text) => Some(text),
+            SqlValue::Text(bytes) | SqlValue::Raw(bytes) => Some(bytes),
         }
+    }
+
+    /// The value as text; `None` for NULL and for bytes that are not UTF-8.
+    pub fn as_str(&self) -> Option<&str> {
+        self.as_bytes()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
     }
 
     pub fn is_null(&self) -> bool {

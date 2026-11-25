@@ -63,6 +63,12 @@ const FRAGMENTS: &[&str] = &[
     " ON DUPLICATE KEY UPDATE a = ",
     "[",
     "]",
+    "/*!40000 ",
+    "/*!",
+    "/*M!",
+    "SET NAMES utf8mb4 ",
+    "SET client_encoding = 'LATIN1';\n",
+    "_binary '",
 ];
 
 /// A byte string made of SQL fragments and arbitrary bytes.

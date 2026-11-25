@@ -6,7 +6,8 @@ use std::fmt;
 use std::sync::Arc;
 
 pub use schema::{
-    HeaderMetadata, Statement, TableChange, TableName, detect_dialect, extract_metadata, has_values,
+    HeaderMetadata, SessionSetting, SettingValue, Statement, TableChange, TableName,
+    detect_dialect, extract_metadata, has_values,
 };
 pub use state::{InsertFormat, Remainder, SqlDialect};
 
@@ -22,6 +23,9 @@ pub enum ParseError {
     /// A row, a data block header or a statement held for checking grew
     /// past the size limit.
     TooLarge { limit: usize },
+    /// A client command that dump tools do not write, while such commands
+    /// are refused (see [`SqlParser::refusing_client_commands`]).
+    ClientCommand { command: String },
 }
 
 impl fmt::Display for ParseError {
@@ -31,6 +35,13 @@ impl fmt::Display for ParseError {
                 f,
                 "a data row or a statement is longer than {limit} bytes \
                  (raise --max-row-size if the dump really has ones this large)"
+            ),
+            ParseError::ClientCommand { command } => write!(
+                f,
+                "the dump runs the client command `{command}`, which GhostDump does not \
+                 read: client commands can hold data or change how the rest of the dump is \
+                 read (variables, other files, another delimiter). Remove it, or run \
+                 without rules"
             ),
         }
     }
@@ -75,6 +86,7 @@ pub struct SqlParser {
     last_header: Vec<u8>,
     last_metadata: Option<Arc<HeaderMetadata>>,
     max_row_bytes: usize,
+    refuse_commands: bool,
 }
 
 impl SqlParser {
@@ -85,6 +97,7 @@ impl SqlParser {
             last_header: Vec::new(),
             last_metadata: None,
             max_row_bytes: DEFAULT_MAX_ROW_BYTES,
+            refuse_commands: false,
         }
     }
 
@@ -92,8 +105,27 @@ impl SqlParser {
     /// as errors instead of growing the buffer without bound.
     pub fn with_max_row_bytes(mut self, limit: usize) -> Self {
         self.max_row_bytes = limit;
-        self.state = State::Normal(NormalState::at_input_start(self.dialect, limit));
+        self.state = State::Normal(self.normal_state(true));
         self
+    }
+
+    /// Client commands that dump tools do not write (psql `\echo`, mysql
+    /// `\g` or `source`, sqlite3 `.print`) are reported as errors instead
+    /// of being passed through. Set when there are rules: those commands
+    /// can carry data, or change how what follows is read.
+    pub fn refusing_client_commands(mut self, refuse: bool) -> Self {
+        self.refuse_commands = refuse;
+        self.state = State::Normal(self.normal_state(true));
+        self
+    }
+
+    fn normal_state(&self, at_input_start: bool) -> NormalState {
+        let state = if at_input_start {
+            NormalState::at_input_start(self.dialect, self.max_row_bytes)
+        } else {
+            NormalState::new(self.dialect, self.max_row_bytes)
+        };
+        state.refusing_commands(self.refuse_commands)
     }
 
     pub fn handle_byte(&mut self, byte: u8) -> Option<SqlEvent> {
@@ -119,6 +151,11 @@ impl SqlParser {
                 NormalEvent::Released(bytes) => Some(SqlEvent::Passthrough(bytes)),
                 NormalEvent::Statement(bytes) => Some(SqlEvent::Statement(bytes)),
                 NormalEvent::TooLarge => Some(self.too_large()),
+                NormalEvent::ClientCommand(command) => {
+                    Some(SqlEvent::Error(ParseError::ClientCommand {
+                        command: String::from_utf8_lossy(&command).into_owned(),
+                    }))
+                }
             },
             State::InsertHeader(header_state) => match header_state.process_byte(byte) {
                 InsertHeaderEvent::HeaderComplete {
@@ -143,7 +180,7 @@ impl SqlParser {
                     })
                 }
                 InsertHeaderEvent::NotData(bytes) => {
-                    self.state = State::Normal(NormalState::new(self.dialect, self.max_row_bytes));
+                    self.state = State::Normal(self.normal_state(false));
                     Some(SqlEvent::Statement(bytes))
                 }
                 InsertHeaderEvent::TooLarge => Some(self.too_large()),
@@ -152,7 +189,7 @@ impl SqlParser {
             State::ValueMode(v_state) => match v_state.process_byte(byte) {
                 ValueEvent::TupleComplete(data) => Some(SqlEvent::Tuple(data, v_state.format)),
                 ValueEvent::ExitValuesMode(footer_bytes) => {
-                    self.state = State::Normal(NormalState::new(self.dialect, self.max_row_bytes));
+                    self.state = State::Normal(self.normal_state(false));
                     Some(SqlEvent::Footer(footer_bytes))
                 }
                 ValueEvent::Passthrough(byte) => Some(SqlEvent::DefaultStatement(byte)),
@@ -633,6 +670,151 @@ mod tests {
     }
 
     #[test]
+    fn test_mysql_version_comments_are_read_as_code() {
+        // mysql runs what `/*!` holds, and ends statements inside it.
+        let my = SqlDialect::Mysql;
+        assert!(opens_data_block(
+            my,
+            b"/*!40000 INSERT INTO users (name) VALUES ('x') */;\n"
+        ));
+        assert!(opens_data_block(
+            my,
+            b"/*!40000 SELECT 1; */ INSERT INTO users (name) VALUES ('x');\n"
+        ));
+        let (statements, _) = held(my, b"/*!40000 UPDATE users SET name = 'x' */;\n");
+        assert_eq!(statements, ["UPDATE users SET name = 'x' */;"]);
+        // MariaDB's `/*M!` and optimizer hints stay comments.
+        assert!(!opens_data_block(
+            my,
+            b"/*M!100000 INSERT INTO users (name) VALUES ('x') */;\n"
+        ));
+        assert!(!opens_data_block(
+            my,
+            b"/*+ INSERT INTO users (name) VALUES ('x') */;\n"
+        ));
+    }
+
+    #[test]
+    fn test_mysql_double_dash_is_a_comment_only_before_a_space() {
+        let my = SqlDialect::Mysql;
+        assert!(opens_data_block(
+            my,
+            b"-- c\nINSERT INTO users (name) VALUES ('x');\n"
+        ));
+        assert!(opens_data_block(
+            my,
+            b"--\tc\nINSERT INTO users (name) VALUES ('x');\n"
+        ));
+        // `1--1` is arithmetic: the statement ends at its `;`.
+        assert!(opens_data_block(
+            my,
+            b"DO 1--1;\nINSERT INTO users (name) VALUES ('x');\n"
+        ));
+        let (statements, _) = held(my, b"SET @x = 1--1, @y = 'it''s';\n");
+        assert_eq!(statements, ["SET @x = 1--1, @y = 'it''s';"]);
+    }
+
+    /// The client command the parser stops at, with commands refused.
+    fn refused_command(dialect: SqlDialect, sql: &[u8]) -> Option<String> {
+        let mut parser = SqlParser::new(dialect).refusing_client_commands(true);
+        sql.iter().find_map(|&byte| match parser.handle_byte(byte) {
+            Some(SqlEvent::Error(ParseError::ClientCommand { command })) => Some(command),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn test_client_commands_are_refused_unless_dump_tools_write_them() {
+        let pg = SqlDialect::Postgres;
+        // What pg_dump and pg_dumpall write.
+        for sql in [
+            "\\connect shop\nINSERT INTO t (a) VALUES (1);\n",
+            "\\restrict AbC123\n\\unrestrict AbC123\n",
+            "  \\c shop\n",
+        ] {
+            assert_eq!(refused_command(pg, sql.as_bytes()), None, "{sql}");
+        }
+        for (sql, command) in [
+            ("\\echo it's\n", "\\echo"),
+            ("\\set v 'x'\n", "\\set"),
+            (
+                "\\connect shop \\\\ INSERT INTO t (a) VALUES (1);\n",
+                "\\\\",
+            ),
+            ("SELECT 1 \\g\n", "\\g"),
+            ("\\copy t FROM stdin\n", "\\copy"),
+        ] {
+            assert_eq!(
+                refused_command(pg, sql.as_bytes()).as_deref(),
+                Some(command),
+                "{sql}"
+            );
+        }
+
+        let my = SqlDialect::Mysql;
+        for sql in [
+            "USE `shop`;\n",
+            "DELIMITER //\nSELECT 1//\nDELIMITER ;\n",
+            "INSERT INTO t (a) VALUES ('C:\\\\');\n",
+        ] {
+            assert_eq!(refused_command(my, sql.as_bytes()), None, "{sql}");
+        }
+        for (sql, command) in [
+            ("DO 1 \\g\n", "\\g"),
+            ("\\d //\n", "\\d"),
+            ("source other.sql\n", "source"),
+            ("charset latin1\n", "charset"),
+        ] {
+            assert_eq!(
+                refused_command(my, sql.as_bytes()).as_deref(),
+                Some(command),
+                "{sql}"
+            );
+        }
+
+        // sqlite3: a dot-command line is refused, a `#` line is a comment.
+        let lite = SqlDialect::Sqlite;
+        assert_eq!(
+            refused_command(lite, b".print it's\n").as_deref(),
+            Some(".print")
+        );
+        assert_eq!(refused_command(lite, b"SELECT 1;\n  .print x\n"), None);
+        assert!(opens_data_block(
+            lite,
+            b"# it's\nINSERT INTO t (a) VALUES ('x');\n"
+        ));
+        // Without refusing, every command passes through as it is.
+        assert_passes_through(pg, b"\\echo it's\n");
+        assert_passes_through(lite, b".print it's\n");
+    }
+
+    #[test]
+    fn test_mysql_use_ends_at_its_line() {
+        // mysql runs `use db` without a `;` as a client command.
+        let my = SqlDialect::Mysql;
+        let sql = b"use shop\nINSERT INTO users (name) VALUES ('x');\n";
+        let (statements, opened) = held(my, sql);
+        assert_eq!(statements, ["use shop\n"]);
+        assert!(opened);
+        let (statements, _) = held(my, b"USE `shop`; SELECT 1;\n");
+        assert_eq!(statements, ["USE `shop`;", "SELECT 1;"]);
+    }
+
+    #[test]
+    fn test_a_delimiter_inside_a_word_ends_the_statement_there() {
+        // mysql ends `END$$INSERT` at `$$`: the INSERT starts a statement.
+        let my = SqlDialect::Mysql;
+        let sql = b"DELIMITER $$\nSELECT 1 END$$INSERT INTO users (name) VALUES ('x')$$\n";
+        let (statements, _) = held(my, sql);
+        assert_eq!(
+            statements,
+            ["SELECT 1 END$$", "INSERT INTO users (name) VALUES ('x')$$"]
+        );
+        // Found by fuzzing: a word cut by the delimiter used to carry over.
+        assert_passes_through(my, b"DELIMITER T\nUPDATE UPDATE ");
+    }
+
+    #[test]
     fn test_mysql_data_with_a_custom_delimiter_is_held() {
         let sql = b"DELIMITER //\nINSERT INTO users (name) VALUES ('Ana')//\nDELIMITER ;\n";
         let (statements, opened) = held(SqlDialect::Mysql, sql);
@@ -662,6 +844,8 @@ mod tests {
         assert_eq!(
             statements,
             [
+                // Held for the settings it may change, not because it writes.
+                "SET x = 1;",
                 "UPDATE users SET name = 'Ana';",
                 "DELETE FROM users WHERE name = 'Ana';",
                 "CREATE TEMP TABLE t AS SELECT 'Ana';",

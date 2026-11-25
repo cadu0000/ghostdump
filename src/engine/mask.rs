@@ -84,11 +84,11 @@ impl Masker {
         stats: &mut MaskStats,
     ) -> SqlValue {
         match self {
-            Masker::Synthetic(kind) => SqlValue::Text(kind.generate(rng)),
+            Masker::Synthetic(kind) => SqlValue::Text(kind.generate(rng).into_bytes()),
             Masker::Nullify => SqlValue::Null,
             // A pseudonym of NULL would link every NULL to each other.
-            Masker::Hmac => match value.as_str() {
-                Some(text) => SqlValue::Text(hmac_hash(text, secret)),
+            Masker::Hmac => match value.as_bytes() {
+                Some(bytes) => SqlValue::Text(hmac_hash(bytes, secret).into_bytes()),
                 None => SqlValue::Null,
             },
             Masker::Laplace(mechanism) => mechanism.apply(value, rng, secret, stats),
@@ -244,10 +244,12 @@ fn to_text(digits: &[u32]) -> String {
         .collect()
 }
 
-pub fn hmac_hash(val: &str, secret: &str) -> String {
+/// HMAC-SHA256 of the bytes of a value, in hex. The bytes are hashed as the
+/// dump has them, so values that differ in any byte get different pseudonyms.
+pub fn hmac_hash(value: &[u8], secret: &str) -> String {
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
-    mac.update(val.as_bytes());
+    mac.update(value);
     hex::encode(mac.finalize().into_bytes())
 }
 
@@ -316,8 +318,27 @@ mod tests {
 
     #[test]
     fn test_hmac_is_deterministic_and_keyed() {
-        assert_eq!(hmac_hash("123", "k"), hmac_hash("123", "k"));
-        assert_ne!(hmac_hash("123", "k"), hmac_hash("123", "other"));
-        assert_eq!(hmac_hash("123", "k").len(), 64);
+        assert_eq!(hmac_hash(b"123", "k"), hmac_hash(b"123", "k"));
+        assert_ne!(hmac_hash(b"123", "k"), hmac_hash(b"123", "other"));
+        assert_eq!(hmac_hash(b"123", "k").len(), 64);
+    }
+
+    #[test]
+    fn test_hmac_hashes_the_bytes_of_the_value() {
+        let pseudonym = |bytes: &[u8]| {
+            let mut stats = MaskStats::default();
+            Masker::Hmac.apply(SqlValue::Text(bytes.to_vec()), &mut rng(), "k", &mut stats)
+        };
+        // Latin-1 values that differ in one byte outside ASCII, and binary
+        // values, keep different pseudonyms.
+        assert_ne!(pseudonym(b"Jos\xe9"), pseudonym(b"Jos\xe8"));
+        assert_ne!(
+            pseudonym(&[0xe9, 0xff, 0, 1]),
+            pseudonym(&[0xe8, 0xff, 0, 1])
+        );
+        assert_eq!(
+            pseudonym("José".as_bytes()),
+            SqlValue::Text(hmac_hash("José".as_bytes(), "k").into_bytes())
+        );
     }
 }

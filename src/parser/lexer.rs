@@ -17,14 +17,24 @@ pub enum ByteClass {
     Comment,
     /// Second byte of a `--` or `/*` comment opener. The first byte was
     /// reported as `Code`, before the lexer could know it opened a comment.
+    /// In MySQL, `--` opens a comment only before a space or a control
+    /// character: this is then that byte, and both dashes were `Code`.
     CommentStart,
+    /// The `/` of the `*/` that closes a MySQL `/*! ... */` comment, whose
+    /// content is code. The `*` was reported as `Code`.
+    VersionEnd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LexState {
     Code,
+    /// MySQL: after `--`, which opens a comment only if a space or a
+    /// control character follows.
+    DashDash,
     LineComment,
     BlockComment,
+    /// After `/*!` in MySQL: the version number, then code.
+    VersionNumber,
     /// Inside text delimited by the given quote byte: `'`, `"` or `` ` ``.
     Quoted(u8),
     /// After a `$` that may open a PostgreSQL dollar-quoted string.
@@ -46,6 +56,10 @@ pub struct Lexer {
     escape_next: bool,
     comment_depth: u32,
     comment_prev: u8,
+    /// Whether the next byte is the first one inside a block comment.
+    comment_first: bool,
+    /// MySQL: inside a `/*! ... */` comment, whose content is code.
+    version_comment: bool,
     /// Tag of the current dollar-quoted string, without the `$` signs.
     dollar_tag: Vec<u8>,
     /// How many bytes of the closing `$tag$` have been matched so far.
@@ -63,6 +77,8 @@ impl Lexer {
             escape_next: false,
             comment_depth: 0,
             comment_prev: 0,
+            comment_first: false,
+            version_comment: false,
             dollar_tag: Vec::new(),
             dollar_matched: 0,
         }
@@ -71,6 +87,19 @@ impl Lexer {
     pub fn feed(&mut self, byte: u8) -> ByteClass {
         match self.state {
             LexState::Code => self.code_byte(byte),
+            LexState::DashDash => {
+                if byte <= b' ' || byte == 0x7f {
+                    if byte == b'\n' {
+                        self.back_to_code(byte);
+                    } else {
+                        self.state = LexState::LineComment;
+                    }
+                    return ByteClass::CommentStart;
+                }
+                // `1--1` is one minus another in MySQL.
+                self.state = LexState::Code;
+                self.code_byte(byte)
+            }
             LexState::LineComment => {
                 if byte == b'\n' {
                     self.back_to_code(byte);
@@ -78,6 +107,14 @@ impl Lexer {
                 ByteClass::Comment
             }
             LexState::BlockComment => self.block_comment_byte(byte),
+            LexState::VersionNumber => {
+                if byte.is_ascii_digit() {
+                    return ByteClass::Comment;
+                }
+                self.version_comment = true;
+                self.back_to_code(0);
+                self.code_byte(byte)
+            }
             LexState::Quoted(quote) => self.quoted_byte(byte, quote),
             LexState::DollarTag => self.dollar_tag_byte(byte),
             LexState::DollarQuoted => self.dollar_quoted_byte(byte),
@@ -91,7 +128,16 @@ impl Lexer {
     }
 
     fn code_byte(&mut self, byte: u8) -> ByteClass {
+        if self.version_comment && byte == b'/' && self.prev == b'*' {
+            self.version_comment = false;
+            self.back_to_code(0);
+            return ByteClass::VersionEnd;
+        }
         let class = match byte {
+            b'-' if self.prev == b'-' && self.dialect == SqlDialect::Mysql => {
+                self.state = LexState::DashDash;
+                ByteClass::Code
+            }
             b'-' if self.prev == b'-' => {
                 self.state = LexState::LineComment;
                 ByteClass::CommentStart
@@ -100,6 +146,7 @@ impl Lexer {
                 self.state = LexState::BlockComment;
                 self.comment_depth = 1;
                 self.comment_prev = 0;
+                self.comment_first = true;
                 ByteClass::CommentStart
             }
             b'#' if self.dialect == SqlDialect::Mysql => {
@@ -168,6 +215,14 @@ impl Lexer {
     }
 
     fn block_comment_byte(&mut self, byte: u8) -> ByteClass {
+        let first = std::mem::take(&mut self.comment_first);
+        if first && byte == b'!' && self.dialect == SqlDialect::Mysql && !self.version_comment {
+            // MySQL runs what follows `/*!` (`/*!40101 SET NAMES utf8mb4 */`),
+            // and the mysql client ends statements inside it, so after the
+            // version number it is code. `/*M!` and `/*+` stay comments.
+            self.state = LexState::VersionNumber;
+            return ByteClass::Comment;
+        }
         if self.comment_prev == b'*' && byte == b'/' {
             self.comment_depth -= 1;
             self.comment_prev = 0;
@@ -247,8 +302,9 @@ pub fn is_ident_byte(byte: u8) -> bool {
 mod tests {
     use super::*;
 
-    /// One letter per input byte: `c` code, `l` literal, `m` comment and
-    /// `s` for the second byte of a comment opener.
+    /// One letter per input byte: `c` code, `l` literal, `m` comment, `s`
+    /// for the second byte of a comment opener and `v` for the `/` that
+    /// closes a MySQL version comment.
     fn classes(dialect: SqlDialect, input: &[u8]) -> String {
         let mut lexer = Lexer::new(dialect);
         input
@@ -258,6 +314,7 @@ mod tests {
                 ByteClass::Literal => 'l',
                 ByteClass::Comment => 'm',
                 ByteClass::CommentStart => 's',
+                ByteClass::VersionEnd => 'v',
             })
             .collect()
     }
@@ -292,6 +349,40 @@ mod tests {
     #[test]
     fn test_sqlite_backslash_is_plain() {
         assert_eq!(classes(SqlDialect::Sqlite, b"'a\\' x"), "llllcc");
+    }
+
+    #[test]
+    fn test_mysql_version_comment_is_code() {
+        let mysql = SqlDialect::Mysql;
+        // The opener and the version number are a comment, the rest is code,
+        // with its quotes.
+        assert_eq!(
+            classes(mysql, b"/*!40101 SET x='*/' */;"),
+            "csmmmmmmcccccccllllccvc"
+        );
+        assert_eq!(classes(mysql, b"/*!SET */;"), "csmcccccvc");
+        assert_eq!(classes(mysql, b"/*!*/a"), "csmcvc");
+        // Only `/*!` opens code: MariaDB's `/*M!` and optimizer hints do not.
+        assert_eq!(classes(mysql, b"/*M! a */b"), "csmmmmmmmc");
+        assert_eq!(classes(mysql, b"/*+ a */b"), "csmmmmmmc");
+        // A comment inside, and a second version comment after the first.
+        assert_eq!(classes(mysql, b"/*!1 a/*b*/c*/"), "csmmcccsmmmccv");
+        assert_eq!(classes(mysql, b"/*!1 a*/ /*!2 b*/"), "csmmcccvccsmmcccv");
+        // Elsewhere `*/` is plain code, and `/*!` a comment.
+        assert_eq!(classes(mysql, b"a*/b"), "cccc");
+        assert_eq!(classes(SqlDialect::Postgres, b"/*!a*/b"), "csmmmmc");
+    }
+
+    #[test]
+    fn test_mysql_double_dash_needs_a_space() {
+        let mysql = SqlDialect::Mysql;
+        // `1--1` is 1 - (-1); the quote after it opens a string.
+        assert_eq!(classes(mysql, b"1--1,'x'"), "ccccclll");
+        assert_eq!(classes(mysql, b"a-- 'x\nb"), "cccsmmmc");
+        assert_eq!(classes(mysql, b"a--\tx\nb"), "cccsmmc");
+        assert_eq!(classes(mysql, b"a--\nb"), "cccsc");
+        assert_eq!(classes(mysql, b"a--- x"), "ccccsm");
+        assert_eq!(classes(SqlDialect::Postgres, b"1--1,'x'"), "ccsmmmmm");
     }
 
     #[test]

@@ -134,8 +134,8 @@ impl LaplaceMechanism {
         };
         // A number stays unquoted when it came unquoted.
         match value {
-            SqlValue::Text(_) => SqlValue::Text(text),
-            SqlValue::Raw(_) | SqlValue::Null => SqlValue::Raw(text),
+            SqlValue::Text(_) => SqlValue::Text(text.into_bytes()),
+            SqlValue::Raw(_) | SqlValue::Null => SqlValue::Raw(text.into_bytes()),
         }
     }
 
