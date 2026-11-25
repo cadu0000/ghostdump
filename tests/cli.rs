@@ -179,6 +179,64 @@ fn only_a_run_that_succeeds_writes_the_output_file() {
 
 /// `check` runs the rules over a dump without writing it, and lists what
 /// they do; a rule that matches nothing makes it fail.
+/// `.cargo/config.toml` builds mimalloc to commit memory on demand, which
+/// keeps the peak memory of a run at about half (docs/benchmarks.md). A
+/// `CFLAGS` variable in the environment of the build replaces that setting.
+#[test]
+fn the_allocator_commits_memory_on_demand() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ghostdump"))
+        .arg("--version")
+        .env("MIMALLOC_VERBOSE", "1")
+        .env_remove("MIMALLOC_ARENA_EAGER_COMMIT")
+        .output()
+        .expect("the binary runs");
+    assert!(
+        stderr(&output).contains("option 'arena_eager_commit': 0"),
+        "mimalloc was built without MI_DEFAULT_ARENA_EAGER_COMMIT=0 (is CFLAGS set?):\n{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn every_member_of_a_gzip_input_is_read() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
+    let gzip = |bytes: &[u8]| {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    };
+    // `cat a.gz b.gz` gives one file of two members, which gunzip reads
+    // whole.
+    let split = PG_DATA.len() / 2;
+    let split = split + PG_DATA[split..].iter().position(|&b| b == b'\n').unwrap() + 1;
+    let mut members = gzip(&PG_DATA[..split]);
+    members.extend(gzip(&PG_DATA[split..]));
+
+    let directory = scratch("gzip_members");
+    for (name, bytes) in [("one.sql.gz", gzip(PG_DATA)), ("two.sql.gz", members)] {
+        let input = directory.join(name);
+        fs::write(&input, bytes).unwrap();
+        let output = run(&["-i", path(&input)], None, b"");
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert!(output.stdout == PG_DATA, "{name} was not read whole");
+    }
+
+    // gunzip ignores zeros after the last member; GhostDump stops.
+    let padded = directory.join("padded.sql.gz");
+    let mut bytes = gzip(PG_DATA);
+    bytes.extend([0; 512]);
+    fs::write(&padded, bytes).unwrap();
+    let output = run(&["-i", path(&padded)], None, b"");
+    assert_eq!(output.status.code(), Some(74), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("could not decompress the input"),
+        "{}",
+        stderr(&output)
+    );
+}
+
 #[test]
 fn check_lists_what_the_rules_do() {
     let dump = include_bytes!("fixtures/pg_dump_default.sql");

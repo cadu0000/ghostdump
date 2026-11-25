@@ -6,8 +6,7 @@ use ghostdump::engine::config::{CompiledConfig, Config};
 use ghostdump::engine::{AnonymizerEngine, RunOptions, RunReport};
 use ghostdump::inventory::{read_tables, starting_rules};
 use ghostdump::io::{InputSource, OutputSource};
-use ghostdump::parser::detect_dialect;
-use ghostdump::parser::state::SqlDialect;
+use ghostdump::parser::{SqlDialect, detect_dialect};
 
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches};

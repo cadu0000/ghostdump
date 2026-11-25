@@ -1,0 +1,57 @@
+name: Full validation
+
+# The long checks, run by hand and on every pull request into main, which
+# is how a release is made. The fast pipeline is ci.yml.
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  properties:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Property tests, one million cases each
+        run: cargo test --locked --release --test properties
+        env:
+          PROPTEST_CASES: "1000000"
+
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parser, engine]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Seed the corpus with the dump fixtures
+        run: sh fuzz/seed.sh
+      - name: Fuzz for 15 minutes
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=900 -dict=fuzz/sql.dict
+      - name: Keep the input that failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Microbenchmarks, short run
+        run: cargo bench --locked --bench microbench -- --warm-up-time 1 --measurement-time 3

@@ -19,6 +19,7 @@ use crate::parser::state::{InsertFormat, SqlDialect};
 /// must stay different.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlValue {
+    /// SQL NULL: `NULL` in VALUES, `\N` in COPY.
     Null,
     /// Text, written as a string literal in VALUES.
     Text(Vec<u8>),
@@ -41,6 +42,7 @@ impl SqlValue {
             .and_then(|bytes| std::str::from_utf8(bytes).ok())
     }
 
+    /// Whether the value is NULL.
     pub fn is_null(&self) -> bool {
         matches!(self, SqlValue::Null)
     }
@@ -48,7 +50,9 @@ impl SqlValue {
 
 /// Decides which fields of a row are masked, and masks them.
 pub trait FieldMasker {
+    /// Whether the field at position `column`, counted from 0, is masked.
     fn masks(&self, column: usize) -> bool;
+    /// The masked value of the field at position `column`.
     fn mask(&mut self, column: usize, value: SqlValue) -> SqlValue;
 }
 

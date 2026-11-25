@@ -1,8 +1,12 @@
 name: CI
 
+# The fast pipeline, on every push and pull request. The long checks are in
+# full.yml. The weekly run catches new advisories and a new stable compiler.
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 5 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,8 +23,35 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Documentation
+        run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: Test
-        run: cargo test
+        run: cargo test --locked
       - name: Validate the Laplace samplers
-        run: cargo test --release -- --ignored
+        run: cargo test --locked --release -- --ignored
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Test with the minimum supported Rust version
+        run: cargo test --locked
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit the dependencies
+        run: cargo audit
+      - name: Audit the dependencies of the fuzz targets
+        run: cargo audit --file fuzz/Cargo.lock

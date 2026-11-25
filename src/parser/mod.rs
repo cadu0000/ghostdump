@@ -1,13 +1,16 @@
-pub mod lexer;
-pub mod schema;
-pub mod state;
+//! Splits a dump, byte by byte, into data rows and everything around
+//! them, which passes through unchanged.
+
+pub(crate) mod lexer;
+pub(crate) mod schema;
+pub(crate) mod state;
 
 use std::fmt;
 use std::sync::Arc;
 
-pub use schema::{
-    HeaderMetadata, SessionSetting, SettingValue, Statement, TableChange, TableName,
-    detect_dialect, extract_metadata, has_values,
+pub use schema::{HeaderMetadata, detect_dialect};
+pub(crate) use schema::{
+    SessionSetting, SettingValue, Statement, TableChange, TableName, extract_metadata, has_values,
 };
 pub use state::{InsertFormat, Remainder, SqlDialect};
 
@@ -18,14 +21,21 @@ use state::{
 /// Largest row or data block header accepted by default: 256 MiB.
 pub const DEFAULT_MAX_ROW_BYTES: usize = 256 * 1024 * 1024;
 
+/// Why the parser cannot go on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParseError {
     /// A row, a data block header or a statement held for checking grew
     /// past the size limit.
-    TooLarge { limit: usize },
+    TooLarge {
+        /// The limit, in bytes.
+        limit: usize,
+    },
     /// A client command that dump tools do not write, while such commands
     /// are refused (see [`SqlParser::refusing_client_commands`]).
-    ClientCommand { command: String },
+    ClientCommand {
+        /// The name of the command, as the dump writes it.
+        command: String,
+    },
 }
 
 impl fmt::Display for ParseError {
@@ -62,7 +72,10 @@ pub enum SqlEvent {
     /// (`UPDATE`, `INSERT ... SELECT`, `CREATE TABLE ... AS SELECT`, ...).
     /// It is written unchanged unless it refers to a table with rules.
     Statement(Vec<u8>),
+    /// The header of a data block, up to its first row: `INSERT ... VALUES`
+    /// or `COPY ... FROM stdin;`.
     Header {
+        /// The bytes of the header, to be written unchanged.
         raw_bytes: Vec<u8>,
         /// Shared between identical headers (`pg_dump --inserts` repeats
         /// the same header on every row).
@@ -70,6 +83,8 @@ pub enum SqlEvent {
         /// A COPY with options the row codec cannot read.
         opaque: bool,
     },
+    /// One data row and the format of its block: a `(...)` tuple of `VALUES`,
+    /// or a line of `COPY`.
     Tuple(Vec<u8>, InsertFormat),
     /// What ends a data block: the `;` of `VALUES`, with any clause after the
     /// rows (`ON CONFLICT ...`), or the `\.` line of COPY.
@@ -78,6 +93,8 @@ pub enum SqlEvent {
     Error(ParseError),
 }
 
+/// Splits a dump into [`SqlEvent`]s, one byte at a time, holding at most
+/// one row, header or statement.
 pub struct SqlParser {
     state: State,
     dialect: SqlDialect,
@@ -90,6 +107,8 @@ pub struct SqlParser {
 }
 
 impl SqlParser {
+    /// A parser for `dialect` with the default size limit, which passes
+    /// client commands through.
     pub fn new(dialect: SqlDialect) -> Self {
         Self {
             state: State::Normal(NormalState::at_input_start(dialect, DEFAULT_MAX_ROW_BYTES)),
@@ -128,6 +147,9 @@ impl SqlParser {
         state.refusing_commands(self.refuse_commands)
     }
 
+    /// Takes the next byte of the input. Returns an event when the byte ends
+    /// one; at the end of the input, [`finish`](Self::finish) returns what is
+    /// left.
     pub fn handle_byte(&mut self, byte: u8) -> Option<SqlEvent> {
         match &mut self.state {
             State::Normal(normal_state) => match normal_state.process_byte(byte) {

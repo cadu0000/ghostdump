@@ -11,10 +11,15 @@ pub use header::{InsertHeaderEvent, InsertHeaderState};
 pub use normal::{NormalEvent, NormalState};
 pub use values::{ValueEvent, ValueState};
 
+/// The SQL dialect a dump is written in, which sets how its strings,
+/// comments and identifiers are read.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SqlDialect {
+    /// MySQL, as mysqldump writes it.
     Mysql,
+    /// PostgreSQL, as pg_dump writes it.
     Postgres,
+    /// SQLite, as the sqlite3 `.dump` command writes it.
     Sqlite,
 }
 
@@ -39,17 +44,23 @@ pub enum Remainder {
     /// A statement held for checking, without its end (see
     /// [`SqlEvent::Statement`](crate::parser::SqlEvent::Statement)).
     Statement(Vec<u8>),
-    /// The input ended inside a data block, before its terminator. When
-    /// `partial_row` is true, an incomplete row was dropped: it cannot be
-    /// masked, so it must not be written. `footer` holds what came after the
-    /// last row (a clause such as `ON CONFLICT ...`), to be checked like a
-    /// footer before it is written.
-    UnterminatedData { partial_row: bool, footer: Vec<u8> },
+    /// The input ended inside a data block, before its terminator.
+    UnterminatedData {
+        /// An incomplete row was dropped: it cannot be masked, so it must
+        /// not be written.
+        partial_row: bool,
+        /// What came after the last row (a clause such as `ON CONFLICT ...`),
+        /// to be checked like a footer before it is written.
+        footer: Vec<u8>,
+    },
 }
 
+/// How the rows of a data block are written.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InsertFormat {
+    /// Tuples after `VALUES`, as SQL literals.
     Values,
+    /// Lines of `COPY ... FROM stdin`, in its text format.
     Copy,
 }
 

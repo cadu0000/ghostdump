@@ -11,7 +11,10 @@ use crate::parser::{HeaderMetadata, SqlEvent, SqlParser, Statement, TableChange}
 /// A table of the dump, with its columns in the order they first appear.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableColumns {
+    /// The schema (or, in MySQL, the database) written before the table
+    /// name, if any.
     pub schema: Option<String>,
+    /// The name of the table.
     pub table: String,
     /// Empty when the dump shows none: no `CREATE TABLE` that lists them,
     /// and rows without a column list.

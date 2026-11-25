@@ -1,7 +1,11 @@
+//! The command line: its arguments, the exit statuses and the checks on
+//! the HMAC secret.
+
 use clap::{Parser, Subcommand, ValueEnum};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+/// The command line: masks a dump, unless a subcommand is given.
 #[derive(Parser, Debug)]
 #[command(
     name = "ghostdump",
@@ -15,6 +19,7 @@ pub struct Args {
     #[command(subcommand)]
     pub command: Option<Command>,
 
+    /// The rules; without them the dump is copied as it is.
     #[arg(
         short = 'c',
         long,
@@ -23,6 +28,7 @@ pub struct Args {
     )]
     pub config: Option<PathBuf>,
 
+    /// The dump to read; stdin when absent.
     #[arg(
         short = 'i',
         long,
@@ -31,6 +37,7 @@ pub struct Args {
     )]
     pub input: Option<PathBuf>,
 
+    /// Where the masked dump is written; stdout when absent.
     #[arg(
         short = 'o',
         long,
@@ -39,6 +46,7 @@ pub struct Args {
     )]
     pub output: Option<PathBuf>,
 
+    /// The HMAC secret, from the command line or `GHOSTDUMP_SECRET`.
     #[arg(
         short = 's',
         long,
@@ -56,9 +64,11 @@ pub struct Args {
     )]
     pub secret_file: Option<PathBuf>,
 
+    /// Logs debug messages.
     #[arg(short = 'v', long, action = clap::ArgAction::SetTrue, help = "Show debug messages")]
     pub verbose: bool,
 
+    /// Reads and checks the input without writing the output.
     #[arg(
         short = 'd',
         long,
@@ -66,6 +76,7 @@ pub struct Args {
     )]
     pub dry_run: bool,
 
+    /// Stops after this many data rows.
     #[arg(
         short = 'l',
         long,
@@ -74,9 +85,11 @@ pub struct Args {
     )]
     pub limit: Option<usize>,
 
+    /// Shows a progress bar on stderr.
     #[arg(short = 'p', long, help = "Show a progress bar on stderr")]
     pub progress: bool,
 
+    /// The dialect of the dump, detected when `Auto`.
     #[arg(
         long,
         value_enum,
@@ -85,6 +98,7 @@ pub struct Args {
     )]
     pub dialect: DialectArg,
 
+    /// The largest data row, or statement held for checking, in MiB.
     #[arg(
         long,
         value_name = "MiB",
@@ -93,6 +107,7 @@ pub struct Args {
     )]
     pub max_row_size: usize,
 
+    /// Threads that mask rows.
     #[arg(
         short = 'j',
         long,
@@ -121,6 +136,7 @@ pub struct Args {
     pub experimental_f64_sampler: bool,
 }
 
+/// The subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Check rules against a dump without writing it: the rules applied,
@@ -131,11 +147,14 @@ pub enum Command {
     Init(InitArgs),
 }
 
+/// The arguments of `ghostdump check`.
 #[derive(clap::Args, Debug)]
 pub struct CheckArgs {
+    /// The rules to check.
     #[arg(short = 'c', long, value_name = "FILE", help = "Rules file (TOML)")]
     pub config: PathBuf,
 
+    /// The dump to check the rules against; stdin when absent.
     #[arg(
         short = 'i',
         long,
@@ -144,6 +163,7 @@ pub struct CheckArgs {
     )]
     pub input: Option<PathBuf>,
 
+    /// The dialect of the dump, detected when `Auto`.
     #[arg(
         long,
         value_enum,
@@ -152,6 +172,7 @@ pub struct CheckArgs {
     )]
     pub dialect: DialectArg,
 
+    /// The largest data row, or statement held for checking, in MiB.
     #[arg(
         long,
         value_name = "MiB",
@@ -161,8 +182,10 @@ pub struct CheckArgs {
     pub max_row_size: usize,
 }
 
+/// The arguments of `ghostdump init`.
 #[derive(clap::Args, Debug)]
 pub struct InitArgs {
+    /// The dump whose tables and columns are listed; stdin when absent.
     #[arg(
         short = 'i',
         long,
@@ -171,6 +194,7 @@ pub struct InitArgs {
     )]
     pub input: Option<PathBuf>,
 
+    /// The rules file to create; stdout when absent.
     #[arg(
         short = 'o',
         long,
@@ -179,6 +203,7 @@ pub struct InitArgs {
     )]
     pub output: Option<PathBuf>,
 
+    /// The dialect of the dump, detected when `Auto`.
     #[arg(
         long,
         value_enum,
@@ -187,6 +212,7 @@ pub struct InitArgs {
     )]
     pub dialect: DialectArg,
 
+    /// The largest data row, or statement held for checking, in MiB.
     #[arg(
         long,
         value_name = "MiB",
@@ -196,20 +222,28 @@ pub struct InitArgs {
     pub max_row_size: usize,
 }
 
+/// The dialect named on the command line.
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
 pub enum DialectArg {
+    /// Detect it from the first lines of the dump
     Auto,
+    /// PostgreSQL, as pg_dump writes it
     Postgres,
+    /// MySQL, as mysqldump writes it
     Mysql,
+    /// SQLite, as the sqlite3 .dump command writes it
     Sqlite,
 }
 
 /// Secrets shorter than this, in bytes, trigger a warning.
 pub const MIN_SECRET_BYTES: usize = 16;
 
+/// Why no HMAC secret can be used.
 #[derive(Debug, PartialEq)]
 pub enum SecretError {
+    /// None was given.
     Missing,
+    /// It is empty or only whitespace.
     Empty,
 }
 
@@ -228,9 +262,12 @@ pub enum ExitStatus {
     Rules = 78,
 }
 
+/// Whether a secret that can be used is long enough.
 #[derive(Debug, PartialEq)]
 pub enum SecretLength {
+    /// At least [`MIN_SECRET_BYTES`] bytes.
     Recommended,
+    /// Shorter than [`MIN_SECRET_BYTES`] bytes: used, with a warning.
     Short,
 }
 

@@ -8,8 +8,10 @@ use crate::parser::state::SqlDialect;
 pub struct HeaderMetadata {
     /// The schema (or, in MySQL, the database) written before the table name.
     pub schema: Option<String>,
+    /// The name of the table.
     pub table: String,
-    /// The table as the database tells it apart (see [`TableName::key`]).
+    /// The schema and table as the database tells them apart: case is
+    /// folded where the dialect folds it, and kept where it does not.
     pub key: String,
     /// `None` when the statement has no column list.
     pub columns: Option<Vec<String>>,

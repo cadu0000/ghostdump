@@ -1,3 +1,5 @@
+//! The rules file, and the rules compiled from it.
+
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
@@ -7,24 +9,31 @@ use std::path::Path;
 use crate::engine::mask::{Guarantee, Masker};
 use crate::engine::strategy::StrategyConfig;
 
+/// The rules file as written: rules by table.
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    /// Rules by table name, `table` or `schema.table`.
     pub tables: HashMap<String, TableConfig>,
 }
 
+/// The rules of one table.
 #[derive(Debug, Deserialize)]
 pub struct TableConfig {
+    /// One rule per column.
     pub columns: Vec<ColumnConfig>,
 }
 
+/// The rule of one column.
 #[derive(Debug, Deserialize)]
 pub struct ColumnConfig {
+    /// The name of the column.
     pub name: String,
 
     /// What to do with NULL values of this column.
     #[serde(default)]
     pub null_policy: NullPolicy,
 
+    /// The strategy and its parameters.
     #[serde(flatten)]
     pub strategy: StrategyConfig,
 }
@@ -34,12 +43,16 @@ pub struct ColumnConfig {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NullPolicy {
+    /// NULL is written as NULL.
     #[default]
     Keep,
+    /// NULL is masked like any other value.
     Generate,
 }
 
 impl Config {
+    /// Reads and parses a rules file, without validating the rules (see
+    /// [`compile`](Self::compile)).
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let content = fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
@@ -61,20 +74,27 @@ pub struct CompiledConfig {
     pub tables: HashMap<String, Vec<CompiledColumn>>,
 }
 
+/// A rule ready to be applied to its column.
 #[derive(Debug)]
 pub struct CompiledColumn {
     /// Tells the rules apart in counters, which hold no names.
     pub id: usize,
+    /// The name of the column, as the rules file spells it.
     pub name: String,
+    /// What to do with NULL values.
     pub null_policy: NullPolicy,
+    /// The masker, with its parameters checked.
     pub masker: Masker,
 }
 
 /// A rule that cannot be compiled, with the table and column it belongs to.
 #[derive(Debug, PartialEq)]
 pub struct ConfigError {
+    /// The table, as the rules file spells it.
     pub table: String,
+    /// The column, or empty when the error concerns the whole table.
     pub column: String,
+    /// What is wrong.
     pub message: String,
 }
 
@@ -148,6 +168,7 @@ impl Config {
 /// What the rules of one table guarantee, for the summary printed at startup.
 #[derive(Debug, PartialEq)]
 pub struct TableGuarantees {
+    /// The table, as the rules file spells it.
     pub table: String,
     /// Columns with ε-LDP and their ε.
     pub ldp: Vec<(String, f64)>,
