@@ -11,6 +11,7 @@ use crate::engine::strategy::StrategyConfig;
 
 /// The rules file as written: rules by table.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Rules by table name, `table` or `schema.table`.
     pub tables: HashMap<String, TableConfig>,
@@ -18,6 +19,7 @@ pub struct Config {
 
 /// The rules of one table.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TableConfig {
     /// One rule per column.
     pub columns: Vec<ColumnConfig>,
@@ -340,6 +342,34 @@ impl CompiledConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_unknown_keys_are_errors() {
+        for rules in [
+            r#"[tables.users]
+               columns = [{ name = "a", strategy = "hmac", null_polcy = "generate" }]"#,
+            r#"[tables.users]
+               columns = [{ name = "a", strategy = "dp_laplace", epsilon = 1.0,
+                            bounds = [0, 1], scale = 0, consistant = true }]"#,
+            r#"[tables.users]
+               columns = [{ name = "a", strategy = "nullify" }]
+               colums = []"#,
+            r#"[tables.users]
+               columns = [{ name = "a", strategy = "nullify" }]
+               [tabels.orders]
+               columns = [{ name = "b", strategy = "nullify" }]"#,
+        ] {
+            let error = toml::from_str::<Config>(rules).unwrap_err().to_string();
+            assert!(error.contains("unknown field"), "{error}");
+        }
+        let valid: Config = toml::from_str(
+            r#"[tables.users]
+               columns = [{ name = "a", strategy = "hmac", null_policy = "keep" },
+                          { name = "b", strategy = "cpf", null_policy = "generate" }]"#,
+        )
+        .unwrap();
+        assert_eq!(valid.tables["users"].columns.len(), 2);
+    }
 
     #[test]
     fn test_each_rule_has_its_own_id() {

@@ -197,6 +197,36 @@ fn the_allocator_commits_memory_on_demand() {
     );
 }
 
+/// A quoted name can hold control characters; written as they are, they
+/// would move the cursor or recolor the terminal of whoever reads the log.
+#[test]
+fn names_from_the_dump_reach_the_terminal_escaped() {
+    let dump = b"CREATE TABLE \"a\x1b[31mb\" (name text);\n\
+                 INSERT INTO \"a\x1b[31mb\" VALUES ('Ana');\n";
+    let output = run(
+        &["-c", TYPO_RULES, "-v", "--dialect", "postgres"],
+        None,
+        dump,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(!output.stderr.contains(&0x1b), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("a\\u{1b}[31mb"),
+        "{}",
+        stderr(&output)
+    );
+
+    let directory = scratch("escaped_names");
+    let input = directory.join("dump.sql");
+    fs::write(&input, dump).unwrap();
+    let check = run(&["check", "-c", TYPO_RULES, "-i", path(&input)], None, b"");
+    assert!(
+        !check.stdout.contains(&0x1b),
+        "{}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+}
+
 #[test]
 fn every_member_of_a_gzip_input_is_read() {
     use flate2::Compression;

@@ -12,6 +12,7 @@ use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{Level, LevelFilter, debug, error, info, warn};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -208,13 +209,17 @@ fn run_check(args: &CheckArgs) -> Result<(), Failure> {
         dialect_name(dialect)
     );
     for (table, columns) in &masked {
-        println!("masked: table `{table}`, columns {}", columns.join(", "));
+        let line = format!("masked: table `{table}`, columns {}", columns.join(", "));
+        println!("{}", printable(&line));
     }
     for table in &report.copied_tables {
-        println!("copied as it is: table `{table}`");
+        println!(
+            "{}",
+            printable(&format!("copied as it is: table `{table}`"))
+        );
     }
     for rule in &report.unused_rules {
-        println!("unused: {rule}");
+        println!("{}", printable(&format!("unused: {rule}")));
     }
     if report.unused_rules.is_empty() {
         Ok(())
@@ -412,16 +417,38 @@ fn init_logger(verbose: bool) {
     builder
         .target(env_logger::Target::Stderr)
         .format(|buf, record| {
+            let message = record.args().to_string();
+            let message = printable(&message);
             let prefix = match record.level() {
-                Level::Info => return writeln!(buf, "{}", record.args()),
+                Level::Info => return writeln!(buf, "{message}"),
                 Level::Error => "error",
                 Level::Warn => "warning",
                 Level::Debug => "debug",
                 Level::Trace => "trace",
             };
-            writeln!(buf, "{}: {}", prefix, record.args())
+            writeln!(buf, "{prefix}: {message}")
         })
         .init();
+}
+
+/// Text for the terminal, with its control characters escaped: names come
+/// from the dump, and a quoted name can hold any of them, such as the
+/// escape sequences that move the cursor or recolor the terminal. Line
+/// breaks and tabs stay, for the messages that span lines (TOML errors).
+fn printable(text: &str) -> Cow<'_, str> {
+    let escaped = |c: char| c.is_control() && c != '\n' && c != '\t';
+    if !text.chars().any(escaped) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if escaped(c) {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// A progress bar on stderr, updated as the input is read. With a plain

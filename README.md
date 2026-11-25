@@ -160,7 +160,7 @@ columns = [
 
 ```
 
-Only the declared columns are rewritten; every other byte of the dump, including the layout of `INSERT` statements and `COPY` blocks, is copied unchanged. Values keep their SQL type: numbers stay unquoted, generated text is escaped for the dialect, and `NULL` stays `NULL` by default. Add `null_policy = "generate"` to a column to mask `NULL` values too.
+Only the declared columns are rewritten; every other byte of the dump, including the layout of `INSERT` statements and `COPY` blocks, is copied unchanged. Values keep their SQL type: numbers stay unquoted, generated text is escaped for the dialect, and `NULL` stays `NULL` by default. Add `null_policy = "generate"` to a column to mask `NULL` values too. A key that the rules file does not know, such as a misspelt `null_policy`, is an error, not ignored.
 
 Table and column names are matched without regard to case, also for letters outside ASCII (MySQL compares column names this way), and quotes are ignored, so a rule for `users.name` also applies to `INSERT INTO "Users" ("Name")`. A rule for `[tables.users]` applies to the table in any schema; write `[tables."audit.users"]` to give one schema its own rules. Two rules whose names differ only in case are rejected.
 

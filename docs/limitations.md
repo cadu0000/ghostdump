@@ -38,6 +38,7 @@ With rules, these stop the run (exit status 65); the error names the input line 
 ## Operation
 
 * **The output file is written in its directory under a temporary name** and renamed over the target at the end: GhostDump needs write permission on that directory, and the replaced file keeps its permissions, not its owner. Devices and pipes are written directly, without this protection. Source: README; `cli::only_a_run_that_succeeds_writes_the_output_file`.
+* **A new output file gets the permissions the umask gives**, 0644 with the usual 022, so other users can read the columns that no rule masks. Run with `umask 077`, or create the file with the permissions it needs first: a file that is replaced keeps its own, and its temporary file is never more open than it. Source: `io::tests::the_temporary_file_is_never_more_open_than_its_target`; checked in stage 1.7 with `stat`.
 * **A run stopped by a signal leaves its temporary file.** After SIGINT, SIGTERM or SIGKILL the target is untouched, but `.<name>.<random>.tmp` stays next to it, holding the part of the output written so far; remove it by hand. Checked in stage 1.6 by signalling a run once the temporary file existed.
 * **A `.gz` input must end with its last gzip member.** Every member is read, as gunzip reads them; bytes after the last one, even the zeros gunzip ignores, stop the run with exit status 74. Decompress such a file with `gunzip -c` and pipe it in. Until stage 1.6 only the first member was read, and the rest of the dump was dropped without an error. Source: `cli::every_member_of_a_gzip_input_is_read`.
 * **Memory is constant in the number of rows, not in their size**: a row, or a statement held whole, is kept in memory up to `--max-row-size`; with `--threads`, at most twice as many segments as threads are out at once. `init` keeps the names of every table and column. Source: [decisions/0002](decisions/0002-parallel-masking.md).
@@ -46,6 +47,7 @@ With rules, these stop the run (exit status 65); the error names the input line 
 ## Tools
 
 * **`init` suggests rules from column names.** It is a hint, not a classification: a column `name` of a table of products gets `faker_name`, and personal data in a column named `notes` gets no rule. Review every line. Source: `inventory::tests::test_suggestions_follow_the_column_name`.
+* **`init` checks that its rules file does not exist when it starts**; a file created at that path while it reads the dump is replaced, because the rules are written under a temporary name and renamed at the end. Source: `run_init` and `PendingOutput::commit` in the code.
 * **`check` runs `hmac` rules with a placeholder secret**: it shows what a run would apply and refuse, not the pseudonyms.
 
 ## Scope of the verification
