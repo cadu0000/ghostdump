@@ -225,76 +225,95 @@ def laplace_cdf(x, b):
     return 0.5 * math.exp(x / b) if x < 0 else 1.0 - 0.5 * math.exp(-x / b)
 
 
-def deconvolve(noisy, bounds, b):
-    """Distribution of the clamped values over EM_TRUE_BINS bins of the
-    bounds, estimated from the noisy values (Laplace noise of scale b)."""
-    lo, hi = bounds
-    width = (hi - lo) / EM_TRUE_BINS
-    centres = [lo + (j + 0.5) * width for j in range(EM_TRUE_BINS)]
-    obs_lo, obs_hi = lo - 6 * b, hi + 6 * b
-    obs_width = (obs_hi - obs_lo) / EM_OBS_BINS
-    edges = [obs_lo + m * obs_width for m in range(EM_OBS_BINS + 1)]
+def deconvolve(noisy, bounds, b, unit=None):
+    """Distribution of the clamped values over bins of the bounds, estimated
+    from the noisy values (Laplace noise of scale b). Returns the bins, as
+    (left, right, centre, width), and their estimated shares.
 
-    counts = [0] * EM_OBS_BINS
+    Without `unit`, the bins are EM_TRUE_BINS equal parts of the bounds, and
+    the noisy values are counted in EM_OBS_BINS equal cells. With `unit`, the
+    step of the values (1 for whole numbers, where the noise is a whole
+    number too), both follow that grid: one bin per value the bounds allow,
+    and cells of whole units centred on the values. Cells that do not follow
+    the grid fall between the values the noise can take, and stay empty
+    where the model expects mass."""
+    lo, hi = bounds
+    if unit is None:
+        width = (hi - lo) / EM_TRUE_BINS
+        centres = [lo + (j + 0.5) * width for j in range(EM_TRUE_BINS)]
+        bins = [(c - width / 2, c + width / 2, c, width) for c in centres]
+        obs_lo, obs_hi = lo - 6 * b, hi + 6 * b
+        obs_cells = EM_OBS_BINS
+        obs_width = (obs_hi - obs_lo) / obs_cells
+    else:
+        centres = [lo + j * unit for j in range(round((hi - lo) / unit) + 1)]
+        bins = [(c - unit / 2, c + unit / 2, c, unit) for c in centres]
+        margin = math.ceil(6 * b / unit)
+        values = round((hi - lo) / unit) + 1 + 2 * margin
+        per_cell = math.ceil(values / EM_OBS_BINS)
+        obs_cells = math.ceil(values / per_cell)
+        obs_width = per_cell * unit
+        obs_lo = lo - (margin + 0.5) * unit
+    edges = [obs_lo + m * obs_width for m in range(obs_cells + 1)]
+
+    counts = [0] * obs_cells
     for y in noisy:
-        m = min(EM_OBS_BINS - 1, max(0, int((y - obs_lo) // obs_width)))
+        m = min(obs_cells - 1, max(0, int((y - obs_lo) // obs_width)))
         counts[m] += 1
 
     # kernel[m][j] = P(noisy value in bin m | true value at centre j); the
     # outer bins absorb the tails.
     kernel = []
-    for m in range(EM_OBS_BINS):
+    for m in range(obs_cells):
         row = []
         for c in centres:
             low = 0.0 if m == 0 else laplace_cdf(edges[m] - c, b)
-            high = 1.0 if m == EM_OBS_BINS - 1 else laplace_cdf(edges[m + 1] - c, b)
+            high = 1.0 if m == obs_cells - 1 else laplace_cdf(edges[m + 1] - c, b)
             row.append(high - low)
         kernel.append(row)
 
-    observed = [(counts[m], kernel[m]) for m in range(EM_OBS_BINS) if counts[m]]
+    observed = [(counts[m], kernel[m]) for m in range(obs_cells) if counts[m]]
     total = len(noisy)
-    p = [1.0 / EM_TRUE_BINS] * EM_TRUE_BINS
+    p = [1.0 / len(centres)] * len(centres)
     for _ in range(EM_MAX_ITERATIONS):
-        acc = [0.0] * EM_TRUE_BINS
+        acc = [0.0] * len(centres)
         for count, row in observed:
             denom = sum(pj * k for pj, k in zip(p, row))
             if denom <= 0:
                 continue
             factor = count / denom
-            for j in range(EM_TRUE_BINS):
+            for j in range(len(centres)):
                 acc[j] += row[j] * factor
         new = [pj * a / total for pj, a in zip(p, acc)]
         moved = sum(abs(a - b) for a, b in zip(new, p))
         p = new
         if moved < EM_TOLERANCE:
             break
-    return centres, width, p
+    return bins, p
 
 
-def answer_estimator(noisy, bounds, b, ranges, edges=HIST_EDGES):
+def answer_estimator(noisy, bounds, b, ranges, edges=HIST_EDGES, unit=None):
     present = [v for v in noisy if v is not None]
-    centres, width, p = deconvolve(present, bounds, b)
+    bins, p = deconvolve(present, bounds, b, unit)
     n = len(present)
 
     def share_between(a, c):
         """Estimated share of values in [a, c), uniform inside each bin."""
         total = 0.0
-        for centre, pj in zip(centres, p):
-            left, right = centre - width / 2, centre + width / 2
+        for (left, right, _, width), pj in zip(bins, p):
             overlap = max(0.0, min(right, c) - max(left, a))
             total += pj * overlap / width
         return total
 
     def inverse_cdf(q):
         acc = 0.0
-        for centre, pj in zip(centres, p):
+        for (left, _, _, width), pj in zip(bins, p):
             if acc + pj >= q:
-                left = centre - width / 2
                 return left + width * ((q - acc) / pj if pj else 0.0)
             acc += pj
-        return centres[-1] + width / 2
+        return bins[-1][2] + bins[-1][3] / 2
 
-    mean = sum(c * pj for c, pj in zip(centres, p))
+    mean = sum(centre * pj for (_, _, centre, _), pj in zip(bins, p))
     hist_inner = [share_between(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
     under = share_between(-math.inf, edges[0])
     over = share_between(edges[-1], math.inf)
@@ -689,7 +708,9 @@ def run_adult(args, workdir):
     setup = {}
     for column, values in numeric.items():
         lo, hi = ADULT_NUMERIC[column]
-        edges = [lo + i * (hi - lo) / 20 for i in range(21)]
+        # Edges between whole numbers, so that each bin holds the same whole
+        # numbers as with edges on them, and the estimator's bins fit in it.
+        edges = [lo - 0.5 + i * (hi - lo) / 20 for i in range(21)]
         true_sorted = sorted(values)
         ranges = whole_ranges(true_sorted)
         oracle = (true_sorted[0], true_sorted[-1])
@@ -720,7 +741,7 @@ def run_adult(args, workdir):
                     b = (bounds[column][1] - bounds[column][0]) / value_epsilon
                     for analyst, answers in (
                         ("naive", answer_naive(noisy, ranges, edges)),
-                        ("estimator", answer_estimator(noisy, bounds[column], b, ranges, edges)),
+                        ("estimator", answer_estimator(noisy, bounds[column], b, ranges, edges, unit=1.0)),
                     ):
                         rows += result_rows(column, n, epsilon, arm, analyst, rep, bounds[column], answers, truth)
             for column, values in numeric.items():
