@@ -3,6 +3,7 @@ pub mod columns;
 pub mod config;
 pub mod laplace;
 pub mod mask;
+mod settings;
 pub mod sink;
 pub mod strategy;
 
@@ -17,11 +18,12 @@ use std::thread;
 
 use crate::engine::columns::{ColumnOrders, Columns};
 use crate::engine::config::{CompiledColumn, CompiledConfig};
+use crate::engine::mask::MaskStats;
+use crate::engine::settings::{SavedSettings, check_settings};
 use crate::engine::sink::{MaskingPlan, ParallelSink, RowContext, SequentialSink, Sink};
 use crate::parser::state::{InsertFormat, SqlDialect};
 use crate::parser::{
-    DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SessionSetting, SettingValue, SqlEvent,
-    SqlParser, Statement, has_values,
+    DEFAULT_MAX_ROW_BYTES, HeaderMetadata, Remainder, SqlEvent, SqlParser, Statement, has_values,
 };
 
 /// How a dump is processed.
@@ -265,43 +267,27 @@ impl AnonymizerEngine {
             max_row_bytes,
             ..
         } = *options;
+        // Without rules nothing is refused: the dump is copied as it is.
+        let checks = !self.config.tables.is_empty();
         let mut reader = BufReader::new(input);
         let mut parser = SqlParser::new(dialect)
             .with_max_row_bytes(max_row_bytes)
-            .refusing_client_commands(!self.config.tables.is_empty());
+            .refusing_client_commands(checks);
+        let mut reading = Reading::new(self, dialect);
 
         let mut buffer = [0u8; 64 * 1024];
-        let mut rows_processed = 0;
-        let mut bytes_read_total = 0u64;
-        let mut data_blocks = 0;
-        let mut rows_masked = 0;
-        let mut rows_by_table: BTreeMap<String, usize> = BTreeMap::new();
-        // Rows of the current table, added to `rows_by_table` when the table
-        // changes, so that rows are counted without a map lookup each.
-        let mut current_table = String::new();
-        let mut current_rows = 0usize;
+        let mut bytes_read = 0u64;
         let mut reached_limit = false;
         let mut unterminated_data_block = false;
 
-        let mut plan: Option<Arc<MaskingPlan>> = None;
-        let mut plan_metadata: Option<Arc<HeaderMetadata>> = None;
-        let mut orders = ColumnOrders::default();
-        // MySQL: the database of the last `USE`, which table names without
-        // one refer to.
-        let mut database: Option<String> = None;
-        // MySQL user variables that hold a saved setting.
-        let mut saved = SavedSettings::default();
-        // Rules applied at least once, as (table key, column name).
-        let mut used: BTreeSet<(&str, &String)> = BTreeSet::new();
-
-        'leitura: loop {
-            let bytes_read = reader.read(&mut buffer)?;
-            if bytes_read == 0 {
+        'reading: loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
                 break;
             }
-            bytes_read_total += bytes_read as u64;
+            bytes_read += read as u64;
 
-            for &byte in &buffer[..bytes_read] {
+            for &byte in &buffer[..read] {
                 let Some(event) = parser.handle_byte(byte) else {
                     continue;
                 };
@@ -309,102 +295,39 @@ impl AnonymizerEngine {
                     SqlEvent::DefaultStatement(b) => sink.write(&[b])?,
                     SqlEvent::Passthrough(bytes) => sink.write(&bytes)?,
                     SqlEvent::Statement(bytes) => {
-                        if !self.config.tables.is_empty() {
-                            let statement = Statement::parse(&bytes, dialect);
-                            if let Err(e) = check_settings(&statement, &mut saved)
-                                .and_then(|()| self.check_statement(&statement))
-                            {
-                                return stop(sink, e);
-                            }
-                            if let Some(name) = statement.used_database() {
-                                database = Some(name);
-                                plan_metadata = None;
-                            }
-                            if let Some(change) = statement.table_change()
-                                && orders.apply(change, &self.config, database.as_deref())
-                            {
-                                // The next header is planned again, even if
-                                // it repeats the last one.
-                                plan_metadata = None;
-                            }
+                        if checks
+                            && let Err(e) = reading.statement(&Statement::parse(&bytes, dialect))
+                        {
+                            return stop(sink, e);
                         }
                         sink.write(&bytes)?;
                     }
-
                     SqlEvent::Header {
                         raw_bytes,
                         metadata,
                         opaque,
                     } => {
-                        // pg_dump --inserts repeats the same header on every row.
-                        let same = match (&metadata, &plan_metadata) {
-                            (Some(new), Some(old)) => Arc::ptr_eq(new, old),
-                            _ => false,
-                        };
-                        data_blocks += 1;
-                        if !same {
-                            let table = metadata.as_deref().map_or("<unknown>", |m| &m.table);
-                            if table != current_table {
-                                count_rows(&mut rows_by_table, &current_table, current_rows);
-                                current_table = table.to_string();
-                                current_rows = 0;
-                            }
-                            plan = match self.plan_block(
-                                metadata.as_deref(),
-                                opaque,
-                                &raw_bytes,
-                                &orders,
-                                database.as_deref(),
-                            ) {
-                                Ok(Some((key, columns))) => {
-                                    used.extend(
-                                        columns.iter().flatten().map(|rule| (key, &rule.name)),
-                                    );
-                                    Some(Arc::new(columns))
-                                }
-                                Ok(None) => None,
-                                Err(e) => return stop(sink, e),
-                            };
-                            plan_metadata = metadata;
+                        if let Err(e) = reading.header(&raw_bytes, metadata, opaque) {
+                            return stop(sink, e);
                         }
                         sink.write(&raw_bytes)?;
                     }
-
                     SqlEvent::Tuple(row, format) => {
-                        match &plan {
-                            None => sink.write(&row)?,
-                            Some(columns) => {
-                                sink.mask(row, format, columns)?;
-                                rows_masked += 1;
-                            }
-                        }
-
-                        rows_processed += 1;
-                        current_rows += 1;
-
-                        if let Some(l) = limit
-                            && rows_processed >= l
-                        {
+                        if reading.row(&mut sink, row, format, limit)? {
                             // Close the statement, so the output still loads.
                             sink.write(match format {
                                 InsertFormat::Values => b";\n",
                                 InsertFormat::Copy => b"\\.\n",
                             })?;
                             reached_limit = true;
-                            break 'leitura;
+                            break 'reading;
                         }
                     }
-
-                    SqlEvent::Footer(footer_bytes) => {
-                        if let Err(e) = self.check_footer(
-                            plan_metadata.as_deref(),
-                            &footer_bytes,
-                            dialect,
-                            database.as_deref(),
-                        ) {
+                    SqlEvent::Footer(footer) => {
+                        if let Err(e) = reading.footer(&footer) {
                             return stop(sink, e);
                         }
-                        sink.write(&footer_bytes)?;
+                        sink.write(&footer)?;
                     }
                     SqlEvent::Error(e) => return stop(sink, refuse(e.to_string())),
                 }
@@ -413,53 +336,22 @@ impl AnonymizerEngine {
 
         // With `--limit` the output stops on purpose, in the middle of the input.
         if !reached_limit {
-            match parser.finish() {
-                Remainder::Bytes(rest) => sink.write(&rest)?,
-                Remainder::Statement(rest) => {
-                    let statement = Statement::parse(&rest, dialect);
-                    if !self.config.tables.is_empty()
-                        && let Err(e) = check_settings(&statement, &mut saved)
-                            .and_then(|()| self.check_statement(&statement))
-                    {
-                        return stop(sink, e);
-                    }
+            match reading.rest(parser.finish(), checks) {
+                Ok((rest, unterminated)) => {
                     sink.write(&rest)?;
-                }
-                Remainder::UnterminatedData {
-                    partial_row: false,
-                    footer,
-                } => {
-                    if let Err(e) = self.check_footer(
-                        plan_metadata.as_deref(),
-                        &footer,
-                        dialect,
-                        database.as_deref(),
-                    ) {
-                        return stop(sink, e);
+                    if unterminated {
+                        warn!(
+                            "the input ended inside a data block, before its terminator \
+                             (`;` or `\\.`)"
+                        );
+                        unterminated_data_block = true;
                     }
-                    sink.write(&footer)?;
-                    warn!(
-                        "the input ended inside a data block, before its terminator (`;` or `\\.`)"
-                    );
-                    unterminated_data_block = true;
                 }
-                Remainder::UnterminatedData {
-                    partial_row: true, ..
-                } => {
-                    return stop(
-                        sink,
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "the input ended in the middle of a data row (truncated dump?). \
-                             The incomplete row was not written, because it could not be masked.",
-                        ),
-                    );
-                }
+                Err(e) => return stop(sink, e),
             }
         }
 
         let stats = sink.finish()?;
-        count_rows(&mut rows_by_table, &current_table, current_rows);
         if stats.non_numeric > 0 {
             // One warning per run, without the values.
             warn!(
@@ -475,23 +367,7 @@ impl AnonymizerEngine {
                 stats.outside_categories
             );
         }
-        Ok(RunReport {
-            rows_processed,
-            unterminated_data_block,
-            non_numeric_dp_values: stats.non_numeric,
-            values_outside_categories: stats.outside_categories,
-            bytes_read: bytes_read_total,
-            data_blocks,
-            rows_masked,
-            fields_masked: stats.masked_fields,
-            rows_by_table,
-            // A run cut short by `--limit` has not seen the whole input.
-            unused_rules: if reached_limit {
-                Vec::new()
-            } else {
-                self.unused_rules(&used)
-            },
-        })
+        Ok(reading.report(&stats, bytes_read, unterminated_data_block, reached_limit))
     }
 }
 
@@ -587,154 +463,210 @@ impl AnonymizerEngine {
     }
 }
 
+/// What a run has read so far, and what it decided from it.
+struct Reading<'a> {
+    engine: &'a AnonymizerEngine,
+    dialect: SqlDialect,
+    /// The masking plan of the current data block; `None` copies its rows.
+    plan: Option<Arc<MaskingPlan<'a>>>,
+    /// The header the plan was made for.
+    plan_metadata: Option<Arc<HeaderMetadata>>,
+    orders: ColumnOrders,
+    /// MySQL: the database of the last `USE`, which table names without
+    /// one refer to.
+    database: Option<String>,
+    /// MySQL user variables that hold a saved setting.
+    saved: SavedSettings,
+    /// Rules applied at least once, as (table key, column name).
+    used: BTreeSet<(&'a str, &'a String)>,
+    rows_processed: usize,
+    data_blocks: usize,
+    rows_masked: usize,
+    rows_by_table: BTreeMap<String, usize>,
+    /// Rows of the current table, added to `rows_by_table` when the table
+    /// changes, so that rows are counted without a map lookup each.
+    current_table: String,
+    current_rows: usize,
+}
+
+impl<'a> Reading<'a> {
+    fn new(engine: &'a AnonymizerEngine, dialect: SqlDialect) -> Self {
+        Self {
+            engine,
+            dialect,
+            plan: None,
+            plan_metadata: None,
+            orders: ColumnOrders::default(),
+            database: None,
+            saved: SavedSettings::default(),
+            used: BTreeSet::new(),
+            rows_processed: 0,
+            data_blocks: 0,
+            rows_masked: 0,
+            rows_by_table: BTreeMap::new(),
+            current_table: String::new(),
+            current_rows: 0,
+        }
+    }
+
+    /// Checks a statement held whole, then follows the database it uses
+    /// and the columns of the tables it changes. An error refuses it.
+    fn statement(&mut self, statement: &Statement) -> io::Result<()> {
+        check_settings(statement, &mut self.saved)?;
+        self.engine.check_statement(statement)?;
+        if let Some(name) = statement.used_database() {
+            self.database = Some(name);
+            self.plan_metadata = None;
+        }
+        if let Some(change) = statement.table_change()
+            && self
+                .orders
+                .apply(change, &self.engine.config, self.database.as_deref())
+        {
+            // The next header is planned again, even if it repeats the last one.
+            self.plan_metadata = None;
+        }
+        Ok(())
+    }
+
+    /// Plans the masking of the data block a header opens. An error
+    /// refuses the block.
+    fn header(
+        &mut self,
+        raw_bytes: &[u8],
+        metadata: Option<Arc<HeaderMetadata>>,
+        opaque: bool,
+    ) -> io::Result<()> {
+        self.data_blocks += 1;
+        // pg_dump --inserts repeats the same header on every row.
+        if let (Some(new), Some(old)) = (&metadata, &self.plan_metadata)
+            && Arc::ptr_eq(new, old)
+        {
+            return Ok(());
+        }
+        let table = metadata.as_deref().map_or("<unknown>", |m| &m.table);
+        if table != self.current_table {
+            count_rows(
+                &mut self.rows_by_table,
+                &self.current_table,
+                self.current_rows,
+            );
+            self.current_table = table.to_string();
+            self.current_rows = 0;
+        }
+        self.plan = self
+            .engine
+            .plan_block(
+                metadata.as_deref(),
+                opaque,
+                raw_bytes,
+                &self.orders,
+                self.database.as_deref(),
+            )?
+            .map(|(key, columns)| {
+                self.used
+                    .extend(columns.iter().flatten().map(|rule| (key, &rule.name)));
+                Arc::new(columns)
+            });
+        self.plan_metadata = metadata;
+        Ok(())
+    }
+
+    /// Writes a row, masked when its block has rules, and returns whether
+    /// it is the last one `--limit` allows.
+    fn row(
+        &mut self,
+        sink: &mut impl Sink<'a>,
+        row: Vec<u8>,
+        format: InsertFormat,
+        limit: Option<usize>,
+    ) -> io::Result<bool> {
+        match &self.plan {
+            None => sink.write(&row)?,
+            Some(columns) => {
+                sink.mask(row, format, columns)?;
+                self.rows_masked += 1;
+            }
+        }
+        self.rows_processed += 1;
+        self.current_rows += 1;
+        Ok(limit.is_some_and(|limit| self.rows_processed >= limit))
+    }
+
+    /// Checks what follows the rows of a data block. An error refuses it.
+    fn footer(&self, footer: &[u8]) -> io::Result<()> {
+        self.engine.check_footer(
+            self.plan_metadata.as_deref(),
+            footer,
+            self.dialect,
+            self.database.as_deref(),
+        )
+    }
+
+    /// What the parser held when the input ended, to be written, and
+    /// whether the input ended inside a data block. An error refuses it.
+    fn rest(&mut self, remainder: Remainder, checks: bool) -> io::Result<(Vec<u8>, bool)> {
+        match remainder {
+            Remainder::Bytes(rest) => Ok((rest, false)),
+            Remainder::Statement(rest) => {
+                if checks {
+                    self.statement(&Statement::parse(&rest, self.dialect))?;
+                }
+                Ok((rest, false))
+            }
+            Remainder::UnterminatedData {
+                partial_row: false,
+                footer,
+            } => {
+                self.footer(&footer)?;
+                Ok((footer, true))
+            }
+            Remainder::UnterminatedData {
+                partial_row: true, ..
+            } => Err(refuse(
+                "the input ended in the middle of a data row (truncated dump?). The \
+                 incomplete row was not written, because it could not be masked."
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn report(
+        mut self,
+        stats: &MaskStats,
+        bytes_read: u64,
+        unterminated_data_block: bool,
+        reached_limit: bool,
+    ) -> RunReport {
+        count_rows(
+            &mut self.rows_by_table,
+            &self.current_table,
+            self.current_rows,
+        );
+        RunReport {
+            rows_processed: self.rows_processed,
+            unterminated_data_block,
+            non_numeric_dp_values: stats.non_numeric,
+            values_outside_categories: stats.outside_categories,
+            bytes_read,
+            data_blocks: self.data_blocks,
+            rows_masked: self.rows_masked,
+            fields_masked: stats.masked_fields,
+            rows_by_table: self.rows_by_table,
+            // A run cut short by `--limit` has not seen the whole input.
+            unused_rules: if reached_limit {
+                Vec::new()
+            } else {
+                self.engine.unused_rules(&self.used)
+            },
+        }
+    }
+}
+
 fn count_rows(rows_by_table: &mut BTreeMap<String, usize>, table: &str, rows: usize) {
     if rows > 0 {
         *rows_by_table.entry(table.to_string()).or_default() += rows;
     }
-}
-
-/// MySQL character sets in which a character can hold a byte below 0x80
-/// (`\` among them in all but euckr), so the server would end a string
-/// where GhostDump does not. Found by converting, on MySQL 8.0, every
-/// two-byte sequence with a lead byte from 0x80 and a second byte below it;
-/// ucs2, utf16, utf16le and utf32 cannot be the character set of a client.
-const ASCII_IN_CHARACTERS: &[&str] = &["big5", "cp932", "euckr", "gb18030", "gbk", "sjis"];
-
-/// How to dump a MySQL database whose triggers, routines or events were
-/// created with a setting GhostDump refuses: mysqldump writes the setting
-/// before each of them.
-const DUMP_CODE_APART: &str = "Dump the data without them (mysqldump --skip-triggers, \
-     without --routines and --events), and the triggers, routines and events apart: \
-     they hold no rows (mysqldump --no-data --no-create-info --routines --events)";
-
-/// MySQL user variables that hold a saved setting (`SET @saved_sql_mode =
-/// @@sql_mode`), so that restoring it (`SET sql_mode = @saved_sql_mode`)
-/// gives back a value GhostDump has read, as mysqldump does around each
-/// table, trigger and routine.
-#[derive(Default)]
-struct SavedSettings(Vec<(String, String)>);
-
-impl SavedSettings {
-    /// The variables kept; a setting restored from one no longer kept is
-    /// refused. mysqldump uses four.
-    const MAX: usize = 16;
-
-    fn assign(&mut self, variable: String, saves: Option<String>) {
-        self.0.retain(|(name, _)| *name != variable);
-        let Some(setting) = saves
-            .filter(|setting| ["sql_mode", "character_set_client"].contains(&setting.as_str()))
-        else {
-            return;
-        };
-        if self.0.len() == Self::MAX {
-            self.0.remove(0);
-        }
-        self.0.push((variable, setting));
-    }
-
-    fn holds(&self, variable: &str, setting: &str) -> bool {
-        self.0
-            .iter()
-            .any(|(name, saved)| name == variable && saved == setting)
-    }
-}
-
-/// Refuses, when there are rules, a change after which GhostDump would
-/// read the dump differently from the database: text in an encoding other
-/// than UTF-8, strings whose backslashes do not work the way the lexer
-/// takes them, or a value GhostDump cannot work out.
-fn check_settings(statement: &Statement, saved: &mut SavedSettings) -> io::Result<()> {
-    for setting in statement.session_settings() {
-        match setting {
-            SessionSetting::Encoding(name) if !name.as_deref().is_some_and(is_utf8) => {
-                return Err(refuse(format!(
-                    "the dump sets its encoding to {}; with rules, GhostDump reads only UTF-8 \
-                     dumps: names and values in another encoding would not match the rules, and \
-                     generated text would be written in UTF-8. Dump again in UTF-8 \
-                     (pg_dump -E UTF8, mysqldump --default-character-set=utf8mb4)",
-                    name.map_or("its default".to_string(), |name| format!("`{name}`"))
-                )));
-            }
-            SessionSetting::StandardStrings(on) if on != Some(true) => {
-                return Err(refuse(
-                    "the dump sets standard_conforming_strings to off (or to a value GhostDump \
-                     does not read): backslashes would then escape quotes in '...' strings, \
-                     which GhostDump reads as standard strings, so a row could be misread. \
-                     Dump with standard_conforming_strings on, as pg_dump does"
-                        .into(),
-                ));
-            }
-            SessionSetting::SqlMode(SettingValue::Literal(modes))
-                if modes
-                    .split(',')
-                    .any(|mode| mode.trim().eq_ignore_ascii_case("no_backslash_escapes")) =>
-            {
-                return Err(refuse(format!(
-                    "the dump sets NO_BACKSLASH_ESCAPES in sql_mode, as mysqldump does before \
-                     a trigger, routine or event created in that mode: backslashes would then \
-                     be plain characters in strings, which GhostDump reads as escapes, so a \
-                     later row could be misread. {DUMP_CODE_APART}"
-                )));
-            }
-            SessionSetting::ClientCharset(SettingValue::Literal(charset))
-                if ASCII_IN_CHARACTERS.contains(&charset.to_ascii_lowercase().as_str()) =>
-            {
-                return Err(refuse(format!(
-                    "the dump sets character_set_client to `{charset}`, in which a character \
-                     can hold an ASCII byte such as a backslash, as mysqldump does before a \
-                     trigger, routine or event created in that character set: the server \
-                     would end strings where GhostDump does not, so a later row could be \
-                     misread. {DUMP_CODE_APART}"
-                )));
-            }
-            SessionSetting::SqlMode(value) => check_restored("sql_mode", value, saved)?,
-            SessionSetting::ClientCharset(value) => {
-                check_restored("character_set_client", value, saved)?;
-            }
-            SessionSetting::UserVariable { name, saves } => saved.assign(name, saves),
-            SessionSetting::Unreadable(change) => {
-                return Err(refuse(format!(
-                    "the dump changes its settings with {change}, which GhostDump does not \
-                     read: standard_conforming_strings or client_encoding could change how the \
-                     rest is read, so a row could be misread. Use SET with a literal value"
-                )));
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-/// Refuses a setting whose value GhostDump does not know: one restored
-/// from a variable that does not hold a saved value of that setting, and
-/// `DEFAULT`, a number or an expression.
-fn check_restored(setting: &str, value: SettingValue, saved: &SavedSettings) -> io::Result<()> {
-    let what = match value {
-        SettingValue::Literal(_) => return Ok(()),
-        SettingValue::Variable(variable) if saved.holds(&variable, setting) => return Ok(()),
-        SettingValue::Variable(variable) => format!("the variable `@{variable}`"),
-        SettingValue::Unknown => "DEFAULT, a number or an expression".to_string(),
-    };
-    Err(refuse(format!(
-        "the dump sets {setting} from {what}, whose value GhostDump does not know, and \
-         {setting} decides how the rest of the dump is read. Set it to a literal value, or \
-         restore it from a variable saved with `SET @v = @@{setting}`"
-    )))
-}
-
-/// Whether an encoding name means UTF-8, or ASCII, which is part of it.
-/// PostgreSQL ignores case and every character but letters and digits in
-/// encoding names, and has `UNICODE` as an alias of `UTF8`.
-fn is_utf8(name: &str) -> bool {
-    let name: String = name
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-    matches!(
-        name.as_str(),
-        "utf8" | "utf8mb3" | "utf8mb4" | "unicode" | "ascii"
-    )
 }
 
 /// An error that stops the run because the data cannot be handled safely.
@@ -1409,111 +1341,6 @@ mod tests {
         let unended = b"SET client_encoding = 'LATIN1'";
         assert!(run_with(NAME_RULES, pg, unended).is_err());
         assert_eq!(run(unended).unwrap(), unended);
-    }
-
-    #[test]
-    fn test_settings_that_change_how_the_dump_is_read_are_refused() {
-        // Checks the statements in order, as one dump.
-        let check = |statements: &[&str], dialect| {
-            let mut saved = SavedSettings::default();
-            statements.iter().try_for_each(|sql| {
-                check_settings(&Statement::parse(sql.as_bytes(), dialect), &mut saved)
-            })
-        };
-        let pg = SqlDialect::Postgres;
-        for read in [
-            &["SET client_encoding = 'UTF8';"][..],
-            &["SET client_encoding = 'utf_8';"],
-            &["SET NAMES 'Unicode';"],
-            &["SET standard_conforming_strings = on;"],
-            &["SET search_path = '';"],
-            &["SELECT pg_catalog.set_config('search_path', '', false);"],
-            &["SELECT set_config('standard_conforming_strings', 'on', false);"],
-        ] {
-            assert!(check(read, pg).is_ok(), "{read:?}");
-        }
-        for refused in [
-            &["SET client_encoding = 'LATIN1';"][..],
-            &["SET client_encoding = 'SQL_ASCII';"],
-            &["SET client_encoding TO DEFAULT;"],
-            &["SET standard_conforming_strings = off;"],
-            &["SELECT set_config('standard_conforming_strings', 'off', false);"],
-            &["SELECT set_config('client_encoding', 'SJIS', false);"],
-            &["SELECT set_config(current_setting('x'), 'off', false);"],
-            &["UPDATE pg_settings SET setting = 'off' WHERE name = 'standard_conforming_strings';"],
-        ] {
-            assert!(check(refused, pg).is_err(), "{refused:?}");
-        }
-
-        let my = SqlDialect::Mysql;
-        for read in [
-            &["SET NAMES utf8mb4 */;"][..],
-            &["SET NAMES utf8 */;"],
-            // mysqldump, at the start and the end of a dump.
-            &[
-                "SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;",
-                "SET SQL_MODE=@OLD_SQL_MODE */;",
-            ],
-            // mysqldump, around a trigger created from a latin1 client.
-            &[
-                "SET @saved_cs_client      = @@character_set_client */ ;",
-                "SET character_set_client  = latin1 */ ;",
-                "SET @saved_sql_mode       = @@sql_mode */ ;",
-                "SET sql_mode              = 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES' */ ;",
-                "SET sql_mode              = @saved_sql_mode */ ;",
-                "SET character_set_client  = @saved_cs_client */ ;",
-            ],
-            &["SET @S = @@session.sql_mode;", "SET sql_mode = @s;"],
-            &["SET character_set_client = ujis;"],
-        ] {
-            assert!(check(read, my).is_ok(), "{read:?}");
-        }
-        for refused in [
-            &["SET NAMES latin1 */;"][..],
-            &["SET NAMES sjis;"],
-            &["SET CHARACTER SET binary;"],
-            &["SET sql_mode = 'ANSI,no_backslash_escapes';"],
-            &["SET sql_mode = NO_BACKSLASH_ESCAPES;"],
-            &["SET sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES');"],
-            &["SET sql_mode = DEFAULT;"],
-            &["SET sql_mode = @m;"],
-            &["SET @m = 'NO_BACKSLASH_ESCAPES';", "SET sql_mode = @m;"],
-            // Saved, then given another value.
-            &[
-                "SET @m = @@sql_mode;",
-                "SET @m := 'x';",
-                "SET sql_mode = @m;",
-            ],
-            &[
-                "SET @m = @@sql_mode;",
-                "SELECT 'NO_BACKSLASH_ESCAPES' INTO @m;",
-                "SET sql_mode = @m;",
-            ],
-            // Saved from the global value, or from another setting.
-            &["SET @m = @@GLOBAL.sql_mode;", "SET sql_mode = @m;"],
-            &["SET @m = @@character_set_client;", "SET sql_mode = @m;"],
-            &["SET character_set_client = sjis;"],
-            &["SET @@session.character_set_client = 'GBK';"],
-            &["SET character_set_client = 13;"],
-            &["SET character_set_client = DEFAULT;"],
-            &["SET @c = 'sjis';", "SET character_set_client = @c;"],
-        ] {
-            assert!(check(refused, my).is_err(), "{refused:?}");
-        }
-    }
-
-    #[test]
-    fn test_only_the_latest_saved_settings_are_kept() {
-        let mut saved = SavedSettings::default();
-        for variable in 0..=SavedSettings::MAX {
-            saved.assign(format!("v{variable}"), Some("sql_mode".into()));
-        }
-        assert!(!saved.holds("v0", "sql_mode"));
-        assert!(saved.holds("v1", "sql_mode"));
-        assert!(saved.holds(&format!("v{}", SavedSettings::MAX), "sql_mode"));
-        assert!(!saved.holds("v1", "character_set_client"));
-        saved.assign("v1".into(), Some("time_zone".into()));
-        assert!(!saved.holds("v1", "sql_mode"));
     }
 
     #[test]

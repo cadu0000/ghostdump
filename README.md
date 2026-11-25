@@ -182,12 +182,16 @@ For categorical columns, `{ name = "status", strategy = "randomized_response", e
 
 ### 2. The Cryptographic Secret
 
-The secret key used to generate deterministic HMAC hashes. For security reasons, **never commit this to the repository**. It can be provided via CLI argument or environment variable:
+The secret key used to generate deterministic HMAC hashes. For security reasons, **never commit this to the repository**. Give it in a file, or in an environment variable:
 
 ```bash
-export GHOSTDUMP_SECRET="$(openssl rand -hex 32)"
+openssl rand -hex 32 > ghostdump.secret && chmod 600 ghostdump.secret
+ghostdump -c rules.toml --secret-file ghostdump.secret -i dump.sql -o masked.sql
 
+export GHOSTDUMP_SECRET="$(openssl rand -hex 32)"
 ```
+
+`--secret-file` reads the whole file, without one line ending at its end, and warns when its group or other users can read it. `-s` also works, with a warning: other users of the machine can read the command line in the process list, and it stays in the shell history. Give the secret one way only: two of them stop the run, so a variable left in the environment never takes the place of the file.
 
 The secret is required only when the rules use `hmac`. Use 32 or more random bytes: an empty secret is rejected, and one shorter than 16 bytes triggers a warning, because HMAC pseudonyms of low-entropy values (sequential IDs, CPFs) can be brute-forced by anyone who guesses the secret.
 
@@ -213,9 +217,10 @@ The optimized binary will be available at `target/release/ghostdump`.
 ### Basic Execution
 
 ```bash
-ghostdump -c rules.toml -i production_db.sql -o dev_db.sql -s "super_secret_key"
-
+ghostdump -c rules.toml -i production_db.sql -o dev_db.sql --secret-file ghostdump.secret
 ```
+
+The output file is written next to its target, under a temporary name, and renamed over it only when the run succeeds: a run that stops leaves the target as it was (or absent), and removes the temporary file. A file that is replaced keeps its permissions. The input and the output may be the same file. Devices and pipes (such as `-o /dev/null`) are written directly.
 
 ### Unix Pipeline (Zero extra disk usage)
 
@@ -235,16 +240,27 @@ zcat production_db.sql.gz | ghostdump -c rules.toml | gzip > dev_db_anon.sql.gz
 | --- | --- | --- |
 | `-c` | `--config <FILE>` | Path to the TOML configuration file. |
 | `-i` | `--input <FILE>` | Path to the input SQL dump file. |
-| `-o` | `--output <FILE>` | Path to the output SQL dump file. |
-| `-s` | `--secret <STR>` | Cryptographic secret for HMAC, required when the rules use `hmac` (Can also use `GHOSTDUMP_SECRET` env var). |
+| `-o` | `--output <FILE>` | Path to the output SQL dump file, replaced only when the run succeeds (stdout when absent). |
+| | `--secret-file <FILE>` | File holding the HMAC secret, required when the rules use `hmac`. |
+| `-s` | `--secret <STR>` | The HMAC secret on the command line, where other users can see it (warns). Can also be given in `GHOSTDUMP_SECRET`. |
 | `-p` | `--progress` | Displays a progress bar on stderr: share read and ETA for a plain input file, bytes read and rate for stdin or `.gz`. Hidden when stderr is not a terminal. |
 | `-v` | `--verbose` | Enables detailed debug logging for troubleshooting. |
-| `-d` | `--dry-run` | Processes input without writing output (Validation mode). |
+| `-d` | `--dry-run` | Processes input without writing output (Validation mode); the output file is not even opened. |
 | `-l` | `--limit <ROWS>` | Stop after N data rows, closing the statement they belong to. Statements after that point (such as a final `COMMIT`) are not written. |
 | | `--dialect <NAME>` | `auto` (default), `postgres`, `mysql` or `sqlite`. |
 | | `--max-row-size <MiB>` | Largest data row, or statement held for checking, accepted (default 256). |
 | | `--strict` | Fail when a rule matches no table or column of the input. |
 | `-j` | `--threads <N>` | Threads that mask rows (default 1). Reading, parsing and writing stay on one thread; the output is the same for any number of threads. See [benchmarks](docs/benchmarks.md) for the speedup. |
+
+The exit status tells what failed, with the values of `sysexits.h`:
+
+| Status | Meaning |
+| --- | --- |
+| 0 | The run succeeded. |
+| 64 | The command line is wrong: an unknown option, or a missing or empty secret, or one given twice. |
+| 65 | The input cannot be masked safely, or is not a dump GhostDump reads: every refusal listed under *Supported SQL Dialects*, a truncated row, a row over `--max-row-size`. |
+| 74 | A file could not be read or written: the input, the rules, the secret file, the output (a full disk, a closed pipe). |
+| 78 | The rules are invalid, or match nothing with `--strict`. |
 
 ---
 

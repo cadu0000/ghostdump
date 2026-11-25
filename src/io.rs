@@ -1,8 +1,10 @@
-use std::fs::File;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
+use log::warn;
 
 pub enum InputSource {
     File(File),
@@ -46,11 +48,37 @@ pub enum OutputSource {
 }
 
 impl OutputSource {
-    pub fn new(path: Option<PathBuf>) -> io::Result<Self> {
-        match path {
-            Some(p) => Ok(OutputSource::File(File::create(p)?)),
-            None => Ok(OutputSource::Stdout(io::stdout())),
+    /// Opens the output: stdout without a path. A path to a regular file,
+    /// or to none yet, is written through a [`PendingOutput`], which leaves
+    /// the file untouched until [`PendingOutput::commit`]; any other path
+    /// (a device, a pipe, a symbolic link to nothing) is written directly.
+    pub fn open(path: Option<&Path>) -> io::Result<(Self, Option<PendingOutput>)> {
+        let Some(path) = path else {
+            return Ok((OutputSource::Stdout(io::stdout()), None));
+        };
+        let target = match fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => fs::canonicalize(path)?,
+            Ok(_) => return Ok((OutputSource::File(File::create(path)?), None)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if fs::symlink_metadata(path).is_ok() {
+                    return Ok((OutputSource::File(File::create(path)?), None));
+                }
+                path.to_path_buf()
+            }
+            Err(e) => return Err(e),
+        };
+        let (file, temp) = create_temporary(&target)?;
+        let pending = PendingOutput {
+            file: file.try_clone()?,
+            temp,
+            target,
+            committed: false,
+        };
+        // A file that is replaced keeps its permissions.
+        if let Ok(metadata) = fs::metadata(&pending.target) {
+            fs::set_permissions(&pending.temp, metadata.permissions())?;
         }
+        Ok((OutputSource::File(file), Some(pending)))
     }
 
     pub fn into_buffered(self) -> BufWriter<Self> {
@@ -72,4 +100,90 @@ impl Write for OutputSource {
             OutputSource::Stdout(s) => s.flush(),
         }
     }
+}
+
+/// An output file written in place of its target: to a temporary file in
+/// the same directory, renamed over the target by [`commit`](Self::commit)
+/// once the run succeeds. Dropped without it, the temporary file is
+/// removed, so a run that fails leaves the target as it was, or absent.
+pub struct PendingOutput {
+    /// Another handle to the temporary file, to flush it to disk.
+    file: File,
+    temp: PathBuf,
+    target: PathBuf,
+    committed: bool,
+}
+
+impl PendingOutput {
+    /// The file that `commit` replaces or creates.
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    /// Flushes the temporary file to disk and renames it over the target.
+    pub fn commit(mut self) -> io::Result<()> {
+        self.file.sync_all()?;
+        fs::rename(&self.temp, &self.target)?;
+        self.committed = true;
+        if let Err(e) = sync_directory(&self.target) {
+            warn!("the output was written, but its directory could not be flushed to disk: {e}");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PendingOutput {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.temp);
+        }
+    }
+}
+
+/// Creates `.<name>.<random>.tmp` next to `target`, so that renaming it
+/// over the target stays on one file system.
+fn create_temporary(target: &Path) -> io::Result<(File, PathBuf)> {
+    let name = target.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "the output path names no file")
+    })?;
+    let directory = match target.parent() {
+        Some(directory) if !directory.as_os_str().is_empty() => directory,
+        _ => Path::new("."),
+    };
+    loop {
+        let mut temp = OsString::from(".");
+        temp.push(name);
+        temp.push(format!(".{:016x}.tmp", rand::random::<u64>()));
+        let temp = directory.join(temp);
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => return Ok((file, temp)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "could not create a temporary file in {}, where the output is \
+                         written before it replaces {}: {e}",
+                        directory.display(),
+                        target.display()
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// Flushes the directory entry of a renamed file, so the rename survives
+/// a crash.
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    match path.parent() {
+        Some(directory) if !directory.as_os_str().is_empty() => File::open(directory)?.sync_all(),
+        _ => File::open(".")?.sync_all(),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_: &Path) -> io::Result<()> {
+    Ok(())
 }

@@ -57,6 +57,7 @@ These are properties of the pipeline, not of a mechanism. Each is enforced by th
 | Masking changes only the masked fields, and keeps the number of rows. | `codec::tests::test_unmasked_fields_and_layout_are_copied`, `properties::masking_keeps_rows_and_other_columns` |
 | Values reach the strategies as the bytes the dump holds, unescaped but not decoded, so two values that differ in any byte (binary data, text that is not UTF-8) are never merged: `hmac` gives them different pseudonyms, `randomized_response` compares them by their bytes. | `codec::tests::test_bytes_that_are_not_utf8_are_kept`, `mask::tests::test_hmac_hashes_the_bytes_of_the_value`, `categorical::tests::test_values_are_compared_by_their_bytes`, `cli::binary_values_keep_distinct_pseudonyms` |
 | Logs never contain column values. | `cli::logs_never_contain_column_values` |
+| A run that stops leaves the output file as it was, or absent, and no temporary file behind: the output is written next to its target and renamed over it only when the run succeeds (`--strict` included). | `cli::only_a_run_that_succeeds_writes_the_output_file` |
 | Invalid rules are rejected before any data is read. | `strategy::tests::test_dp_laplace_validation`, `cli::invalid_rules_stop_before_reading_data` |
 
 ## Assumptions

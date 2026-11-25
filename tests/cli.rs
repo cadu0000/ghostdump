@@ -1,6 +1,8 @@
 //! End-to-end tests: run the binary on fixture dumps.
 
+use std::fs;
 use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const PASSTHROUGH: &[u8] = include_bytes!("fixtures/passthrough.sql");
@@ -91,6 +93,148 @@ fn run(args: &[&str], secret: Option<&str>, stdin: &[u8]) -> Output {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// A new, empty directory for one test.
+fn scratch(name: &str) -> PathBuf {
+    let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir_all(&directory).expect("the directory is created");
+    directory
+}
+
+fn path(path: &Path) -> &str {
+    path.to_str().expect("a UTF-8 path")
+}
+
+/// Exit statuses follow sysexits.h: 64 for the command line, 65 for an
+/// input that cannot be masked safely, 74 for files that cannot be read or
+/// written, 78 for the rules.
+#[test]
+fn exit_statuses_tell_what_failed() {
+    let dump = b"INSERT INTO users (name) VALUES ('Ana');\n";
+    let status = |args: &[&str], stdin: &[u8]| run(args, None, stdin).status.code();
+    assert_eq!(status(&[], dump), Some(0));
+    assert_eq!(status(&["--threads", "0"], dump), Some(64));
+    assert_eq!(status(&["-c", HMAC_RULES], dump), Some(64));
+    assert_eq!(
+        status(&["-c", TYPO_RULES], b"INSERT INTO users VALUES ('Ana');\n"),
+        Some(65)
+    );
+    assert_eq!(status(&["-i", "/nonexistent/dump.sql"], b""), Some(74));
+    assert_eq!(status(&["-c", "/nonexistent/rules.toml"], dump), Some(74));
+    assert_eq!(status(&["-o", "/dev/full"], dump), Some(74));
+    assert_eq!(status(&["-c", INVALID_RULES], dump), Some(78));
+    assert_eq!(status(&["-c", TYPO_RULES, "--strict"], dump), Some(78));
+}
+
+/// The output file is written next to its target and renamed over it at
+/// the end: a run that fails leaves the target as it was, or absent, and
+/// no temporary file behind.
+#[test]
+fn only_a_run_that_succeeds_writes_the_output_file() {
+    let directory = scratch("output_file");
+    let target = directory.join("out.sql");
+    let new = directory.join("new.sql");
+    fs::write(&target, "previous\n").unwrap();
+    let masked = b"INSERT INTO users (name) VALUES ('Ana');\n";
+    let refused = b"INSERT INTO users (name) VALUES ('Ana');\nINSERT INTO users VALUES ('Bea');\n";
+
+    for args in [
+        &["-c", TYPO_RULES, "-o", path(&target)][..],
+        &["-c", TYPO_RULES, "-o", path(&new)],
+    ] {
+        let output = run(args, None, refused);
+        assert_eq!(output.status.code(), Some(65), "{}", stderr(&output));
+        assert!(
+            stderr(&output).contains("was not written"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    let strict = run(
+        &["-c", TYPO_RULES, "--strict", "-o", path(&target)],
+        None,
+        masked,
+    );
+    assert_eq!(strict.status.code(), Some(78));
+    let dry_run = run(
+        &["-c", TYPO_RULES, "--dry-run", "-o", path(&target)],
+        None,
+        masked,
+    );
+    assert!(dry_run.status.success(), "{}", stderr(&dry_run));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "previous\n");
+    assert!(!new.exists());
+
+    let written = run(&["-c", TYPO_RULES, "-o", path(&target)], None, masked);
+    assert!(written.status.success(), "{}", stderr(&written));
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "INSERT INTO users (name) VALUES (NULL);\n"
+    );
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+}
+
+/// `--secret-file` gives the same secret as GHOSTDUMP_SECRET, without the
+/// line ending at its end. The secret is given once; `-s` warns that it
+/// shows in the process list.
+#[test]
+fn secret_files_hold_the_secret() {
+    let directory = scratch("secret_file");
+    let file = directory.join("secret");
+    fs::write(&file, format!("{GOLDEN_SECRET}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let from_environment = run(&["-c", HMAC_RULES], Some(GOLDEN_SECRET), PG_DATA);
+    let from_file = run(
+        &["-c", HMAC_RULES, "--secret-file", path(&file)],
+        None,
+        PG_DATA,
+    );
+    assert!(from_file.status.success(), "{}", stderr(&from_file));
+    assert_eq!(from_file.stdout, from_environment.stdout);
+    assert!(
+        !stderr(&from_file).contains("secret"),
+        "{}",
+        stderr(&from_file)
+    );
+
+    let twice = run(
+        &["-c", HMAC_RULES, "--secret-file", path(&file)],
+        Some(GOLDEN_SECRET),
+        PG_DATA,
+    );
+    assert_eq!(twice.status.code(), Some(64));
+
+    let on_command_line = run(&["-c", HMAC_RULES, "-s", GOLDEN_SECRET], None, PG_DATA);
+    assert!(on_command_line.status.success());
+    assert!(
+        stderr(&on_command_line).contains("process list"),
+        "{}",
+        stderr(&on_command_line)
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let readable = run(
+            &["-c", HMAC_RULES, "--secret-file", path(&file)],
+            None,
+            PG_DATA,
+        );
+        assert!(readable.status.success());
+        assert!(
+            stderr(&readable).contains("chmod 600"),
+            "{}",
+            stderr(&readable)
+        );
+    }
 }
 
 #[test]

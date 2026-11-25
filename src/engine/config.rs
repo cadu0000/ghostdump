@@ -46,6 +46,7 @@ impl Config {
         Ok(config)
     }
 }
+
 /// Rules validated and compiled, ready to be applied.
 ///
 /// Table and column names are matched without regard to case (see
