@@ -1,0 +1,4 @@
+[tables.users]
+columns = [
+    { name = "salary", strategy = "dp_laplace", epsilon = 0.5, sensitivity = 15000.0 },
+]

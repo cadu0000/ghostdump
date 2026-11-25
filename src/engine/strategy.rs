@@ -1,22 +1,38 @@
-use cpf_cnpj::{cnpj, cpf};
-use fake::Fake;
-use fake::faker::internet::en::{IPv4, SafeEmail};
-use fake::faker::name::en::Name;
-use hmac::{Hmac, Mac};
-use rand::Rng;
-use rand::distributions::Alphanumeric;
-use rand::seq::SliceRandom;
-use serde::Deserialize;
-use sha2::Sha256;
-use uuid::Uuid;
+//! Strategies as written in the rules file. They are validated and compiled
+//! into maskers (`engine::mask`) once, before any data is read.
 
-type HmacSha256 = Hmac<Sha256>;
+use serde::Deserialize;
+
+use crate::engine::categorical::RandomizedResponse;
+use crate::engine::laplace::{LaplaceMechanism, max_f64_scale};
+use crate::engine::mask::{Masker, Synthetic};
+
+/// Most decimal places `dp_laplace` accepts in `scale`.
+const MAX_SCALE: u32 = 12;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "strategy", rename_all = "snake_case")]
 pub enum StrategyConfig {
     Hmac,
-    DpLaplace { epsilon: f64, sensitivity: f64 },
+    DpLaplace {
+        epsilon: f64,
+        /// `[lo, hi]`: values are clamped to it before noise is added.
+        bounds: Option<[f64; 2]>,
+        /// No longer accepted; kept so the error can explain the change.
+        sensitivity: Option<f64>,
+        /// Decimal places written.
+        scale: Option<u32>,
+        /// Also clamp the noisy output to the bounds.
+        #[serde(default)]
+        clamp_output: bool,
+        /// Which sampler draws the noise.
+        #[serde(default)]
+        mechanism: LaplaceSampler,
+        /// Draw the noise from a keyed PRF of the value: equal values get
+        /// equal outputs in every row and run. Needs the secret.
+        #[serde(default)]
+        consistent: bool,
+    },
     FakerName,
     FakerEmail,
     FakeCreditCard,
@@ -26,378 +42,263 @@ pub enum StrategyConfig {
     Cpf,
     Cnpj,
     Nullify,
-    Fixed { value: String },
-    RandomChoice { options: Vec<String> },
-    RandomString { length: usize },
+    Fixed {
+        value: String,
+    },
+    RandomChoice {
+        options: Vec<String>,
+    },
+    RandomString {
+        length: usize,
+    },
+    /// k-ary randomized response over the declared categories.
+    RandomizedResponse {
+        epsilon: f64,
+        categories: Vec<String>,
+    },
+}
+
+/// `exact` (the default) samples on integers with no floating-point step;
+/// `f64` is the floating-point sampler, kept for comparison.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaplaceSampler {
+    #[default]
+    Exact,
+    F64,
 }
 
 impl StrategyConfig {
-    pub fn apply(
-        &self,
-        original_value: Option<&str>,
-        rng: &mut impl Rng,
-        secret: &str,
-    ) -> Option<String> {
+    /// Validates the parameters and builds the masker.
+    pub fn compile(&self) -> Result<Masker, String> {
+        let synthetic = |kind| Ok(Masker::Synthetic(kind));
         match self {
-            StrategyConfig::FakerName => Some(Name().fake::<String>()),
-            StrategyConfig::FakerEmail => Some(SafeEmail().fake::<String>()),
-            StrategyConfig::FakerIp => Some(IPv4().fake::<String>()),
-            StrategyConfig::RandomUuid => Some(Uuid::new_v4().to_string()),
-            StrategyConfig::FakeCreditCard => Some(generate_fake_credit_card(rng)),
-            StrategyConfig::FakerPhoneBr => Some(generate_fake_phone_br(rng)),
-            StrategyConfig::Cpf => Some(cpf::generate()),
-            StrategyConfig::Cnpj => Some(cnpj::generate()),
-            StrategyConfig::Fixed { value } => Some(value.clone()),
-            StrategyConfig::Nullify => None,
+            StrategyConfig::Hmac => Ok(Masker::Hmac),
+            StrategyConfig::Nullify => Ok(Masker::Nullify),
+            StrategyConfig::FakerName => synthetic(Synthetic::FakerName),
+            StrategyConfig::FakerEmail => synthetic(Synthetic::FakerEmail),
+            StrategyConfig::FakerIp => synthetic(Synthetic::Ipv4),
+            StrategyConfig::RandomUuid => synthetic(Synthetic::Uuid),
+            StrategyConfig::FakeCreditCard => synthetic(Synthetic::CreditCard),
+            StrategyConfig::FakerPhoneBr => synthetic(Synthetic::PhoneBr),
+            StrategyConfig::Cpf => synthetic(Synthetic::Cpf),
+            StrategyConfig::Cnpj => synthetic(Synthetic::Cnpj),
+            StrategyConfig::Fixed { value } => synthetic(Synthetic::Fixed(value.clone())),
             StrategyConfig::RandomChoice { options } => {
-                Some(options.choose(rng).cloned().unwrap_or_default())
-            }
-            StrategyConfig::Hmac => {
-                let val = original_value.unwrap_or("");
-                let hashed = hmac_hash(val, secret);
-                Some(hashed)
-            }
-            StrategyConfig::DpLaplace {
-                epsilon,
-                sensitivity,
-            } => {
-                let val = original_value.unwrap_or("0");
-                let noisy_value = dp_laplace(val, *epsilon, *sensitivity, rng);
-                Some(noisy_value.to_string())
+                if options.is_empty() {
+                    return Err("random_choice needs at least one option".into());
+                }
+                synthetic(Synthetic::Choice(options.clone()))
             }
             StrategyConfig::RandomString { length } => {
-                let random_str: String = rng
-                    .sample_iter(&Alphanumeric)
-                    .take(*length)
-                    .map(char::from)
-                    .collect();
-                Some(random_str)
+                if *length == 0 {
+                    return Err("random_string needs a length of at least 1".into());
+                }
+                synthetic(Synthetic::Alphanumeric(*length))
             }
+            StrategyConfig::RandomizedResponse {
+                epsilon,
+                categories,
+            } => Ok(Masker::RandomizedResponse(RandomizedResponse::new(
+                *epsilon,
+                categories.clone(),
+            )?)),
+            StrategyConfig::DpLaplace {
+                epsilon,
+                bounds,
+                sensitivity,
+                scale,
+                clamp_output,
+                mechanism,
+                consistent,
+            } => compile_laplace(
+                *epsilon,
+                *bounds,
+                *sensitivity,
+                *scale,
+                *clamp_output,
+                *mechanism,
+                *consistent,
+            ),
         }
     }
 }
 
-pub fn generate_fake_credit_card(rng: &mut impl Rng) -> String {
-    format!(
-        "{:04}-{:04}-{:04}-{:04}",
-        rng.gen_range(0..=9999),
-        rng.gen_range(0..=9999),
-        rng.gen_range(0..=9999),
-        rng.gen_range(0..=9999)
-    )
-}
-
-pub fn generate_fake_phone_br(rng: &mut impl Rng) -> String {
-    format!(
-        "({:02}) 9{:04}-{:04}",
-        rng.gen_range(11..=99),
-        rng.gen_range(0..=9999),
-        rng.gen_range(0..=9999)
-    )
-}
-
-pub fn hmac_hash(val: &str, secret: &str) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC aceita qualquer tamanho");
-
-    mac.update(val.as_bytes());
-    let result = mac.finalize();
-
-    hex::encode(result.into_bytes())
-}
-
-/// Applies the Laplace Mechanism for Differential Privacy.
-///
-/// WARNING (SECURITY DEBT):
-/// This is a naive implementation based on Inverse Transform Sampling using `f64`.
-/// For production environments requiring absolute cryptographic rigor, the standard
-/// use of `f64` is vulnerable to floating-point attacks (Mironov, 2012).
-///
-/// FUTURE ARCHITECTURE NOTES:
-/// We explicitly avoid using Google's DP C++ library bindings here to prevent
-/// heavy FFI overhead and maintain strict single-pass streaming performance.
-/// In future versions (1.0), a native Rust implementation of the Snapping
-/// Mechanism should be developed to replace this function.
-pub fn dp_laplace(value: &str, epsilon: f64, sensitivity: f64, rng: &mut impl Rng) -> String {
-    let trimmed = value.trim();
-
-    if trimmed.eq_ignore_ascii_case("NULL") || trimmed.is_empty() {
-        return value.to_string();
-    }
-
-    if epsilon <= 0.0 || sensitivity <= 0.0 {
-        eprintln!(
-            "Warning: Invalid DP parameters (epsilon: {}, sensitivity: {}). Returning original value.",
-            epsilon, sensitivity
+fn compile_laplace(
+    epsilon: f64,
+    bounds: Option<[f64; 2]>,
+    sensitivity: Option<f64>,
+    scale: Option<u32>,
+    clamp_output: bool,
+    sampler: LaplaceSampler,
+    consistent: bool,
+) -> Result<Masker, String> {
+    if sensitivity.is_some() {
+        return Err(
+            "`sensitivity` is no longer accepted: in local differential privacy the \
+             sensitivity is the width of the input domain. Declare `bounds = [lo, hi]` \
+             instead; values are clamped to it and Δ = hi - lo"
+                .into(),
         );
-        return value.to_string();
     }
-    
-    let decimal_places = trimmed
-        .split_once('.')
-        .map(|(_, frac)| frac.len())
-        .unwrap_or(0);
-
-    let parsed_value: f64 = match trimmed.parse() {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!(
-                "Warning: Failure to convert '{}' to f64 in DP Laplace.",
-                trimmed
-            );
-            return value.to_string();
-        }
+    let Some([lo, hi]) = bounds else {
+        return Err(
+            "dp_laplace needs `bounds = [lo, hi]`, the range values are clamped to \
+             before noise is added"
+                .into(),
+        );
     };
+    if !(epsilon.is_finite() && epsilon > 0.0) {
+        return Err("`epsilon` must be a positive number".into());
+    }
+    if !(lo.is_finite() && hi.is_finite() && lo < hi) {
+        return Err("`bounds` must be two finite numbers with lo < hi".into());
+    }
+    let Some(scale) = scale else {
+        return Err(
+            "dp_laplace needs `scale`, the number of decimal places written \
+             (0 for integers, 2 for money): copying the precision of each input would \
+             reveal it"
+                .into(),
+        );
+    };
+    if scale > MAX_SCALE {
+        return Err(format!("`scale` must be at most {MAX_SCALE}"));
+    }
 
-    let b = sensitivity / epsilon;
-    let u: f64 = rng.gen_range(-0.5..0.5);
+    if sampler == LaplaceSampler::F64 {
+        let max = max_f64_scale(epsilon, lo, hi);
+        if scale > max {
+            return Err(format!(
+                "with mechanism = \"f64\", `scale` must be at most {max} for these bounds and \
+                 epsilon: finer output keeps the low-order bits of the floating-point noise, \
+                 which reveal the input (see docs/experiments/floating-point.md). Lower \
+                 `scale` or use the exact sampler"
+            ));
+        }
+    }
 
-    let sign = u.signum();
-    let noise = -b * sign * (1.0 - 2.0 * u.abs()).ln();
-
-    let noised_value = parsed_value + noise;
-
-    format!("{:.*}", decimal_places, noised_value)
+    let decimals = scale as usize;
+    let mechanism = match sampler {
+        LaplaceSampler::Exact => LaplaceMechanism::exact(epsilon, lo, hi, decimals, clamp_output)?,
+        LaplaceSampler::F64 => LaplaceMechanism::new(epsilon, lo, hi, decimals, clamp_output),
+    };
+    let mechanism = if consistent {
+        mechanism.with_consistent_noise()
+    } else {
+        mechanism
+    };
+    Ok(Masker::Laplace(mechanism))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{SeedableRng, rngs::StdRng};
 
-    fn seeded_rng() -> StdRng {
-        StdRng::seed_from_u64(42)
+    fn compile(toml_column: &str) -> Result<Masker, String> {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            column: StrategyConfig,
+        }
+        let parsed: Wrapper = toml::from_str(&format!("column = {{ {toml_column} }}")).unwrap();
+        parsed.column.compile()
     }
 
     #[test]
-    fn test_all_strategies_do_not_panic() {
-        let mut rng = seeded_rng();
+    fn test_every_strategy_compiles() {
+        for column in [
+            r#"strategy = "hmac""#,
+            r#"strategy = "nullify""#,
+            r#"strategy = "faker_name""#,
+            r#"strategy = "faker_email""#,
+            r#"strategy = "faker_ip""#,
+            r#"strategy = "random_uuid""#,
+            r#"strategy = "fake_credit_card""#,
+            r#"strategy = "faker_phone_br""#,
+            r#"strategy = "cpf""#,
+            r#"strategy = "cnpj""#,
+            r#"strategy = "fixed", value = "x""#,
+            r#"strategy = "random_choice", options = ["a"]"#,
+            r#"strategy = "random_string", length = 4"#,
+            r#"strategy = "randomized_response", epsilon = 1.0, categories = ["A", "B"]"#,
+            r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2"#,
+            r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2, mechanism = "f64""#,
+        ] {
+            assert!(compile(column).is_ok(), "{column}");
+        }
+    }
 
-        let strategies = vec![
-            StrategyConfig::FakerName,
-            StrategyConfig::FakerEmail,
-            StrategyConfig::FakerIp,
-            StrategyConfig::RandomUuid,
-            StrategyConfig::FakeCreditCard,
-            StrategyConfig::FakerPhoneBr,
-            StrategyConfig::Cpf,
-            StrategyConfig::Cnpj,
-            StrategyConfig::Nullify,
-            StrategyConfig::Fixed {
-                value: "STABLE".into(),
-            },
-            StrategyConfig::RandomChoice {
-                options: vec!["A".into(), "B".into()],
-            },
-            StrategyConfig::RandomString { length: 8 },
-            StrategyConfig::Hmac,
-            StrategyConfig::DpLaplace {
-                epsilon: 1.0,
-                sensitivity: 100.0,
-            },
+    #[test]
+    fn test_dp_laplace_validation() {
+        let cases = [
+            (
+                r#"strategy = "dp_laplace", epsilon = 1.0, sensitivity = 5.0"#,
+                "no longer accepted",
+            ),
+            (
+                r#"strategy = "dp_laplace", epsilon = 1.0, scale = 2"#,
+                "needs `bounds",
+            ),
+            (
+                r#"strategy = "dp_laplace", epsilon = 0.0, bounds = [0.0, 1.0], scale = 2"#,
+                "positive",
+            ),
+            (
+                r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [5.0, 1.0], scale = 2"#,
+                "lo < hi",
+            ),
+            (
+                r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 1.0]"#,
+                "needs `scale`",
+            ),
+            (
+                r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 1.0], scale = 13"#,
+                "at most 12",
+            ),
         ];
-
-        for strategy in strategies {
-            let _ = strategy.apply(Some("12345"), &mut rng, "secret");
+        for (column, message) in cases {
+            let err = compile(column).unwrap_err();
+            assert!(err.contains(message), "{column}: {err}");
         }
     }
 
     #[test]
-    fn test_nullify_strategy() {
-        let mut rng = seeded_rng();
-        let result = StrategyConfig::Nullify.apply(Some("123"), &mut rng, "secret");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_fixed_strategy() {
-        let mut rng = seeded_rng();
-        let strategy = StrategyConfig::Fixed {
-            value: "CONST".into(),
+    fn test_exact_sampler_is_the_default() {
+        let column = r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2"#;
+        let Ok(Masker::Laplace(m)) = compile(column) else {
+            panic!("dp_laplace compiles");
         };
-        let result = strategy.apply(Some("123"), &mut rng, "secret");
-        assert_eq!(result.unwrap(), "CONST");
+        assert!(m.describe().contains("exact integer sampler"));
+        let too_fine = r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 1e12], scale = 6"#;
+        assert!(compile(too_fine).unwrap_err().contains("2^53"));
     }
 
     #[test]
-    fn test_random_string_length() {
-        let mut rng = seeded_rng();
-        let strategy = StrategyConfig::RandomString { length: 12 };
-        let result = strategy.apply(Some("abc"), &mut rng, "secret").unwrap();
-        assert_eq!(result.len(), 12);
-    }
-
-    #[test]
-    fn test_random_choice_returns_valid_option() {
-        let mut rng = seeded_rng();
-        let options = vec!["A".into(), "B".into()];
-        let strategy = StrategyConfig::RandomChoice {
-            options: options.clone(),
+    fn test_f64_sampler_rejects_scales_that_expose_float_bits() {
+        let with_scale = |scale: u32, mechanism: &str| {
+            compile(&format!(
+                r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 100000.0], scale = {scale}, mechanism = "{mechanism}""#
+            ))
         };
-
-        let result = strategy.apply(Some("abc"), &mut rng, "secret").unwrap();
-        assert!(options.contains(&result));
+        assert!(with_scale(6, "f64").is_ok());
+        let err = with_scale(12, "f64").unwrap_err();
+        assert!(err.contains("at most 6"), "{err}");
+        // The exact sampler has no floating-point bits to expose.
+        assert!(with_scale(6, "exact").is_ok());
+        assert_eq!(max_f64_scale(1.0, 0.0, 100_000.0), 6);
     }
 
     #[test]
-    fn test_uuid_strategy_valid_format() {
-        let mut rng = seeded_rng();
-        let result = StrategyConfig::RandomUuid
-            .apply(Some("abc"), &mut rng, "secret")
-            .unwrap();
-
-        assert!(uuid::Uuid::parse_str(&result).is_ok());
+    fn test_consistent_noise_needs_the_secret() {
+        let plain = r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2"#;
+        assert!(!compile(plain).unwrap().uses_secret());
+        let consistent = r#"strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10.0], scale = 2, consistent = true"#;
+        assert!(compile(consistent).unwrap().uses_secret());
     }
 
     #[test]
-    fn test_cpf_strategy_structure() {
-        let mut rng = seeded_rng();
-        let result = StrategyConfig::Cpf
-            .apply(Some("abc"), &mut rng, "secret")
-            .unwrap();
-
-        assert_eq!(result.len(), 11);
-        assert!(result.chars().all(|c| c.is_ascii_digit()));
-    }
-
-    #[test]
-    fn test_cnpj_strategy_structure() {
-        let mut rng = seeded_rng();
-        let result = StrategyConfig::Cnpj
-            .apply(Some("abc"), &mut rng, "secret")
-            .unwrap();
-
-        assert_eq!(result.len(), 14);
-        assert!(result.chars().all(|c| c.is_ascii_digit()));
-    }
-
-    #[test]
-    fn test_credit_card_structure() {
-        let mut rng = seeded_rng();
-        let result = StrategyConfig::FakeCreditCard
-            .apply(Some("abc"), &mut rng, "secret")
-            .unwrap();
-
-        assert_eq!(result.len(), 19);
-        assert_eq!(result.matches('-').count(), 3);
-    }
-
-    #[test]
-    fn test_phone_br_format() {
-        let mut rng = seeded_rng();
-        let result = StrategyConfig::FakerPhoneBr
-            .apply(Some("abc"), &mut rng, "secret")
-            .unwrap();
-
-        assert!(result.starts_with('('));
-    }
-
-    #[test]
-    fn test_hmac_is_deterministic_for_same_input() {
-        let mut rng1 = seeded_rng();
-        let mut rng2 = seeded_rng();
-
-        let strategy = StrategyConfig::Hmac;
-
-        let r1 = strategy.apply(Some("123"), &mut rng1, "secret");
-        let r2 = strategy.apply(Some("123"), &mut rng2, "secret");
-
-        assert_eq!(r1, r2);
-    }
-
-    #[test]
-    fn test_dp_laplace_returns_value() {
-        let mut rng = seeded_rng();
-
-        let strategy = StrategyConfig::DpLaplace {
-            epsilon: 1.0,
-            sensitivity: 100.0,
-        };
-
-        let result = strategy.apply(Some("5000"), &mut rng, "secret");
-
-        assert!(result.is_some());
-        assert!(!result.unwrap().is_empty());
-    }
-    #[test]
-    fn test_dp_laplace_valid_number() {
-        let mut rng = StdRng::seed_from_u64(42);
-
-        let original = "1000.00";
-        let epsilon = 1.0;
-        let sensitivity = 10.0;
-
-        let result = dp_laplace(original, epsilon, sensitivity, &mut rng);
-
-        assert_ne!(result, "1000.00");
-        assert!(result.contains('.'));
-    }
-
-    #[test]
-    fn test_dp_laplace_null_handling() {
-        let mut rng = StdRng::seed_from_u64(42);
-
-        assert_eq!(dp_laplace("NULL", 1.0, 10.0, &mut rng), "NULL");
-        assert_eq!(dp_laplace("null", 1.0, 10.0, &mut rng), "null");
-        assert_eq!(dp_laplace("  NULL  ", 1.0, 10.0, &mut rng), "  NULL  ");
-    }
-
-    #[test]
-    fn test_dp_laplace_invalid_string() {
-        let mut rng = StdRng::seed_from_u64(42);
-
-        assert_eq!(dp_laplace("Batman", 1.0, 10.0, &mut rng), "Batman");
-    }
-
-    #[test]
-    fn test_dp_laplace_zero_epsilon() {
-        let mut rng = StdRng::seed_from_u64(42);
-
-        let result = dp_laplace("1000", 0.0, 10.0, &mut rng);
-
-        assert_eq!(result, "1000");
-    }
-
-    #[test]
-    fn test_dp_laplace_zero_sensitivity() {
-        let mut rng = StdRng::seed_from_u64(42);
-
-        let result = dp_laplace("1000", 1.0, 0.0, &mut rng);
-
-        assert_eq!(result, "1000");
-    }
-
-    #[test]
-    fn test_dp_laplace_negative_number() {
-        let mut rng = StdRng::seed_from_u64(42);
-
-        let result = dp_laplace("-1000", 1.0, 10.0, &mut rng);
-
-        assert_ne!(result, "-1000");
-    }
-
-    #[test]
-    fn test_dp_laplace_integer() {
-        let mut rng = StdRng::seed_from_u64(42);
-
-        let result = dp_laplace("42", 1.0, 10.0, &mut rng);
-
-        assert_ne!(result, "42");
-    }
-
-    #[test]
-    fn test_dp_laplace_distribution_changes() {
-        let mut rng = StdRng::seed_from_u64(42);
-
-        let mut values = Vec::new();
-
-        for _ in 0..1000 {
-            let v = dp_laplace("1000", 1.0, 10.0, &mut rng);
-            values.push(v.parse::<f64>().unwrap());
-        }
-
-        let mean: f64 = values.iter().sum::<f64>() / values.len() as f64;
-
-        assert!(mean > 990.0 && mean < 1010.0);
+    fn test_other_validation() {
+        assert!(compile(r#"strategy = "random_choice", options = []"#).is_err());
+        assert!(compile(r#"strategy = "random_string", length = 0"#).is_err());
     }
 }

@@ -37,7 +37,7 @@ Compressed SQL Dump
  FSM SQL Parser
        │
        ▼
-Column Tokenizer
+  Row Codec
        │
        ▼
  Masking Engine (HMAC / Faker / DP)
@@ -55,6 +55,7 @@ This approach enables:
 * **Single-pass processing**: The SQL dump is parsed only once.
 * **High composability**: Easy integration with other Unix tools (`zcat`, `gzip`).
 * **Lazy masking strategies**: Transformations are applied only to mapped columns.
+* **Parallel masking** (`--threads N`): the reader groups rows into segments of at most 1,024 masked rows, N threads mask them, and the writer puts them back in input order. At most 2N segments are in flight, so memory stays bounded, and a seeded run writes the same output for any N.
 
 ---
 
@@ -88,10 +89,15 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 | 114bd151f8fb0
 
 ##  Supported SQL Dialects
 
-GhostDump's FSM parser is designed to handle the most common SQL dump formats:
+GhostDump's FSM parser is designed to handle the most common SQL dump formats. The dialect is detected from the dump header (`--dialect auto`, the default) or chosen with `--dialect postgres|mysql|sqlite`.
 
-* **PostgreSQL**: Native support for `COPY ... FROM stdin;` formats (tab-separated values) and traditional `INSERT INTO` statements.
-* **MySQL / SQLite**: Support for multi-value `INSERT INTO ... VALUES (...), (...);` dumps.
+* **PostgreSQL**: `COPY ... FROM stdin;` blocks in text format and `INSERT INTO` statements (including `pg_dump --inserts`, `--column-inserts` and `--on-conflict-do-nothing`).
+* **MySQL**: multi-row `INSERT`, `INSERT IGNORE` and `REPLACE` statements. Rules need column names in the statements: dump with `mysqldump --complete-insert`.
+* **SQLite**: `INSERT` and `INSERT OR ...` statements with a column list.
+
+GhostDump fails closed: when a table has rules that cannot be applied, it stops with an error instead of writing the rows unmasked. This happens when an `INSERT` has no column list, when a `COPY ... FROM stdin` uses options such as `WITH (FORMAT csv)`, or when a data block's table name cannot be read. Rows larger than `--max-row-size` (256 MiB by default) also stop the run.
+
+Not supported yet: MySQL `DELIMITER` blocks (stored routines), SQLite triggers with several statements, and inserts inside CTEs (`WITH ... INSERT`).
 
 ---
 
@@ -103,12 +109,12 @@ GhostDump is currently under active development. The core parsing engine is func
 * [x] **Zero-Memory Proxy**: Streaming architecture implementation.
 * [x] **CLI Foundation**: Robust argument parsing using `clap`.
 * [x] **Masking Strategies**: Deterministic HMAC and Faker-based PII anonymization.
-* [ ] **Differential Privacy**: Laplace mechanism implementation.
-* [ ] **Rule Engine Integration**: Connect the `rules.toml` to the FSM.
-* [ ] **UX & Metrics**: Real-time progress metrics (`indicatif`).
-* [ ] **Structured Logging**: Verbose debug mode (`--verbose`).
-* [ ] **Edge Cases**: Advanced handling of `NULL` values.
-* [ ] **Parallel Processing**: Multi-threading for the masking step.
+* [x] **Differential Privacy**: Laplace mechanism with bounds, clamping and fixed precision.
+* [x] **Rule Engine Integration**: Connect the `rules.toml` to the FSM.
+* [x] **UX & Metrics**: Real-time progress metrics (`-p`, `indicatif`) and an end-of-run summary (rows, masked fields, MiB/s).
+* [x] **Structured Logging**: Verbose debug mode (`--verbose`) and `GHOSTDUMP_LOG`.
+* [x] **Edge Cases**: Advanced handling of `NULL` values (`null_policy`).
+* [x] **Parallel Processing**: Masking on a pool of threads (`--threads`), with the output in input order.
 
 ---
 
@@ -133,19 +139,39 @@ columns = [
     { name = "password_hash", strategy = "fixed", value = "$2a$12$R9h/cIPz0gi..." },
     
     # Local Differential Privacy (Laplace Mechanism for numerics)
-    { name = "salary", strategy = "dp_laplace", epsilon = 0.5, sensitivity = 15000.0 }
+    { name = "salary", strategy = "dp_laplace", epsilon = 0.5, bounds = [0.0, 15000.0], scale = 2 }
 ]
 
 ```
+
+Only the declared columns are rewritten; every other byte of the dump, including the layout of `INSERT` statements and `COPY` blocks, is copied unchanged. Values keep their SQL type: numbers stay unquoted, generated text is escaped for the dialect, and `NULL` stays `NULL` by default. Add `null_policy = "generate"` to a column to mask `NULL` values too.
+
+Rules are checked before any data is read: a rule with a missing or invalid parameter stops GhostDump with a message that names the table and column. Then GhostDump prints, on stderr, what the rules guarantee for each table: the ε a row spends over its `dp_laplace` columns, and which columns are 0-LDP or only pseudonymized.
+
+#### `dp_laplace`
+
+Each value is clamped to `bounds = [lo, hi]` and receives Laplace noise of scale `(hi - lo) / epsilon`, so every published value is ε-differentially private on its own (local differential privacy). The bounds must be chosen from knowledge of the domain, not from the data: values outside them lose accuracy, and bounds wider than needed add noise. `scale` fixes the number of decimal places written, so the output never reveals the precision of the input. `clamp_output = true` also keeps the noisy values inside the bounds (no negative salaries), at the cost of a bias near the edges. Values that are not numbers are treated as the midpoint of the bounds, never written as they are. The privacy budget adds up: a row with two `dp_laplace` columns spends the sum of their epsilons, and a person with several rows spends it once per row.
+
+The noise is drawn by an exact sampler on integers (`mechanism = "exact"`, the default): values are handled in units of `scale` and no floating-point operation takes part, so the output carries no low-order artifacts. `mechanism = "f64"` selects the floating-point sampler, about 15 times cheaper per value but vulnerable to attacks on the low-order bits; it is kept to measure the cost of exact sampling, and rejects a `scale` fine enough to expose the low-order bits of its noise. Bounds times 10^scale must stay below 2^53. See [docs/decisions/0001-laplace-sampler.md](docs/decisions/0001-laplace-sampler.md) for the reasons, including why OpenDP is not used.
+
+`consistent = true` draws the noise of each value from a keyed PRF (HMAC-SHA256 of the secret, the column and the clamped value) instead of the run's random generator. The same value in the same column then gets the same noisy output in every row and in every run. Repeated dumps no longer let anyone average the noise away (T releases cost ε, not T·ε), and a person whose value repeats in several rows spends ε once. The price: equal values produce equal outputs, which reveals which rows share a value, as `hmac` does. The guarantee becomes computational: it rests on the secret staying secret. Consistent noise needs the secret.
+
+#### `randomized_response`
+
+For categorical columns, `{ name = "status", strategy = "randomized_response", epsilon = 1.0, categories = ["ACTIVE", "PENDING", "INACTIVE"] }` keeps the true category with probability e^ε/(e^ε + k − 1) and otherwise writes another declared category, so each value is ε-differentially private on its own. Values outside the categories are replaced by a uniformly random category and counted in a warning. Unlike `random_choice`, which erases the distribution, the share of each category can be estimated without bias from the masked dump with (observed − q)/(p − q), where q = 1/(e^ε + k − 1); see [docs/experiments/utility.md](docs/experiments/utility.md). Sampling uses integer arithmetic only.
 
 ### 2. The Cryptographic Secret
 
 The secret key used to generate deterministic HMAC hashes. For security reasons, **never commit this to the repository**. It can be provided via CLI argument or environment variable:
 
 ```bash
-export GHOSTDUMP_SECRET="super_secret_key"
+export GHOSTDUMP_SECRET="$(openssl rand -hex 32)"
 
 ```
+
+The secret is required only when the rules use `hmac`. Use 32 or more random bytes: an empty secret is rejected, and one shorter than 16 bytes triggers a warning, because HMAC pseudonyms of low-entropy values (sequential IDs, CPFs) can be brute-forced by anyone who guesses the secret.
+
+All status messages and warnings are written to stderr, so stdout carries only the sanitized dump. Use `-v` for debug messages, or set `GHOSTDUMP_LOG` (for example `GHOSTDUMP_LOG=warn`) to choose the level. Logs never include column values.
 
 ---
 
@@ -190,11 +216,14 @@ zcat production_db.sql.gz | ghostdump -c rules.toml | gzip > dev_db_anon.sql.gz
 | `-c` | `--config <FILE>` | Path to the TOML configuration file. |
 | `-i` | `--input <FILE>` | Path to the input SQL dump file. |
 | `-o` | `--output <FILE>` | Path to the output SQL dump file. |
-| `-s` | `--secret <STR>` | Cryptographic secret for HMAC (Can also use `GHOSTDUMP_SECRET` env var). |
-| `-p` | `--progress` | Displays real-time progress metrics (MB/s, ETA). |
+| `-s` | `--secret <STR>` | Cryptographic secret for HMAC, required when the rules use `hmac` (Can also use `GHOSTDUMP_SECRET` env var). |
+| `-p` | `--progress` | Displays a progress bar on stderr: share read and ETA for a plain input file, bytes read and rate for stdin or `.gz`. Hidden when stderr is not a terminal. |
 | `-v` | `--verbose` | Enables detailed debug logging for troubleshooting. |
 | `-d` | `--dry-run` | Processes input without writing output (Validation mode). |
-| `-l` | `--limit <ROWS>` | Stop after processing N rows. |
+| `-l` | `--limit <ROWS>` | Stop after N data rows, closing the statement they belong to. Statements after that point (such as a final `COMMIT`) are not written. |
+| | `--dialect <NAME>` | `auto` (default), `postgres`, `mysql` or `sqlite`. |
+| | `--max-row-size <MiB>` | Largest data row accepted (default 256). |
+| `-j` | `--threads <N>` | Threads that mask rows (default 1). Reading, parsing and writing stay on one thread; the output is the same for any number of threads. See [benchmarks](docs/benchmarks.md) for the speedup. |
 
 ---
 
@@ -213,6 +242,29 @@ To run tests with standard output visible (useful for debugging state transition
 cargo test -- --nocapture
 
 ```
+
+Continuous integration (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on every push and pull request. The integration tests in `tests/` run the binary on fixture dumps and compare its output with expected files.
+
+`tests/properties.rs` holds property-based tests (proptest): on inputs built from SQL fragments and arbitrary bytes, the parser reports every byte, a run without rules is an exact copy or a clean error, and masking keeps the rows and the unmasked columns. `cargo test` runs 256 cases per property; for a deeper search, run `PROPTEST_CASES=100000 cargo test --release --test properties`.
+
+The statistical validation of the Laplace samplers is slow and ignored by default; run it with `cargo test --release -- --ignored`.
+
+For reproducible experiments, the hidden `--seed <N>` option fixes every random choice (generated values and Laplace noise). Anyone who knows the seed can recompute them, so never use it on real data. A seeded run writes the same output for any `--threads`.
+
+---
+
+##  Documentation
+
+| Page | Contents |
+| --- | --- |
+| [docs/guarantees.md](docs/guarantees.md) | What each strategy protects, under which conditions, and the propositions behind it |
+| [docs/experiments/utility.md](docs/experiments/utility.md) | Utility of masked dumps: local arms, SQL and estimator analysts, central-DP comparator (`scripts/utility_eval.py`) |
+| [docs/experiments/floating-point.md](docs/experiments/floating-point.md) | Floating-point distinguishing experiment on the Laplace samplers (`examples/fp_distinguisher.rs`) |
+| [docs/benchmarks.md](docs/benchmarks.md) | Microbenchmarks, end-to-end throughput and memory, and parallel masking (`benches/`, `scripts/bench_grid.py`) |
+| [docs/decisions/0001-laplace-sampler.md](docs/decisions/0001-laplace-sampler.md) | Why the exact integer sampler, and why not OpenDP |
+| [docs/decisions/0002-parallel-masking.md](docs/decisions/0002-parallel-masking.md) | How `--threads` keeps the output ordered, reproducible and in bounded memory, and why mimalloc |
+| [docs/dataset-generation.md](docs/dataset-generation.md) | The seeded dataset generator and its rule sets |
+| [docs/future-work.md](docs/future-work.md) | Shuffling and other directions not taken |
 
 ---
 

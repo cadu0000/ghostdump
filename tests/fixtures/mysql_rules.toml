@@ -1,0 +1,5 @@
+[tables.customers]
+columns = [
+    { name = "name", strategy = "fixed", value = "Masked O'Name" },
+    { name = "email", strategy = "nullify" },
+]

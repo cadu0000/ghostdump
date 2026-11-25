@@ -1,0 +1,4 @@
+[tables.users]
+columns = [
+    { name = "salary", strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 100000.0], scale = 2, consistent = true },
+]

@@ -16,3 +16,8 @@
 .DS_Store
 
 *.pdb
+# Output of scripts/sql_generator.py
+/generated/
+
+# Python bytecode (scripts import each other)
+__pycache__/

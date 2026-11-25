@@ -16,10 +16,23 @@ serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.0.3"
 fake = "2.9"
 rand = "0.8"
-cpf_cnpj = "0.3"
-uuid = { version = "1.10", features = ["v4"] }
+uuid = "1.10"
 sha2 = "0.10.9"
 hmac = "0.12.1"
 hex = "0.4.3"
 regex = "1.12.3"
 flate2 = "1.0"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false }
+memchr = "2"
+indicatif = "0.18"
+mimalloc = "0.1"
+
+[dev-dependencies]
+cpf_cnpj = "0.3"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+proptest = "1"
+
+[[bench]]
+name = "microbench"
+harness = false

@@ -1,0 +1,7 @@
+[tables.users]
+columns = [
+    { name = "name", strategy = "faker_name" },
+    { name = "email", strategy = "hmac" },
+    { name = "salary", strategy = "dp_laplace", epsilon = 1.0, bounds = [0.0, 10000.0], scale = 2 },
+    { name = "note", strategy = "random_string", length = 8, null_policy = "generate" },
+]
