@@ -117,6 +117,11 @@ impl Masker {
         }
     }
 
+    /// Whether the masker draws Laplace noise with the `f64` sampler.
+    pub fn uses_f64_sampler(&self) -> bool {
+        matches!(self, Masker::Laplace(m) if m.is_f64())
+    }
+
     /// Names the column the masker belongs to (used by consistent noise).
     pub fn bind(&mut self, table: &str, column: &str) {
         if let Masker::Laplace(m) = self {

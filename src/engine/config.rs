@@ -288,6 +288,15 @@ impl CompiledConfig {
             .flatten()
             .any(|column| column.masker.uses_secret())
     }
+
+    /// Whether any column draws Laplace noise with the `f64` sampler, which
+    /// the CLI accepts only for experiments.
+    pub fn uses_f64_sampler(&self) -> bool {
+        self.tables
+            .values()
+            .flatten()
+            .any(|column| column.masker.uses_f64_sampler())
+    }
 }
 
 #[cfg(test)]
@@ -356,7 +365,9 @@ mod tests {
             "#,
         )
         .unwrap();
-        let summary = config.compile().unwrap().guarantees();
+        let compiled = config.compile().unwrap();
+        assert!(compiled.uses_f64_sampler());
+        let summary = compiled.guarantees();
         assert_eq!(summary.len(), 1);
         assert!((summary[0].epsilon_per_row() - 0.75).abs() < 1e-9);
         assert_eq!(

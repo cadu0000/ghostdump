@@ -62,7 +62,7 @@ Arms:
 
 ## Consequences
 
-* The `f64` arm keeps its guarantee only if the output is rounded to a grid much coarser than the spacing of doubles at the output's magnitude. Since this experiment, GhostDump enforces it: with `mechanism = "f64"`, a rule whose `scale` is finer than 1024 doubles at |bound| + 10·b is rejected at startup (for the parameters above, at most 6 places). The exact sampler, the default, does not depend on it.
+* The `f64` arm keeps its guarantee only if the output is rounded to a grid much coarser than the spacing of doubles at the output's magnitude. Since this experiment, GhostDump enforces it: with `mechanism = "f64"`, a rule whose `scale` is finer than 1024 doubles at |bound| + 10·b is rejected at startup (for the parameters above, at most 6 places). The exact sampler, the default, does not depend on it. Since stage 1.2 of the roadmap, `mechanism = "f64"` also runs only with the hidden option `--experimental-f64-sampler`; this experiment calls the samplers directly and does not need it.
 * These results support the decision recorded in [decisions/0001-laplace-sampler.md](../decisions/0001-laplace-sampler.md) and feed the conditions of the guarantees table.
 * Limitation: the reachability test assumes the attacker knows the sampler and its parameters, which is the standard assumption (Kerckhoffs). It does not need the seed.
 

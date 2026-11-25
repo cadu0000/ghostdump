@@ -38,12 +38,12 @@ OpenDP was the first candidate. A feasibility test (OpenDP 0.16.0, `default-feat
 
 1. the value is clamped to the bounds and rounded to an integer number of units of the published precision (with `scale = 2`, one unit is 0.01);
 2. the sensitivity in units is Δ = units(hi) − units(lo), since rounding is monotone;
-3. the noise parameter is t = ⌈Δ / ε⌉, so the effective ε, Δ/t, never exceeds the configured one;
+3. the noise parameter is the smallest t with Δ/t ≤ ε, computed in integers from the exact value of ε (t = ⌈Δ·den/num⌉ for ε = num/den), so the effective ε, Δ/t, never exceeds the configured one (see [0003](0003-numeric-conversions.md));
 4. the output is the integer (value + noise), written with the decimal point in place.
 
 No floating-point operation takes part in sampling or in the output. Inputs are parsed as `f64` before clamping, which does not affect the guarantee: the result is mapped into the bounded integer domain either way.
 
-The `f64` sampler stays available (`mechanism = "f64"`) to measure the cost of exact sampling.
+The `f64` sampler stays available (`mechanism = "f64"`) to measure the cost of exact sampling. It runs only with the hidden option `--experimental-f64-sampler`, which warns at startup.
 
 ## Random source
 
@@ -61,7 +61,7 @@ Both samplers draw from the run's `StdRng` from the `rand` crate (ChaCha12, seed
   - a negative control for each check, which must fail on a broken sampler.
 
   Run them with `cargo test --release -- --ignored` (CI runs them too).
-- Bounds, `scale` and ε must fit the integer domain: bounds times 10^scale below 2^53 and t at most 2^50. Rules outside these limits are rejected at startup.
+- Bounds, `scale` and ε must fit the integer domain: bounds times 10^scale below 2^53, t at most 2^50, and ε a fraction whose denominator is at most 2^100 (every ε of at least 2^-48 is). Rules outside these limits are rejected at startup.
 
 ## References
 

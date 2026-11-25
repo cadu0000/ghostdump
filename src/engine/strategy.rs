@@ -167,6 +167,16 @@ fn compile_laplace(
     }
 
     if sampler == LaplaceSampler::F64 {
+        // The f64 sampler draws U on multiples of 2^-53 below 1, so its
+        // noise is at most 53·ln 2 < 37 times the noise scale.
+        let largest = lo.abs().max(hi.abs()) + 37.0 * ((hi - lo) / epsilon);
+        if !largest.is_finite() {
+            return Err(
+                "with mechanism = \"f64\", the noise for these bounds and epsilon can overflow \
+                 to infinity, which is not a SQL number; use the exact sampler"
+                    .into(),
+            );
+        }
         let max = max_f64_scale(epsilon, lo, hi);
         if scale > max {
             return Err(format!(
@@ -286,6 +296,27 @@ mod tests {
         // The exact sampler has no floating-point bits to expose.
         assert!(with_scale(6, "exact").is_ok());
         assert_eq!(max_f64_scale(1.0, 0.0, 100_000.0), 6);
+    }
+
+    #[test]
+    fn test_f64_sampler_rejects_noise_that_overflows() {
+        let f64_rule = |epsilon: &str, bounds: &str| {
+            compile(&format!(
+                r#"strategy = "dp_laplace", epsilon = {epsilon}, bounds = {bounds}, scale = 0, mechanism = "f64""#
+            ))
+        };
+        // (hi - lo) / ε, or 37 times it, passes the largest f64.
+        for (epsilon, bounds) in [
+            ("1e-320", "[0.0, 1.0]"),
+            ("1.0", "[-1e308, 1e308]"),
+            ("1.0", "[0.0, 1e307]"),
+        ] {
+            let err = f64_rule(epsilon, bounds).unwrap_err();
+            assert!(err.contains("infinity"), "{epsilon} {bounds}: {err}");
+        }
+        assert!(f64_rule("1.0", "[0.0, 1e306]").is_ok());
+        // ε above 1 divides the width before it is multiplied.
+        assert!(f64_rule("100.0", "[0.0, 1e308]").is_ok());
     }
 
     #[test]
