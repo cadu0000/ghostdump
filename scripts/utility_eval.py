@@ -886,7 +886,7 @@ def print_query(rows, query, column, n, epsilon):
             mean = statistics.fmean(values)
             sd = statistics.stdev(values) if len(values) > 1 else 0.0
             if query in DISTANCES:
-                out.append(f"{mean:.3f} ± {sd:.3f}")
+                out.append(f"{mean:.4f} ± {sd:.4f}")
             elif signed:
                 out.append(f"{100 * mean:+.1f}% ± {100 * sd:.1f}%")
             else:
