@@ -9,6 +9,7 @@ use rand::Rng;
 use rand::distributions::Alphanumeric;
 use rand::seq::SliceRandom;
 use sha2::Sha256;
+use std::collections::BTreeMap;
 use uuid::Builder;
 
 use crate::codec::SqlValue;
@@ -37,6 +38,16 @@ pub struct MaskStats {
     pub masked_fields: usize,
     /// Values of `randomized_response` columns outside their categories.
     pub outside_categories: usize,
+    /// `non_numeric` and `outside_categories` by rule (see
+    /// [`CompiledColumn::id`](crate::engine::config::CompiledColumn::id)).
+    pub by_rule: BTreeMap<usize, RuleStats>,
+}
+
+/// The values of one rule that its strategy could not take as they were.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct RuleStats {
+    pub non_numeric: usize,
+    pub outside_categories: usize,
 }
 
 impl MaskStats {
@@ -45,6 +56,23 @@ impl MaskStats {
         self.non_numeric += other.non_numeric;
         self.masked_fields += other.masked_fields;
         self.outside_categories += other.outside_categories;
+        for (rule, stats) in &other.by_rule {
+            let sum = self.by_rule.entry(*rule).or_default();
+            sum.non_numeric += stats.non_numeric;
+            sum.outside_categories += stats.outside_categories;
+        }
+    }
+
+    /// A value of a `dp_laplace` rule that is not a number.
+    pub fn count_non_numeric(&mut self, rule: usize) {
+        self.non_numeric += 1;
+        self.by_rule.entry(rule).or_default().non_numeric += 1;
+    }
+
+    /// A value of a `randomized_response` rule outside its categories.
+    pub fn count_outside_category(&mut self, rule: usize) {
+        self.outside_categories += 1;
+        self.by_rule.entry(rule).or_default().outside_categories += 1;
     }
 }
 
@@ -126,6 +154,15 @@ impl Masker {
     pub fn bind(&mut self, table: &str, column: &str) {
         if let Masker::Laplace(m) = self {
             m.bind(table, column);
+        }
+    }
+
+    /// Names the rule whose values the masker counts in `MaskStats`.
+    pub fn set_rule(&mut self, rule: usize) {
+        match self {
+            Masker::Laplace(m) => m.set_rule(rule),
+            Masker::RandomizedResponse(rr) => rr.set_rule(rule),
+            Masker::Synthetic(_) | Masker::Nullify | Masker::Hmac => {}
         }
     }
 

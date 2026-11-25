@@ -109,7 +109,7 @@ GhostDump fails closed: when its rules cannot be applied with certainty, it stop
 * there are rules and the dump runs a client command that pg_dump, mysqldump and sqlite3 do not write: a psql meta-command other than `\connect` (`\c`), `\restrict` and `\unrestrict` (such as `\set`, `\copy` or `\g`), a mysql command (`\g`, `\d`, `source`, `charset`, ...) other than `DELIMITER` and `USE`, or a sqlite3 dot-command. These commands can carry data, read other files, or change the delimiter or the encoding;
 * the rows of a table name no schema, the dump does not say which schema they go to (`mysqldump --databases` says it, with `USE`), and the only rules for the table name a schema, as `[tables."shop.users"]` does.
 
-Rows, and the statements GhostDump holds to check them, also stop the run when they are larger than `--max-row-size` (256 MiB by default).
+Rows, and the statements GhostDump holds to check them, also stop the run when they are larger than `--max-row-size` (256 MiB by default). Every error that stops a run names the line of the input where GhostDump stopped: the line that ends the statement, header or row it refuses.
 
 Values are masked from their bytes, unescaped but not decoded: two values that differ in any byte, such as binary data, keep different `hmac` pseudonyms.
 
@@ -195,7 +195,7 @@ export GHOSTDUMP_SECRET="$(openssl rand -hex 32)"
 
 The secret is required only when the rules use `hmac`. Use 32 or more random bytes: an empty secret is rejected, and one shorter than 16 bytes triggers a warning, because HMAC pseudonyms of low-entropy values (sequential IDs, CPFs) can be brute-forced by anyone who guesses the secret.
 
-All status messages and warnings are written to stderr, so stdout carries only the sanitized dump. Use `-v` for debug messages, or set `GHOSTDUMP_LOG` (for example `GHOSTDUMP_LOG=warn`) to choose the level. Logs never include column values.
+All status messages and warnings are written to stderr, so stdout carries only the sanitized dump. Use `-v` for debug messages, or set `GHOSTDUMP_LOG` (for example `GHOSTDUMP_LOG=warn`) to choose the level. Logs never include column values: a warning about values names their column and counts them (`column users.salary: 2 value(s) were not numbers`). With rules, a PostgreSQL dump that holds large objects gets a warning too, since no rule applies to them.
 
 ---
 
@@ -221,6 +221,22 @@ ghostdump -c rules.toml -i production_db.sql -o dev_db.sql --secret-file ghostdu
 ```
 
 The output file is written next to its target, under a temporary name, and renamed over it only when the run succeeds: a run that stops leaves the target as it was (or absent), and removes the temporary file. A file that is replaced keeps its permissions. The input and the output may be the same file. Devices and pipes (such as `-o /dev/null`) are written directly.
+
+### Starting and checking the rules
+
+`init` reads the tables and columns of a dump (from its `CREATE TABLE` statements and the column lists of its rows) and writes a starting rules file. Columns whose names suggest personal data (`name`, `email`, `cpf`, `phone`, ...) get a rule that needs no secret; every other column is listed in a comment. A table the dump has no rows of, and SQLite's own tables, are commented out. It never replaces an existing file:
+
+```bash
+ghostdump init -i production_db.sql -o rules.toml
+```
+
+`check` runs the rules over a dump without writing anything, and lists the rules applied to each table, the tables copied as they are, and the rules that match nothing. It needs no secret, and fails like a run would: 78 when a rule matches nothing, 65 when the dump would be refused.
+
+```bash
+ghostdump check -c rules.toml -i production_db.sql
+```
+
+A rules file written by `init` passes `check` on its dump: checked on 30 real dumps of the three dialects.
 
 ### Unix Pipeline (Zero extra disk usage)
 

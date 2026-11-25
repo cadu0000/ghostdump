@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
@@ -7,14 +7,19 @@ use std::path::PathBuf;
     name = "ghostdump",
     version,
     about = "High-Throughput SQL Stream Sanitizer",
-    long_about = "Ferramenta CLI para anonimização e pseudonimização determinística de dumps SQL em alta performance."
+    long_about = "Masks the values of a SQL dump in one streaming pass, with rules per column: deterministic pseudonyms, generated values and local differential privacy. Everything without a rule is copied byte for byte.",
+    args_conflicts_with_subcommands = true
 )]
 pub struct Args {
+    /// Without one, the dump is masked: `ghostdump -c rules.toml -i dump.sql`.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     #[arg(
         short = 'c',
         long,
         value_name = "FILE",
-        help = "Define o caminho do arquivo de configuração TOML"
+        help = "Rules file (TOML); without it the dump is copied as it is"
     )]
     pub config: Option<PathBuf>,
 
@@ -22,7 +27,7 @@ pub struct Args {
         short = 'i',
         long,
         value_name = "INPUT_FILE",
-        help = "Define o caminho do arquivo de entrada"
+        help = "Input dump, decompressed when it ends in .gz (stdin when absent)"
     )]
     pub input: Option<PathBuf>,
 
@@ -30,7 +35,7 @@ pub struct Args {
         short = 'o',
         long,
         value_name = "OUTPUT_FILE",
-        help = "Define o caminho do arquivo de saída"
+        help = "Output dump, replaced only when the run succeeds (stdout when absent)"
     )]
     pub output: Option<PathBuf>,
 
@@ -39,7 +44,7 @@ pub struct Args {
         long,
         env = "GHOSTDUMP_SECRET",
         hide_env_values = true,
-        help = "Chave secreta do HMAC; obrigatória quando as regras usam hmac (use 32 ou mais bytes aleatórios)"
+        help = "HMAC secret (32 or more random bytes), needed when the rules use hmac. Other users can read it in the process list: prefer --secret-file"
     )]
     pub secret: Option<String>,
 
@@ -51,13 +56,13 @@ pub struct Args {
     )]
     pub secret_file: Option<PathBuf>,
 
-    #[arg(short = 'v', long, action = clap::ArgAction::SetTrue, help = "Ativa logs detalhados (Debug)")]
+    #[arg(short = 'v', long, action = clap::ArgAction::SetTrue, help = "Show debug messages")]
     pub verbose: bool,
 
     #[arg(
         short = 'd',
         long,
-        help = "Processa o arquivo sem escrever a saída, apenas validando erros e logs"
+        help = "Read and check the input without writing the output"
     )]
     pub dry_run: bool,
 
@@ -65,18 +70,18 @@ pub struct Args {
         short = 'l',
         long,
         value_name = "ROWS",
-        help = "Para depois de N linhas de dados, fechando o comando em que estão"
+        help = "Stop after N data rows, closing the statement they belong to"
     )]
     pub limit: Option<usize>,
 
-    #[arg(short = 'p', long, help = "Exibe uma barra de progresso no terminal")]
+    #[arg(short = 'p', long, help = "Show a progress bar on stderr")]
     pub progress: bool,
 
     #[arg(
         long,
         value_enum,
         default_value_t = DialectArg::Auto,
-        help = "Dialeto SQL do dump; auto detecta pelo cabeçalho"
+        help = "SQL dialect of the dump; auto detects it from its first lines"
     )]
     pub dialect: DialectArg,
 
@@ -84,7 +89,7 @@ pub struct Args {
         long,
         value_name = "MiB",
         default_value_t = 256,
-        help = "Tamanho máximo de uma linha de dados, em MiB"
+        help = "Largest data row, or statement held for checking, in MiB"
     )]
     pub max_row_size: usize,
 
@@ -93,7 +98,7 @@ pub struct Args {
         long,
         value_name = "N",
         default_value = "1",
-        help = "Threads que mascaram as linhas; a leitura e a escrita ficam na thread principal"
+        help = "Threads that mask rows; reading and writing stay on the main thread"
     )]
     pub threads: NonZeroUsize,
 
@@ -114,6 +119,81 @@ pub struct Args {
     /// low-order bits of floating-point noise.
     #[arg(long, hide = true)]
     pub experimental_f64_sampler: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Check rules against a dump without writing it: the rules applied,
+    /// the tables copied as they are, the rules that match nothing, and
+    /// what would stop a run
+    Check(CheckArgs),
+    /// Write a starting rules file from the tables and columns of a dump
+    Init(InitArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CheckArgs {
+    #[arg(short = 'c', long, value_name = "FILE", help = "Rules file (TOML)")]
+    pub config: PathBuf,
+
+    #[arg(
+        short = 'i',
+        long,
+        value_name = "INPUT_FILE",
+        help = "Input dump, decompressed when it ends in .gz (stdin when absent)"
+    )]
+    pub input: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = DialectArg::Auto,
+        help = "SQL dialect of the dump; auto detects it from its first lines"
+    )]
+    pub dialect: DialectArg,
+
+    #[arg(
+        long,
+        value_name = "MiB",
+        default_value_t = 256,
+        help = "Largest data row, or statement held for checking, in MiB"
+    )]
+    pub max_row_size: usize,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct InitArgs {
+    #[arg(
+        short = 'i',
+        long,
+        value_name = "INPUT_FILE",
+        help = "Input dump, decompressed when it ends in .gz (stdin when absent)"
+    )]
+    pub input: Option<PathBuf>,
+
+    #[arg(
+        short = 'o',
+        long,
+        value_name = "FILE",
+        help = "Rules file to write, which must not exist yet (stdout when absent)"
+    )]
+    pub output: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = DialectArg::Auto,
+        help = "SQL dialect of the dump; auto detects it from its first lines"
+    )]
+    pub dialect: DialectArg,
+
+    #[arg(
+        long,
+        value_name = "MiB",
+        default_value_t = 256,
+        help = "Largest data row, or statement held for checking, in MiB"
+    )]
+    pub max_row_size: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
@@ -196,6 +276,21 @@ mod tests {
         assert_eq!(parse(&[]).unwrap().threads.get(), 1);
         assert_eq!(parse(&["-j", "4"]).unwrap().threads.get(), 4);
         assert!(parse(&["--threads", "0"]).is_err());
+    }
+
+    #[test]
+    fn test_subcommands_keep_the_default_form() {
+        let parse = |args: &[&str]| Args::try_parse_from([&["ghostdump"], args].concat());
+        let masked = parse(&["-c", "rules.toml", "-i", "dump.sql"]).unwrap();
+        assert!(masked.command.is_none());
+        let check = parse(&["check", "-c", "rules.toml", "-i", "dump.sql"]).unwrap();
+        assert!(matches!(check.command, Some(Command::Check(_))));
+        assert!(matches!(
+            parse(&["init", "-i", "dump.sql"]).unwrap().command,
+            Some(Command::Init(_))
+        ));
+        assert!(parse(&["-c", "rules.toml", "check", "-c", "rules.toml"]).is_err());
+        assert!(parse(&["check", "-i", "dump.sql"]).is_err());
     }
 
     #[test]

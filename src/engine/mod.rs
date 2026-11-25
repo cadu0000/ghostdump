@@ -84,6 +84,15 @@ pub struct RunReport {
     /// Rules that matched no table or column of the input: a misspelt name
     /// leaves its column unmasked. Empty when `--limit` stopped the run.
     pub unused_rules: Vec<UnusedRule>,
+    /// Statements that write the bytes of a PostgreSQL large object
+    /// (`lowrite`), which GhostDump copies as they are. Counted only when
+    /// there are rules.
+    pub large_object_writes: usize,
+    /// The rules applied at least once, as (table key, column).
+    pub applied_rules: BTreeSet<(String, String)>,
+    /// Tables of the input, as they are named there, whose rows no rule
+    /// changed: copied as they are.
+    pub copied_tables: BTreeSet<String>,
 }
 
 /// A rule that matched nothing in the input.
@@ -277,6 +286,8 @@ impl AnonymizerEngine {
 
         let mut buffer = [0u8; 64 * 1024];
         let mut bytes_read = 0u64;
+        // Line ends in the buffers already read.
+        let mut lines_before = 0u64;
         let mut reached_limit = false;
         let mut unterminated_data_block = false;
 
@@ -286,8 +297,14 @@ impl AnonymizerEngine {
                 break;
             }
             bytes_read += read as u64;
+            // A refusal names the line where GhostDump stopped: the line
+            // that ends the statement, header or row it refuses.
+            let at_line = |error: io::Error, at: usize| {
+                let line = lines_before + newlines(&buffer[..at]) + 1;
+                io::Error::new(error.kind(), format!("{error} (line {line} of the input)"))
+            };
 
-            for &byte in &buffer[..read] {
+            for (at, &byte) in buffer[..read].iter().enumerate() {
                 let Some(event) = parser.handle_byte(byte) else {
                     continue;
                 };
@@ -298,7 +315,7 @@ impl AnonymizerEngine {
                         if checks
                             && let Err(e) = reading.statement(&Statement::parse(&bytes, dialect))
                         {
-                            return stop(sink, e);
+                            return stop(sink, at_line(e, at));
                         }
                         sink.write(&bytes)?;
                     }
@@ -308,7 +325,7 @@ impl AnonymizerEngine {
                         opaque,
                     } => {
                         if let Err(e) = reading.header(&raw_bytes, metadata, opaque) {
-                            return stop(sink, e);
+                            return stop(sink, at_line(e, at));
                         }
                         sink.write(&raw_bytes)?;
                     }
@@ -325,13 +342,16 @@ impl AnonymizerEngine {
                     }
                     SqlEvent::Footer(footer) => {
                         if let Err(e) = reading.footer(&footer) {
-                            return stop(sink, e);
+                            return stop(sink, at_line(e, at));
                         }
                         sink.write(&footer)?;
                     }
-                    SqlEvent::Error(e) => return stop(sink, refuse(e.to_string())),
+                    SqlEvent::Error(e) => {
+                        return stop(sink, at_line(refuse(e.to_string()), at));
+                    }
                 }
             }
+            lines_before += newlines(&buffer[..read]);
         }
 
         // With `--limit` the output stops on purpose, in the middle of the input.
@@ -352,26 +372,45 @@ impl AnonymizerEngine {
         }
 
         let stats = sink.finish()?;
-        if stats.non_numeric > 0 {
-            // One warning per run, without the values.
-            warn!(
-                "{} value(s) of dp_laplace columns were not numbers; they were treated as \
-                 the midpoint of their bounds",
-                stats.non_numeric
-            );
-        }
-        if stats.outside_categories > 0 {
-            warn!(
-                "{} value(s) of randomized_response columns were not among their categories; \
-                 they were replaced by a uniformly random category",
-                stats.outside_categories
-            );
-        }
+        self.warn_at_end(&stats, reading.large_object_writes);
         Ok(reading.report(&stats, bytes_read, unterminated_data_block, reached_limit))
     }
 }
 
 impl AnonymizerEngine {
+    /// The warnings of a run that ends: one per column whose values its rule
+    /// could not take as they were, with their number, never the values; and
+    /// the large objects copied unmasked. Out of the loop of `run`.
+    #[cold]
+    fn warn_at_end(&self, stats: &MaskStats, large_object_writes: usize) {
+        for (&rule, counts) in &stats.by_rule {
+            let (table, column) = self.config.rule(rule).unwrap_or(("?", "?"));
+            if counts.non_numeric > 0 {
+                warn!(
+                    "column `{table}.{column}`: {} value(s) were not numbers; its dp_laplace \
+                     rule treated them as the midpoint of its bounds",
+                    counts.non_numeric
+                );
+            }
+            if counts.outside_categories > 0 {
+                warn!(
+                    "column `{table}.{column}`: {} value(s) were not among the categories of \
+                     its randomized_response rule; they were replaced by a uniformly random \
+                     category",
+                    counts.outside_categories
+                );
+            }
+        }
+        if large_object_writes > 0 {
+            warn!(
+                "the dump writes {} piece(s) of PostgreSQL large objects, which GhostDump copies \
+                 unmasked: no rule applies to them. Dump with pg_dump --no-large-objects (-B) \
+                 unless they hold no personal data",
+                large_object_writes
+            );
+        }
+    }
+
     /// Refuses a statement that may write data GhostDump cannot mask (see
     /// [`SqlEvent::Statement`]) when it refers to a table with rules. The
     /// check is by name, so a column or keyword spelt like such a table is
@@ -463,6 +502,10 @@ impl AnonymizerEngine {
     }
 }
 
+/// The PostgreSQL functions that write the bytes of a large object from
+/// the dump: pg_dump writes `lowrite`, the others write them by hand.
+const LARGE_OBJECT_WRITES: &[&str] = &["lowrite", "lo_put", "lo_from_bytea"];
+
 /// What a run has read so far, and what it decided from it.
 struct Reading<'a> {
     engine: &'a AnonymizerEngine,
@@ -482,6 +525,11 @@ struct Reading<'a> {
     rows_processed: usize,
     data_blocks: usize,
     rows_masked: usize,
+    large_object_writes: usize,
+    /// Tables whose rows a rule changed, and tables whose rows none did,
+    /// as the input names them.
+    masked_tables: BTreeSet<String>,
+    copied_tables: BTreeSet<String>,
     rows_by_table: BTreeMap<String, usize>,
     /// Rows of the current table, added to `rows_by_table` when the table
     /// changes, so that rows are counted without a map lookup each.
@@ -503,6 +551,9 @@ impl<'a> Reading<'a> {
             rows_processed: 0,
             data_blocks: 0,
             rows_masked: 0,
+            large_object_writes: 0,
+            masked_tables: BTreeSet::new(),
+            copied_tables: BTreeSet::new(),
             rows_by_table: BTreeMap::new(),
             current_table: String::new(),
             current_rows: 0,
@@ -514,6 +565,9 @@ impl<'a> Reading<'a> {
     fn statement(&mut self, statement: &Statement) -> io::Result<()> {
         check_settings(statement, &mut self.saved)?;
         self.engine.check_statement(statement)?;
+        if self.dialect == SqlDialect::Postgres && statement.calls_any(LARGE_OBJECT_WRITES) {
+            self.large_object_writes += 1;
+        }
         if let Some(name) = statement.used_database() {
             self.database = Some(name);
             self.plan_metadata = None;
@@ -568,6 +622,16 @@ impl<'a> Reading<'a> {
                     .extend(columns.iter().flatten().map(|rule| (key, &rule.name)));
                 Arc::new(columns)
             });
+        if let Some(metadata) = metadata.as_deref() {
+            let name = match &metadata.schema {
+                Some(schema) => format!("{schema}.{}", metadata.table),
+                None => metadata.table.clone(),
+            };
+            match &self.plan {
+                Some(plan) if plan.iter().any(Option::is_some) => self.masked_tables.insert(name),
+                _ => self.copied_tables.insert(name),
+            };
+        }
         self.plan_metadata = metadata;
         Ok(())
     }
@@ -651,6 +715,17 @@ impl<'a> Reading<'a> {
             bytes_read,
             data_blocks: self.data_blocks,
             rows_masked: self.rows_masked,
+            large_object_writes: self.large_object_writes,
+            applied_rules: self
+                .used
+                .iter()
+                .map(|(table, column)| (table.to_string(), column.to_string()))
+                .collect(),
+            copied_tables: self
+                .copied_tables
+                .difference(&self.masked_tables)
+                .cloned()
+                .collect(),
             fields_masked: stats.masked_fields,
             rows_by_table: self.rows_by_table,
             // A run cut short by `--limit` has not seen the whole input.
@@ -667,6 +742,12 @@ fn count_rows(rows_by_table: &mut BTreeMap<String, usize>, table: &str, rows: us
     if rows > 0 {
         *rows_by_table.entry(table.to_string()).or_default() += rows;
     }
+}
+
+fn newlines(bytes: &[u8]) -> u64 {
+    // memchr counts with vector instructions: about 1% of the instructions
+    // of a run that copies a COPY block.
+    memchr::memchr_iter(b'\n', bytes).count() as u64
 }
 
 /// An error that stops the run because the data cannot be handled safely.
@@ -1177,6 +1258,43 @@ mod tests {
                 assert!(err.to_string().contains("longer than 64 bytes"), "{err}");
             }
         }
+    }
+
+    #[test]
+    fn test_refusals_name_the_line_where_they_stop() {
+        let refused = |input: &[u8]| {
+            let mut out = Vec::new();
+            engine(NAME_RULES)
+                .process_dump(input, &mut out, &RunOptions::new(SqlDialect::Postgres))
+                .unwrap_err()
+                .to_string()
+        };
+        let err = refused(
+            b"SELECT 1;\nINSERT INTO users (name)\nVALUES ('a');\nUPDATE users\nSET name = 'b';\n",
+        );
+        assert!(err.ends_with("(line 5 of the input)"), "{err}");
+        // Past the first buffers read, which hold 64 KiB each.
+        let mut long = b"SELECT 1;\n".repeat(20_000);
+        long.extend_from_slice(b"INSERT INTO users VALUES ('a');\n");
+        let err = refused(&long);
+        assert!(err.ends_with("(line 20001 of the input)"), "{err}");
+    }
+
+    #[test]
+    fn test_large_object_writes_are_counted_with_rules() {
+        let input = b"SELECT pg_catalog.lo_open('49158', 131072);\n\
+            SELECT pg_catalog.lowrite(0, '\\x5345');\n\
+            SELECT pg_catalog.lo_close(0);\n";
+        let count = |rules: &str| {
+            let mut out = Vec::new();
+            let report = engine(rules)
+                .process_dump(&input[..], &mut out, &RunOptions::new(SqlDialect::Postgres))
+                .unwrap();
+            assert_eq!(out, input);
+            report.large_object_writes
+        };
+        assert_eq!(count(NAME_RULES), 1);
+        assert_eq!(count(""), 0);
     }
 
     #[test]

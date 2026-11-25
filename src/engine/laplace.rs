@@ -34,6 +34,8 @@ pub struct LaplaceMechanism {
     sampler: Sampler,
     /// `Some(label)` for consistent noise; the label names the column.
     consistent: Option<String>,
+    /// The rule it belongs to, for the counters of `MaskStats`.
+    rule: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +57,7 @@ impl LaplaceMechanism {
                 noise_scale: (hi - lo) / epsilon,
             },
             consistent: None,
+            rule: 0,
         }
     }
 
@@ -71,6 +74,11 @@ impl LaplaceMechanism {
         if let Some(label) = &mut self.consistent {
             *label = format!("{table}.{column}");
         }
+    }
+
+    /// Names the rule whose values `apply` counts in `MaskStats`.
+    pub fn set_rule(&mut self, rule: usize) {
+        self.rule = rule;
     }
 
     pub fn is_consistent(&self) -> bool {
@@ -109,7 +117,7 @@ impl LaplaceMechanism {
             .and_then(|text| text.trim().parse::<f64>().ok())
             .filter(|number| number.is_finite());
         if parsed.is_none() && !value.is_null() {
-            stats.non_numeric += 1;
+            stats.count_non_numeric(self.rule);
         }
 
         let text = match &self.sampler {
