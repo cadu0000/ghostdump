@@ -388,6 +388,10 @@ def main():
     parser.add_argument("--task", choices=["numeric", "categorical", "adult"], default="numeric")
     parser.add_argument("--adult-dir", help="directory with adult.data and adult.test (--task adult)")
     parser.add_argument("--summarize", metavar="CSV", help="print the summary of an earlier run and exit")
+    parser.add_argument("--query", help="with --summarize: one table of this query, arms by n or by ε")
+    parser.add_argument("--column", help="with --query: the column (for CSVs with several)")
+    parser.add_argument("--n", type=int, help="with --query: fix n, one table column per ε")
+    parser.add_argument("--epsilon", type=float, help="with --query: fix ε, one table column per n")
     parser.add_argument("--sizes", default="10000,100000")
     parser.add_argument("--epsilons", default="0.5,1,2")
     parser.add_argument("--reps", type=int, default=10)
@@ -400,7 +404,13 @@ def main():
 
     if args.summarize:
         with open(args.summarize, newline="") as f:
-            print_summary(list(csv.DictReader(f)))
+            rows = list(csv.DictReader(f))
+        if args.query:
+            if (args.n is None) == (args.epsilon is None):
+                parser.error("--query needs one of --n and --epsilon")
+            print_query(rows, args.query, args.column, args.n, args.epsilon)
+        else:
+            print_summary(rows)
         return
     if args.task == "adult" and not args.adult_dir:
         parser.error("--task adult needs --adult-dir")
@@ -809,6 +819,58 @@ def print_summary(rows):
                     errors = [abs(e) for e in errors]
                 cells.append(dispersion(errors, signed=q == "mean"))
             print("| " + " | ".join(cells) + " |")
+
+
+ARM_ORDER = [
+    "a_priori", "dp_bounds", "oracle", "central_a_priori", "central_oracle",
+    "random_choice", "randomized_response", "central",
+]
+ANALYST_NAMES = {"naive": "SQL", "estimator": "estimator", "central": "central DP"}
+# Queries whose error is a distance, not a relative error.
+DISTANCES = {"histogram_tv", "tv", "max_share"}
+
+
+def print_query(rows, query, column, n, epsilon):
+    """One query as a Markdown table: a row per arm and analyst, a column
+    per ε (n fixed) or per n (ε fixed); each cell the mean error over the
+    repetitions ± its standard deviation, in percent for relative errors."""
+    by_cell = {}
+    for r in rows:
+        if r["query"] != query or (column and r.get("column", "") != column):
+            continue
+        if n is not None and int(r["n"]) != n:
+            continue
+        if epsilon is not None and float(r["epsilon"]) != epsilon:
+            continue
+        across = float(r["epsilon"]) if n is not None else int(r["n"])
+        error = float(r["error"])
+        if not math.isnan(error):
+            by_cell.setdefault((r["arm"], r["analyst"]), {}).setdefault(across, []).append(error)
+    if not by_cell:
+        sys.exit(f"no rows for query {query}")
+    acrosses = sorted({a for cells in by_cell.values() for a in cells})
+    label = (lambda a: f"ε = {a:g}") if n is not None else (lambda a: f"n = {a:,}")
+    print("| Arm | Analyst | " + " | ".join(label(a) for a in acrosses) + " |")
+    print("|---|---|" + "---|" * len(acrosses))
+    order = {arm: i for i, arm in enumerate(ARM_ORDER)}
+    for (arm, analyst), cells in sorted(by_cell.items(), key=lambda kv: (order.get(kv[0][0], 99), kv[0][1] != "naive", kv[0][1])):
+        out = []
+        for a in acrosses:
+            errors = cells.get(a, [])
+            if not errors:
+                out.append("n/a")
+                continue
+            signed = query == "mean"
+            values = errors if signed else [abs(e) for e in errors]
+            mean = statistics.fmean(values)
+            sd = statistics.stdev(values) if len(values) > 1 else 0.0
+            if query in DISTANCES:
+                out.append(f"{mean:.3f} ± {sd:.3f}")
+            elif signed:
+                out.append(f"{100 * mean:+.1f}% ± {100 * sd:.1f}%")
+            else:
+                out.append(f"{100 * mean:.1f}% ± {100 * sd:.1f}%")
+        print(f"| `{arm}` | {ANALYST_NAMES.get(analyst, analyst)} | " + " | ".join(out) + " |")
 
 
 def dispersion(errors, signed=False):
