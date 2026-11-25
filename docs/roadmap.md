@@ -66,17 +66,19 @@ Goal: measure what the tool delivers and improve where the evidence points. Item
 
 | Stage | Work | Priority |
 | --- | --- | --- |
-| 2.1 Utility evaluation, second version | ε in {0.1, 0.5, 1, 2, 5, 10}; dispersion in every table (the raw CSVs already hold one row per repetition); the Adult dataset instead of ACS PUMS; error per column; randomized response with 2, 5, 9 and 16 categories. | high |
+| 2.1 Utility evaluation, second version | **done** in November 2026 ([utility evaluation](experiments/utility.md)): ε in {0.1, 0.5, 1, 2, 5, 10}; the mean ± standard deviation of 10 repetitions in every table, each printed by a command; the Adult dataset (48,842 records) instead of ACS PUMS, checked against its SHA-256; error per column; randomized response with 2, 5, 9 and 16 categories (Adult's `sex`, `race`, `workclass`, `education`), whose error follows the variance of k-ary randomized response. | high |
 | 2.2 Measures over several columns | Counts over two attributes, dependence between columns (Cramér's V, correlation), one classification task. | medium |
 | 2.3 Utility warnings at startup | Print the probability that randomized response keeps a value and warn when it is low; guidance on choosing ε per column. | medium |
 | 2.4 Comparator with global access | A marginal-based synthesizer. The `pasteur` library (MARE, PrivBayes, AIM, MST) installs in the development environment but has not been run. *Evaluate* with a one-day trial. | medium |
-| 2.5 Estimator shipped with the tool | A subcommand `estimate` that reads a masked dump and its rules and returns corrected histograms and shares, in one pass and constant memory. | medium |
+| 2.5 Estimator shipped with the tool | A subcommand `estimate` that reads a masked dump and its rules and returns corrected histograms and shares, in one pass and constant memory. The EM of the evaluation overfits on Adult (stage 2.1): it needs a stopping rule or a regularization chosen without the truth. | medium |
 | 2.6 Checking properties | Statistical tests of ε for `randomized_response` and consistent noise; a property test for the composition in the privacy summary. Formal verification of the sampler is out for now. | high |
 | 2.7 Empirical risk | A linkage or inference experiment on a masked dump. *Evaluate* the scope. | medium |
 | 2.8 Controlled benchmarks | A dedicated machine or declared noise, 10^7 rows, CPU profiles; decide the chunked parser with this data. | medium |
 | 2.9 Guarantee per person | A two-pass helper that reports the largest number of rows per key. *Evaluate*: it is outside the single pass. | low |
 
 V2 is complete when every claim in `docs/guarantees.md` and `docs/experiments/` can be reproduced by a documented command, with dispersion, and every recommendation of the reviews has a recorded outcome.
+
+Found in November 2026, in stage 2.1. The deconvolution estimator of the evaluation counted the noisy values in cells 0.92 units wide and grouped the true values in bins 2 units wide, both off the grid of whole numbers that Adult's columns and their noise lie on; cells between two whole numbers stayed empty where the model expected mass. Its errors on `age` then rose with ε, up to 235% on the range around the median at ε = 5 with the true bounds (harness at commit `a16ec9f`). It now follows the grid of whole-number columns; on synthetic data it computes as before, and a small run gave the same rows. With that fixed, EM still overfits on Adult: run to its stopping rule, its estimate of `age` is worse than after 300 to 1,000 iterations, so its errors stop falling from ε = 0.5 on. The rule is kept, and the question passes to stage 2.5.
 
 ## V3: exploration
 
