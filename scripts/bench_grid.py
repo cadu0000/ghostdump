@@ -19,6 +19,10 @@ configurations it understands (no rules, and the full rule set written with
 build). Runs without rules use one thread only: with no rules nothing is
 masked, so the CLI ignores the option.
 
+--dump measures an existing dump instead of generated ones, such as the
+output of pg_dump or mysqldump for the generated data; --rules gives its
+full rule set and --data-rows the rows it holds.
+
 --compare-binary runs a second build of the current format in alternation
 with the first, run by run, so both see the same drift of a shared machine.
 Given a copy of the same binary, the difference between the two is the
@@ -220,9 +224,15 @@ def main():
     parser.add_argument(
         "--threads", default="1", help="comma-separated thread counts for the current build"
     )
+    parser.add_argument("--dump", help="an existing dump to measure, instead of --sizes")
+    parser.add_argument("--rules", help="--dump: the full rule set for it")
+    parser.add_argument("--data-rows", type=int, help="--dump: the rows it holds")
+    parser.add_argument("--label", default="dump", help="--dump: its name in the format column")
     parser.add_argument("--workdir", default=str(PROJECT_ROOT / "generated" / "bench"))
     parser.add_argument("--out", default="bench_results.csv")
     args = parser.parse_args()
+    if args.dump and not (args.rules and args.data_rows):
+        parser.error("--dump needs --rules and --data-rows")
 
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -236,53 +246,61 @@ def main():
     wanted = args.configs.split(",")
     thread_counts = [int(n) for n in args.threads.split(",")]
 
+    def dumps():
+        """(format, users, dump, full rules, data rows, directory for the rules)."""
+        if args.dump:
+            yield args.label, "", Path(args.dump), Path(args.rules), args.data_rows, workdir
+            return
+        for users in (int(n) for n in args.sizes.split(",")):
+            for fmt in args.formats.split(","):
+                dump, rules, data_rows = prepare_dump(workdir, users, fmt, args.seed)
+                yield fmt, users, dump, rules, data_rows, dump.parent
+
     rows_out = []
-    for rows in (int(n) for n in args.sizes.split(",")):
-        for fmt in args.formats.split(","):
-            dump, generated_rules, data_rows = prepare_dump(workdir, rows, fmt, args.seed)
-            mib = dump.stat().st_size / (1 << 20)
-            for binaries, write in groups:
-                configs = write(dump.parent, generated_rules)
-                baseline = binaries[0][0] == "baseline"
-                for name, config in configs.items():
-                    if name not in wanted:
+    for fmt, rows, dump, generated_rules, data_rows, rules_dir in dumps():
+        mib = dump.stat().st_size / (1 << 20)
+        for binaries, write in groups:
+            configs = write(rules_dir, generated_rules)
+            baseline = binaries[0][0] == "baseline"
+            for name, config in configs.items():
+                if name not in wanted:
+                    continue
+                for threads in [None] if baseline else thread_counts:
+                    # Without rules nothing is masked and --threads is ignored.
+                    if config is None and threads not in (None, 1):
                         continue
-                    for threads in [None] if baseline else thread_counts:
-                        # Without rules nothing is masked and --threads is ignored.
-                        if config is None and threads not in (None, 1):
-                            continue
-                        flags = CONFIG_FLAGS.get(name, [])
-                        for _ in range(args.warmup):
-                            for _, binary in binaries:
-                                run_once(binary, config, dump, threads, flags)
-                        measured = {label: [] for label, _ in binaries}
-                        for run in range(1, args.runs + 1):
-                            for label, binary in binaries:
-                                m = run_once(binary, config, dump, threads, flags)
-                                row = {
-                                    "binary": label,
-                                    "config": name,
-                                    "threads": threads or 1,
-                                    "users": rows,
-                                    "data_rows": data_rows,
-                                    "format": fmt,
-                                    "run": run,
-                                    "seconds": f"{m['seconds']:.4f}",
-                                    "rows_per_second": round(data_rows / m["seconds"]),
-                                    "mib_per_second": f"{mib / m['seconds']:.1f}",
-                                    "max_rss_kib": m["max_rss_kib"],
-                                    "user_seconds": f"{m['user_seconds']:.3f}",
-                                    "system_seconds": f"{m['system_seconds']:.3f}",
-                                    "reader_cpu_seconds": f"{m['reader_cpu_seconds']:.2f}",
-                                    "minor_faults": m["minor_faults"],
-                                    "major_faults": m["major_faults"],
-                                    "voluntary_switches": m["voluntary_switches"],
-                                    "involuntary_switches": m["involuntary_switches"],
-                                }
-                                rows_out.append(row)
-                                measured[label].append(row)
-                        for runs in measured.values():
-                            print_summary(runs)
+                    flags = CONFIG_FLAGS.get(name, [])
+                    for _ in range(args.warmup):
+                        for _, binary in binaries:
+                            run_once(binary, config, dump, threads, flags)
+                    measured = {label: [] for label, _ in binaries}
+                    for run in range(1, args.runs + 1):
+                        for label, binary in binaries:
+                            m = run_once(binary, config, dump, threads, flags)
+                            row = {
+                                "binary": label,
+                                "config": name,
+                                "threads": threads or 1,
+                                "users": rows,
+                                "data_rows": data_rows,
+                                "format": fmt,
+                                "run": run,
+                                "seconds": f"{m['seconds']:.4f}",
+                                "rows_per_second": round(data_rows / m["seconds"]),
+                                "mib_per_second": f"{mib / m['seconds']:.1f}",
+                                "max_rss_kib": m["max_rss_kib"],
+                                "user_seconds": f"{m['user_seconds']:.3f}",
+                                "system_seconds": f"{m['system_seconds']:.3f}",
+                                "reader_cpu_seconds": f"{m['reader_cpu_seconds']:.2f}",
+                                "minor_faults": m["minor_faults"],
+                                "major_faults": m["major_faults"],
+                                "voluntary_switches": m["voluntary_switches"],
+                                "involuntary_switches": m["involuntary_switches"],
+                            }
+                            rows_out.append(row)
+                            measured[label].append(row)
+                    for runs in measured.values():
+                        print_summary(runs)
 
     with open(args.out, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows_out[0]))
