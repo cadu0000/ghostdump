@@ -1,0 +1,12 @@
+[package]
+name = "ast-roundtrip"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Parses a dump into sqlparser ASTs and prints it back, for the benchmarks"
+
+[dependencies]
+sqlparser = "=0.64.0"
+
+# Not part of GhostDump's workspace.
+[workspace]

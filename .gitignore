@@ -21,3 +21,6 @@
 
 # Python bytecode (scripts import each other)
 __pycache__/
+
+# Build of the AST baseline of the benchmarks
+/scripts/ast_roundtrip/target/
