@@ -323,7 +323,7 @@ For reproducible experiments, the hidden `--seed <N>` option fixes every random 
 | --- | --- |
 | [docs/guarantees.md](docs/guarantees.md) | What each strategy protects, under which conditions, and the propositions behind it |
 | [docs/limitations.md](docs/limitations.md) | What GhostDump does not do, or does only under conditions, with the evidence for each |
-| [docs/experiments/utility.md](docs/experiments/utility.md) | Utility of masked dumps, on synthetic data and on UCI Adult, by ε and with dispersion: local arms, SQL and estimator analysts, central-DP comparator (`scripts/utility_eval.py`, `scripts/utility_checks.py`) |
+| [docs/experiments/utility.md](docs/experiments/utility.md) | Utility of masked dumps, on synthetic data and on UCI Adult, by ε and with dispersion: single columns, pairs of columns and a classification task; local arms, SQL and estimator analysts, central-DP comparator (`scripts/utility_eval.py`, `scripts/utility_multi.py`, `scripts/utility_checks.py`) |
 | [docs/experiments/floating-point.md](docs/experiments/floating-point.md) | Floating-point distinguishing experiment on the Laplace samplers (`examples/fp_distinguisher.rs`) |
 | [docs/experiments/client-framing.md](docs/experiments/client-framing.md) | Unusual comments, quoting, client commands and settings, checked against psql, mysql and sqlite3 (`scripts/client_framing.py`) |
 | [docs/benchmarks.md](docs/benchmarks.md) | Microbenchmarks, end-to-end throughput and memory, and parallel masking (`benches/`, `scripts/bench_grid.py`) |
