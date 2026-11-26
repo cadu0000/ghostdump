@@ -8,17 +8,17 @@
 * `scale CSV [CSV ...]`: per dump size, the median time and throughput, the
   peak memory, the page faults and context switches, and the share of the
   wall time the reading thread spends on the CPU.
-* `profile FILE`: the samples of `perf script -F pid,tid,ip,sym`, per thread
-  and per part of the program, told apart by the names of the functions
-  sampled (`CATEGORIES`). The reading thread is the one whose id is the
-  process's.
+* `profile FILE`: the samples of `perf script -F pid,tid,ip,sym`, demangled
+  with `c++filt`, per thread and per part of the program, told apart by the
+  path of the function sampled, without its generic arguments
+  (`CATEGORIES`). The reading thread is the one whose id is the process's.
 
 Examples:
 
     python3 scripts/bench_report.py pairs docs/bench-results/2026-11-aa.csv
     python3 scripts/bench_report.py scale docs/bench-results/2026-11-scale*.csv
     perf record -e cpu-clock -F 1000 -o run.data ghostdump -i dump.sql -o /dev/null -c rules.toml
-    perf script -i run.data -F pid,tid,ip,sym > run.txt
+    perf script -i run.data -F pid,tid,ip,sym | c++filt > run.txt
     python3 scripts/bench_report.py profile run.txt
 
 Only the Python standard library is used.
@@ -33,19 +33,23 @@ from collections import Counter, defaultdict
 
 BOOTSTRAP = 10_000
 
-# The first pattern found in a function's name, mangled or not, names its
-# part of the program; samples in the kernel count apart.
+# The first pattern found in the path of a function, demangled and without
+# its generic arguments, names its part of the program; samples in the
+# kernel count apart. A crate's functions are found also as the trait or
+# type of an impl (`<String as fake::Dummy<..>>::dummy_with_rng`).
+CRATE = r"(?:^|[<\s])"
 CATEGORIES = [
-    ("HMAC", r"sha2|hmac|hex|HexChars"),
-    ("statement parser", r"ghostdump::parser|9ghostdump6parser"),
-    ("row codec", r"ghostdump::codec|9ghostdump5codec"),
-    ("Laplace", r"laplace"),
-    ("random numbers", r"rand_chacha|rand_core|4rand4rngs|gen_range|3Rng"),
-    ("fake values", r"4fake|fake::"),
-    ("formatting", r"core3fmt|alloc3fmt|replace|7pattern|core::fmt|alloc::fmt"),
-    ("allocation", r"^mi_|^_mi_|rust_alloc|rust_realloc|rust_dealloc|raw_vec|rust_no_alloc"),
-    ("memcpy, memchr", r"memmove|memcpy|memchr|memset|memcmp"),
-    ("engine", r"ghostdump::engine|9ghostdump6engine|9ghostdump2io"),
+    ("HMAC", CRATE + r"(?:sha2|hmac|hex|digest)::|ghostdump::engine::mask::(?:HmacKey|hmac_hash)"),
+    ("parser", r"ghostdump::parser::"),
+    ("row codec", r"ghostdump::codec::"),
+    ("Laplace", r"ghostdump::engine::laplace::"),
+    ("fake values", CRATE + r"(?:fake|cpf_cnpj|uuid)::"),
+    ("random numbers", CRATE + r"(?:rand|rand_core|rand_chacha)::"),
+    ("text and numbers", CRATE + r"(?:core|alloc)::fmt::|_fmt_inner|core::num::|f64 as core::str|"
+     r">::replace$|>::to_lowercase$|core::str::pattern::"),
+    ("allocation", r"^_?mi_|__rust_(?:alloc|realloc|dealloc|no_alloc)|alloc::raw_vec::"),
+    ("memcpy, memchr", r"^__mem|^mem|memchr::"),
+    ("engine, I/O", r"ghostdump::|std::io::"),
 ]
 
 
@@ -148,11 +152,28 @@ def scale(args):
         )
 
 
+def function_path(symbol):
+    """`symbol` without crate hashes and without generic arguments (`::<..>`)."""
+    symbol = re.sub(r"\[[0-9a-f]{16}\]", "", symbol)
+    path, i = [], 0
+    while i < len(symbol):
+        if symbol.startswith("::<", i):
+            depth, i = 1, i + 3
+            while i < len(symbol) and depth:
+                depth += {"<": 1, ">": -1}.get(symbol[i], 0)
+                i += 1
+            continue
+        path.append(symbol[i])
+        i += 1
+    return "".join(path)
+
+
 def category(symbol, address):
     if address.startswith("ffffffff"):
         return "kernel"
+    path = function_path(symbol)
     for name, pattern in CATEGORIES:
-        if re.search(pattern, symbol):
+        if re.search(pattern, path):
             return name
     return "other"
 
