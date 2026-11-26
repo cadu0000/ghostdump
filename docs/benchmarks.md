@@ -4,7 +4,7 @@ Two kinds of measurement:
 
 * **Microbenchmarks** (`benches/microbench.rs`, Criterion): throughput of the parser and of the whole engine on in-memory dumps, and the cost per value of each masker.
 * **End-to-end runs** of the CLI over generated dumps (throughput and peak memory).
-* **Controlled runs** of stage 2.8: the noise of the machine, instructions per row, profiles per thread, dumps up to 10^7 rows, real dumps, and a parser that builds an AST.
+* **Controlled runs** of stage 2.8: the noise of the machine, instructions per row, profiles per thread, dumps up to 10^8 rows, real dumps, and a parser that builds an AST.
 
 ---
 
@@ -112,7 +112,7 @@ Findings:
 * **The exact sampler costs about 5% end to end** (5.2% on COPY, 4.7% on INSERT) against the `f64` one, with one `dp_laplace` column; the cost of exact sampling is small next to the rest of the pipeline.
 * The first paper reported about 307,000 rows/s and 4.7 MB with its rules on another machine; the numbers here are not directly comparable to it, only to each other.
 
-Larger sizes run with the same command; [size of the dump](#size-of-the-dump) measures up to 10^7 rows.
+Larger sizes run with the same command; [size of the dump](#size-of-the-dump) measures up to 10^8 rows.
 
 ---
 
@@ -351,12 +351,14 @@ This is one parser, not every AST-based tool; the sizes depend on how a parser r
 
 ### Size of the dump
 
-Generated dumps of 300,000 and 10,000,002 rows (100,000 and 3,333,334 users), 5 runs each after one warm-up, with the 3,000,000 rows of the A/A runs:
+Generated dumps of 300,000 and 10,000,002 rows (100,000 and 3,333,334 users), 5 runs each after one warm-up, and of 100,000,002 rows (33,333,334 users), 3 runs without warm-up, with the 3,000,000 rows of the A/A runs. A dump of 10^8 rows takes about 7.3 GiB as COPY and 8.7 GiB as INSERT, so each format was generated, measured and deleted in turn:
 
 ```bash
 python3 scripts/bench_grid.py --sizes 100000,3333334 --configs no_rules,full --threads 1,3 --runs 5 \
     --out scale.csv
-python3 scripts/bench_report.py scale scale.csv aa.csv
+python3 scripts/bench_grid.py --sizes 33333334 --formats copy --configs no_rules,full --threads 1,3 \
+    --runs 3 --warmup 0 --out scale-copy.csv    # then --formats insert
+python3 scripts/bench_report.py scale scale.csv scale-copy.csv scale-insert.csv aa.csv
 ```
 
 "Reading thread on CPU" is the CPU time of the reading thread over the wall time. Raw runs in [bench-results/2026-11-scale.csv](bench-results/2026-11-scale.csv).
@@ -366,26 +368,33 @@ python3 scripts/bench_report.py scale scale.csv aa.csv
 | COPY | `full` | 1 | 300,000 | 5 | 0.44 | 0.08 | 681,508 | 4.7–4.7 | 271 | 0 | 2 | 97% |
 | COPY | `full` | 1 | 3,000,000 | 20 | 4.94 | 0.32 | 607,115 | 4.7–4.7 | 276 | 0 | 11 | 99% |
 | COPY | `full` | 1 | 10,000,002 | 5 | 16.25 | 0.07 | 615,502 | 4.6–4.7 | 275 | 0 | 29 | 99% |
+| COPY | `full` | 1 | 100,000,002 | 3 | 163.32 | 5.91 | 612,312 | 4.7–4.7 | 276 | 0 | 207 | 99% |
 | COPY | `full` | 3 | 300,000 | 5 | 0.16 | 0.05 | 1,833,741 | 8.8–9.5 | 1,471 | 0 | 427 | 92% |
 | COPY | `full` | 3 | 3,000,000 | 20 | 1.67 | 0.17 | 1,797,322 | 9.3–10.0 | 1,536 | 0 | 3,424 | 98% |
 | COPY | `full` | 3 | 10,000,002 | 5 | 5.82 | 0.49 | 1,717,771 | 9.3–9.6 | 1,522 | 0 | 11,831 | 98% |
+| COPY | `full` | 3 | 100,000,002 | 3 | 54.66 | 1.97 | 1,829,612 | 9.3–9.4 | 1,583 | 0 | 119,725 | 99% |
 | COPY | `no_rules` | 1 | 300,000 | 5 | 0.16 | 0.03 | 1,897,533 | 4.6–4.7 | 264 | 0 | 1 | 96% |
 | COPY | `no_rules` | 1 | 3,000,000 | 20 | 1.58 | 0.16 | 1,901,080 | 4.5–4.7 | 265 | 0 | 4 | 99% |
 | COPY | `no_rules` | 1 | 10,000,002 | 5 | 5.12 | 0.56 | 1,951,334 | 4.5–4.7 | 267 | 0 | 11 | 99% |
+| COPY | `no_rules` | 1 | 100,000,002 | 3 | 52.97 | 1.78 | 1,887,861 | 4.5–4.7 | 267 | 2 | 58 | 100% |
 | INSERT | `full` | 1 | 300,000 | 5 | 0.69 | 0.06 | 436,618 | 4.6–4.7 | 271 | 0 | 3 | 98% |
 | INSERT | `full` | 1 | 3,000,000 | 20 | 6.90 | 0.43 | 434,997 | 4.7–4.7 | 275 | 0 | 14 | 99% |
 | INSERT | `full` | 1 | 10,000,002 | 5 | 22.91 | 1.31 | 436,415 | 4.7–4.7 | 276 | 0 | 36 | 99% |
+| INSERT | `full` | 1 | 100,000,002 | 3 | 228.91 | 8.28 | 436,847 | 4.7–4.7 | 276 | 0 | 316 | 99% |
 | INSERT | `full` | 3 | 300,000 | 5 | 0.27 | 0.02 | 1,128,668 | 8.6–9.7 | 1,524 | 0 | 592 | 95% |
 | INSERT | `full` | 3 | 3,000,000 | 20 | 2.84 | 0.22 | 1,056,673 | 9.2–10.8 | 1,830 | 0 | 5,072 | 98% |
 | INSERT | `full` | 3 | 10,000,002 | 5 | 9.93 | 0.85 | 1,006,857 | 9.4–10.0 | 1,699 | 0 | 17,244 | 98% |
+| INSERT | `full` | 3 | 100,000,002 | 3 | 97.34 | 2.99 | 1,027,335 | 8.9–10.7 | 1,840 | 0 | 164,607 | 99% |
 | INSERT | `no_rules` | 1 | 300,000 | 5 | 0.26 | 0.04 | 1,141,118 | 4.5–4.6 | 264 | 0 | 2 | 95% |
 | INSERT | `no_rules` | 1 | 3,000,000 | 20 | 2.66 | 0.16 | 1,127,184 | 4.5–4.7 | 266 | 0 | 6 | 99% |
 | INSERT | `no_rules` | 1 | 10,000,002 | 5 | 8.89 | 0.54 | 1,124,404 | 4.6–4.7 | 267 | 0 | 15 | 99% |
+| INSERT | `no_rules` | 1 | 100,000,002 | 3 | 89.84 | 1.18 | 1,113,043 | 4.6–4.6 | 267 | 0 | 107 | 99% |
 
-* **Memory does not grow with the dump.** With one thread the peak is 4.5–4.7 MiB at every size, with three 8.6–10.8 MiB, and the minor page faults of a run are the same, 264–276 with one thread, for 300,000 rows as for 10^7: the process touches the same pages whatever the size. There are no major page faults, and the machine has no swap.
-* **Throughput does not fall with the size**: with every rule and one thread, 607,000–682,000 rows per second on COPY and 435,000–437,000 on INSERT.
-* **With three threads the reading thread is on the CPU 98% of the time** from 3,000,000 rows on (92–95% at 300,000 rows, in runs of 0.16–0.27 s): it bounds the run.
+* **Memory does not grow with the dump.** With one thread the peak is 4.5–4.7 MiB at every size, with three 8.6–10.8 MiB, and the minor page faults of a run are the same, 264–276 with one thread, for 300,000 rows as for 10^8: the process touches the same pages whatever the size. One run had major page faults, 2, the first of 10^8 rows without rules, which had no warm-up; the machine has no swap.
+* **Throughput does not fall with the size**: with every rule and one thread, 607,000–682,000 rows per second on COPY and 435,000–437,000 on INSERT, from 300,000 rows to 10^8. 10^8 rows take 163 s on COPY and 229 s on INSERT with one thread, 55 s and 97 s with three.
+* **With three threads the reading thread is on the CPU 98–99% of the time** from 3,000,000 rows on (92–95% at 300,000 rows, in runs of 0.16–0.27 s): it bounds the run.
 * The earlier tables of this document, measured on earlier builds, peaked at 5.7–6.9 MiB with one thread. Many changes came between those builds and this one, and the difference was not traced to one of them.
+* The first paper's Table 2 reported 10^8 records in 325.03 s, 307,661 rows per second, with a peak of 4.67 MB, 13 page faults and no swapping, on an Apple M2 and a build that read COPY only in part. The machines, dumps and measuring tools differ, so the times do not compare; the peak memory, flat in the size of the dump, does.
 
 ### Decision on the chunked parser
 
