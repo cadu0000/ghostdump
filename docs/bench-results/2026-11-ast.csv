@@ -1,0 +1,13 @@
+dump,dialect,mode,data_rows,bytes,seconds,max_rss_kib,exit,parser
+insert,postgres,statement,300000,27516057,2.01,60376,0,"32 statements, 0 rejected by the parser"
+insert,postgres,whole,300000,27516057,1.79,653732,0,"32 statements, 0 rejected by the parser"
+copy,postgres,statement,300000,23000163,0.15,66112,0,"4 statements, 0 rejected by the parser"
+copy,postgres,whole,300000,23000163,0.15,75932,0,"4 statements, 0 rejected by the parser"
+insert,postgres,statement,3000000,277136162,16.97,60452,0,"302 statements, 0 rejected by the parser"
+insert,postgres,whole,3000000,277136162,19.50,6274032,0,"302 statements, 0 rejected by the parser"
+copy,postgres,statement,3000000,231975960,1.52,460804,0,"4 statements, 0 rejected by the parser"
+copy,postgres,whole,3000000,231975960,1.75,572844,0,"4 statements, 0 rejected by the parser"
+pg_dump,postgres,statement,3000000,231977211,1.66,461656,0,"19 statements, 2 rejected by the parser"
+pg_dump,postgres,whole,3000000,231977211,1.60,571580,0,"19 statements, 2 rejected by the parser"
+mysqldump,mysql,statement,3000000,262125417,16.21,57480,0,"291 statements, 4 rejected by the parser"
+mysqldump,mysql,whole,3000000,262125417,18.59,6264476,0,"291 statements, 4 rejected by the parser"

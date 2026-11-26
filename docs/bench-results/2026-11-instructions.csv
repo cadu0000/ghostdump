@@ -1,0 +1,13 @@
+build,commit,format,config,data_rows,instructions,instructions_per_row
+first_paper,3849e9e,copy,no_rules,300000,4111607871,13705
+first_paper,3849e9e,copy,full,300000,15155141672,50517
+first_paper,3849e9e,insert,no_rules,300000,7803043337,26010
+first_paper,3849e9e,insert,full,300000,19129040803,63763
+before_hmac_change,a22cc90,copy,no_rules,300000,2205477853,7352
+before_hmac_change,a22cc90,copy,full,300000,14360928404,47870
+before_hmac_change,a22cc90,insert,no_rules,300000,3488994919,11630
+before_hmac_change,a22cc90,insert,full,300000,16842513859,56142
+stage_2.8,41fd2a1,copy,no_rules,300000,2205467706,7352
+stage_2.8,41fd2a1,copy,full,300000,9155788699,30519
+stage_2.8,41fd2a1,insert,no_rules,300000,3488981503,11630
+stage_2.8,41fd2a1,insert,full,300000,11637594095,38792
