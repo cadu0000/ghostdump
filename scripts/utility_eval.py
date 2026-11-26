@@ -651,20 +651,27 @@ ADULT_COLUMNS = list(ADULT_NUMERIC) + list(ADULT_CATEGORICAL)
 
 
 def load_adult(directory):
-    """The records of adult.data and adult.test; stops when a file is not
-    the published one."""
-    records = []
+    """The records of adult.data and then adult.test."""
+    parts = load_adult_files(directory)
+    return parts["adult.data"] + parts["adult.test"]
+
+
+def load_adult_files(directory):
+    """The records of each file, by name; stops when a file is not the
+    published one."""
+    parts = {}
     for name, digest in ADULT_SHA256.items():
         path = Path(directory) / name
         data = path.read_bytes()
         if hashlib.sha256(data).hexdigest() != digest:
             sys.exit(f"{path}: SHA-256 differs from the published file")
+        records = parts[name] = []
         for line in data.decode("ascii").splitlines():
             fields = [field.strip() for field in line.split(",")]
             # Skips the blank last lines and the first line of adult.test.
             if len(fields) == len(ADULT_FIELDS):
                 records.append(dict(zip(ADULT_FIELDS, fields)))
-    return records
+    return parts
 
 
 def write_adult_dump(path, records):
@@ -836,19 +843,22 @@ def print_summary(rows):
             cells = [column, str(n), f"{eps:g}", arm, analyst]
             for q in queries:
                 errors = by_query.get(q, [])
-                if q != "mean":
+                signed = q == "mean" or q in DIFFERENCES
+                if not signed:
                     errors = [abs(e) for e in errors]
-                cells.append(dispersion(errors, signed=q == "mean"))
+                cells.append(dispersion(errors, signed=signed))
             print("| " + " | ".join(cells) + " |")
 
 
 ARM_ORDER = [
-    "a_priori", "dp_bounds", "oracle", "central_a_priori", "central_oracle",
+    "local", "a_priori", "dp_bounds", "oracle", "central_a_priori", "central_oracle",
     "random_choice", "randomized_response", "central",
 ]
 ANALYST_NAMES = {"naive": "SQL", "estimator": "estimator", "central": "central DP"}
 # Queries whose error is a distance, not a relative error.
-DISTANCES = {"histogram_tv", "tv", "max_share"}
+DISTANCES = {"histogram_tv", "tv", "max_share", "joint_tv"}
+# Queries whose error is a signed difference of two values, not relative.
+DIFFERENCES = {"cramers_v", "correlation", "accuracy", "auc"}
 
 
 def print_query(rows, query, column, n, epsilon):
@@ -881,11 +891,13 @@ def print_query(rows, query, column, n, epsilon):
             if not errors:
                 out.append("n/a")
                 continue
-            signed = query == "mean"
+            signed = query == "mean" or query in DIFFERENCES
             values = errors if signed else [abs(e) for e in errors]
             mean = statistics.fmean(values)
             sd = statistics.stdev(values) if len(values) > 1 else 0.0
-            if query in DISTANCES:
+            if query in DIFFERENCES:
+                out.append(f"{mean:+.4f} ± {sd:.4f}")
+            elif query in DISTANCES:
                 out.append(f"{mean:.4f} ± {sd:.4f}")
             elif signed:
                 out.append(f"{100 * mean:+.1f}% ± {100 * sd:.1f}%")
