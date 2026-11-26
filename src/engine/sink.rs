@@ -21,7 +21,7 @@ use rand::{Rng, SeedableRng};
 
 use crate::codec::{self, FieldMasker, SqlValue};
 use crate::engine::config::{CompiledColumn, NullPolicy};
-use crate::engine::mask::MaskStats;
+use crate::engine::mask::{HmacKey, MaskStats};
 use crate::parser::state::{InsertFormat, SqlDialect};
 
 /// A segment closes once it holds this many masked rows...
@@ -436,7 +436,7 @@ fn workers_gone() -> io::Error {
 #[derive(Debug, Clone, Copy)]
 pub struct RowContext<'s> {
     pub dialect: SqlDialect,
-    pub secret: &'s str,
+    pub key: &'s HmacKey,
 }
 
 impl RowContext<'_> {
@@ -453,7 +453,7 @@ impl RowContext<'_> {
         let mut masker = RowMasker {
             columns: plan,
             rng,
-            secret: self.secret,
+            key: self.key,
             stats,
         };
         codec::rewrite_row(row, format, self.dialect, &mut masker, out)
@@ -463,7 +463,7 @@ impl RowContext<'_> {
 struct RowMasker<'a, R> {
     columns: &'a [Option<&'a CompiledColumn>],
     rng: &'a mut R,
-    secret: &'a str,
+    key: &'a HmacKey,
     stats: &'a mut MaskStats,
 }
 
@@ -480,9 +480,7 @@ impl<R: Rng> FieldMasker for RowMasker<'_, R> {
         if value.is_null() && config.null_policy == NullPolicy::Keep {
             return SqlValue::Null;
         }
-        config
-            .masker
-            .apply(value, self.rng, self.secret, self.stats)
+        config.masker.apply(value, self.rng, self.key, self.stats)
     }
 }
 

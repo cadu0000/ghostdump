@@ -21,7 +21,7 @@ use std::thread;
 
 use crate::engine::columns::{ColumnOrders, Columns};
 use crate::engine::config::{CompiledColumn, CompiledConfig};
-use crate::engine::mask::MaskStats;
+use crate::engine::mask::{HmacKey, MaskStats};
 use crate::engine::settings::{SavedSettings, check_settings};
 use crate::engine::sink::{MaskingPlan, ParallelSink, RowContext, SequentialSink, Sink};
 use crate::parser::state::{InsertFormat, SqlDialect};
@@ -127,7 +127,7 @@ type KeyedPlan<'a> = (&'a str, MaskingPlan<'a>);
 /// Masks dumps with a set of compiled rules.
 pub struct AnonymizerEngine {
     config: CompiledConfig,
-    secret: String,
+    key: HmacKey,
 }
 
 impl AnonymizerEngine {
@@ -142,7 +142,10 @@ impl AnonymizerEngine {
                 );
             }
         }
-        Self { config, secret }
+        Self {
+            config,
+            key: HmacKey::new(&secret),
+        }
     }
 
     /// The columns of a data block that have rules, or `None` when no
@@ -267,7 +270,7 @@ impl AnonymizerEngine {
         };
         let context = RowContext {
             dialect: options.dialect,
-            secret: &self.secret,
+            key: &self.key,
         };
         // Without rules nothing is masked, so threads would only copy bytes.
         if options.threads <= 1 || self.config.tables.is_empty() {

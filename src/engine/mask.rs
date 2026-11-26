@@ -10,6 +10,7 @@ use rand::distributions::Alphanumeric;
 use rand::seq::SliceRandom;
 use sha2::Sha256;
 use std::collections::BTreeMap;
+use std::fmt;
 use uuid::Builder;
 
 use crate::codec::SqlValue;
@@ -132,7 +133,7 @@ impl Masker {
         &self,
         value: SqlValue,
         rng: &mut impl Rng,
-        secret: &str,
+        key: &HmacKey,
         stats: &mut MaskStats,
     ) -> SqlValue {
         match self {
@@ -140,10 +141,10 @@ impl Masker {
             Masker::Nullify => SqlValue::Null,
             // A pseudonym of NULL would link every NULL to each other.
             Masker::Hmac => match value.as_bytes() {
-                Some(bytes) => SqlValue::Text(hmac_hash(bytes, secret).into_bytes()),
+                Some(bytes) => SqlValue::Text(key.pseudonym(bytes)),
                 None => SqlValue::Null,
             },
-            Masker::Laplace(mechanism) => mechanism.apply(value, rng, secret, stats),
+            Masker::Laplace(mechanism) => mechanism.apply(value, rng, key, stats),
             Masker::RandomizedResponse(rr) => rr.apply(value, rng, stats),
         }
     }
@@ -312,13 +313,46 @@ fn to_text(digits: &[u32]) -> String {
         .collect()
 }
 
+/// The secret as an HMAC-SHA256 key, derived once per run: keying hashes
+/// two blocks, as many as hashing a short value does.
+#[derive(Clone)]
+pub struct HmacKey(HmacSha256);
+
+impl HmacKey {
+    /// The key for `secret`.
+    pub fn new(secret: &str) -> Self {
+        Self(
+            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length"),
+        )
+    }
+
+    /// A MAC under this key, with nothing hashed yet.
+    pub(crate) fn mac(&self) -> HmacSha256 {
+        self.0.clone()
+    }
+
+    /// HMAC-SHA256 of `value`, in lower-case hex.
+    fn pseudonym(&self, value: &[u8]) -> Vec<u8> {
+        let mut mac = self.mac();
+        mac.update(value);
+        let mut digits = vec![0; 64];
+        hex::encode_to_slice(mac.finalize().into_bytes(), &mut digits)
+            .expect("32 bytes take 64 hex digits");
+        digits
+    }
+}
+
+/// Never shows the key.
+impl fmt::Debug for HmacKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HmacKey(..)")
+    }
+}
+
 /// HMAC-SHA256 of the bytes of a value, in hex. The bytes are hashed as the
 /// dump has them, so values that differ in any byte get different pseudonyms.
 pub fn hmac_hash(value: &[u8], secret: &str) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
-    mac.update(value);
-    hex::encode(mac.finalize().into_bytes())
+    String::from_utf8(HmacKey::new(secret).pseudonym(value)).expect("hex digits are ASCII")
 }
 
 #[cfg(test)]
@@ -392,10 +426,25 @@ mod tests {
     }
 
     #[test]
+    fn test_hmac_matches_rfc_4231() {
+        // Test case 2 of RFC 4231, the one with a key shorter than a block.
+        let expected = "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
+        assert_eq!(hmac_hash(b"what do ya want for nothing?", "Jefe"), expected);
+        // A key used for many values gives each the same pseudonym as a new key.
+        let key = HmacKey::new("Jefe");
+        key.pseudonym(b"another value");
+        assert_eq!(
+            key.pseudonym(b"what do ya want for nothing?"),
+            expected.as_bytes()
+        );
+    }
+
+    #[test]
     fn test_hmac_hashes_the_bytes_of_the_value() {
+        let key = HmacKey::new("k");
         let pseudonym = |bytes: &[u8]| {
             let mut stats = MaskStats::default();
-            Masker::Hmac.apply(SqlValue::Text(bytes.to_vec()), &mut rng(), "k", &mut stats)
+            Masker::Hmac.apply(SqlValue::Text(bytes.to_vec()), &mut rng(), &key, &mut stats)
         };
         // Latin-1 values that differ in one byte outside ASCII, and binary
         // values, keep different pseudonyms.

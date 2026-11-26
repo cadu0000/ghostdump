@@ -22,7 +22,7 @@ use rand::rngs::StdRng;
 
 use ghostdump::codec::SqlValue;
 use ghostdump::engine::laplace::{LaplaceMechanism, laplace_noise};
-use ghostdump::engine::mask::{MaskStats, Masker};
+use ghostdump::engine::mask::{HmacKey, MaskStats, Masker};
 
 const SAMPLES: usize = 200_000;
 const EPSILON: f64 = 1.0;
@@ -107,6 +107,7 @@ fn run(arm: &Arm, x0: f64, x1: f64, seed: u64) -> Outcome {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut guesser = StdRng::seed_from_u64(seed ^ 0x5eed);
     let mut stats = MaskStats::default();
+    let key = HmacKey::new("");
     let (mut lr_ok, mut reach_ok, mut decisive) = (0usize, 0usize, 0usize);
 
     for i in 0..SAMPLES {
@@ -116,7 +117,7 @@ fn run(arm: &Arm, x0: f64, x1: f64, seed: u64) -> Outcome {
             None => input + laplace_noise(b, &mut rng),
             Some(m) => {
                 let text = format!("{input:.2}");
-                let out = m.apply(SqlValue::Raw(text.into_bytes()), &mut rng, "", &mut stats);
+                let out = m.apply(SqlValue::Raw(text.into_bytes()), &mut rng, &key, &mut stats);
                 out.as_str().unwrap().parse::<f64>().unwrap()
             }
         };

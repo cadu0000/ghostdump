@@ -73,7 +73,7 @@ Goal: measure what the tool delivers and improve where the evidence points. Item
 | 2.5 Estimator shipped with the tool | A subcommand `estimate` that reads a masked dump and its rules and returns corrected histograms and shares, in one pass and constant memory. The EM of the evaluation overfits on Adult (stage 2.1): it needs a stopping rule or a regularization chosen without the truth. | medium |
 | 2.6 Checking properties | Statistical tests of ε for `randomized_response` and consistent noise; a property test for the composition in the privacy summary. Formal verification of the sampler is out for now. | high |
 | 2.7 Empirical risk | A linkage or inference experiment on a masked dump. *Evaluate* the scope. | medium |
-| 2.8 Controlled benchmarks | A dedicated machine or declared noise, 10^7 rows, CPU profiles; decide the chunked parser with this data. | medium |
+| 2.8 Controlled benchmarks | **done** in November 2026 ([benchmarks](benchmarks.md#controlled-runs-stage-28)): no dedicated machine, so its noise is measured (two copies of one binary, 20 runs each in alternation, differ by up to 4%) and builds are compared run by run; instructions per row counted with callgrind against the first paper's build; perf profiles per thread; dumps from 300,000 to 10^8 rows, and pg_dump's and mysqldump's output of the same data; a parser that builds an AST (sqlparser) for comparison. The profiles found `hmac` deriving its key for every value, now fixed. The parser bounds runs with threads; the chunked parser stays in V3. Not done: the comparison with myanon, whose build was not run. | medium |
 | 2.9 Guarantee per person | A two-pass helper that reports the largest number of rows per key. *Evaluate*: it is outside the single pass. | low |
 
 V2 is complete when every claim in `docs/guarantees.md` and `docs/experiments/` can be reproduced by a documented command, with dispersion, and every recommendation of the reviews has a recorded outcome.
@@ -81,6 +81,8 @@ V2 is complete when every claim in `docs/guarantees.md` and `docs/experiments/` 
 Found in November 2026, in stage 2.1. The deconvolution estimator of the evaluation counted the noisy values in cells 0.92 units wide and grouped the true values in bins 2 units wide, both off the grid of whole numbers that Adult's columns and their noise lie on; cells between two whole numbers stayed empty where the model expected mass. Its errors on `age` then rose with ε, up to 235% on the range around the median at ε = 5 with the true bounds (harness at commit `a16ec9f`). It now follows the grid of whole-number columns; on synthetic data it computes as before, and a small run gave the same rows. With that fixed, EM still overfits on Adult: run to its stopping rule, its estimate of `age` is worse than after 300 to 1,000 iterations, so its errors stop falling from ε = 0.5 on. The rule is kept, and the question passes to stage 2.5.
 
 Found in November 2026, in stage 2.2: the tables of the harness left out the repetitions whose error is undefined without saying so. The corrected correlation is undefined when a column's observed variance minus the noise's is not positive, which happened in 9, 7 and 5 of 10 repetitions at ε = 0.1, 0.5 and 1; the cell showed the mean of the others. A cell now says how many repetitions it holds, and the tables of stage 2.1, built again, are unchanged.
+
+Found in November 2026, in stage 2.8: `hmac` derived its key from the secret for every value, two of the four SHA-256 compressions of a short value, and turned the digest into hex one character at a time; together, a third of a run with every rule on one thread. The key is now derived once per run and the hex written from a table: the output is the same byte for byte, a value costs 168 ns instead of 437, and a run with every rule on one thread takes 25% less time on COPY and 14% less on INSERT.
 
 ## V3: exploration
 
@@ -91,7 +93,8 @@ No closed scope. Candidate directions, each with the evidence that would justify
 | Joint randomized response over declared groups of columns | stage 2.2 shows a relevant loss of dependence between columns |
 | Local mechanisms for numbers other than Laplace | stage 2.1 shows the numeric error rules out important uses |
 | Shuffling in a window | the analysis in [future work](future-work.md) shows a gain for feasible windows |
-| Chunked parser and parallel reading | stage 2.8 confirms the parser as the bottleneck on real loads |
+| Chunked parser and parallel reading | stage 2.8 confirmed the parser as the bottleneck with threads, on pg_dump's and mysqldump's output too, but on 4 vCPUs parallel reading can gain at most 17–31%: measure it on a machine with more cores |
+| A sequential parser that copies runs of bytes that change no state at once | it lowers the instructions per row of stage 2.8 without changing any output |
 | Other input formats and use as a library | there is demand |
 | A simple graphical interface for building rules | `init` and `check` are not enough |
 | An empirical study of local DP on real tabular data | stages 2.1 and 2.2 give solid results |
