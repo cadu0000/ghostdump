@@ -59,3 +59,5 @@ jobs:
         run: cargo audit
       - name: Audit the dependencies of the fuzz targets
         run: cargo audit --file fuzz/Cargo.lock
+      - name: Audit the dependencies of the AST baseline of the benchmarks
+        run: cargo audit --file scripts/ast_roundtrip/Cargo.lock
