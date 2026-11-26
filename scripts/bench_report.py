@@ -9,9 +9,10 @@
   peak memory, the page faults and context switches, and the share of the
   wall time the reading thread spends on the CPU.
 * `profile FILE`: the samples of `perf script -F pid,tid,ip,sym`, demangled
-  with `c++filt`, per thread and per part of the program, told apart by the
-  path of the function sampled, without its generic arguments
-  (`CATEGORIES`). The reading thread is the one whose id is the process's.
+  with `c++filt`, for the reading thread and for the masking threads
+  together, per part of the program, told apart by the path of the
+  function sampled, without its generic arguments (`CATEGORIES`). The
+  reading thread is the one whose id is the process's.
 
 Examples:
 
@@ -180,6 +181,7 @@ def category(symbol, address):
 
 def profile(args):
     counts = defaultdict(Counter)
+    threads = set()
     with open(args.samples) as f:
         for line in f:
             # "pid/tid address symbol", where the symbol may be missing.
@@ -189,20 +191,19 @@ def profile(args):
             pid, tid = fields[0].split("/")
             address = fields[1]
             symbol = fields[2].strip() if len(fields) > 2 else ""
-            thread = "reading" if pid == tid else f"masking ({tid})"
-            counts[thread][category(symbol, address)] += 1
+            counts["reading" if pid == tid else "masking"][category(symbol, address)] += 1
+            threads.add(tid)
     names = [name for name, _ in CATEGORIES] + ["kernel", "other"]
-    print("| Thread | Samples | " + " | ".join(names) + " |")
+    print("| Threads | Samples | " + " | ".join(names) + " |")
     print("|---|---|" + "---|" * len(names))
-    threads = sorted(counts, key=lambda t: (t != "reading", t))
-    if len(threads) > 1:
-        threads.append("all")
-        counts["all"] = sum((counts[t] for t in threads[:-1]), Counter())
-    for thread in threads:
-        c = counts[thread]
+    rows = [("reading", counts["reading"])]
+    if "masking" in counts:
+        rows.append((f"masking ({len(threads) - 1})", counts["masking"]))
+        rows.append(("all", counts["reading"] + counts["masking"]))
+    for label, c in rows:
         total = sum(c.values())
         cells = " | ".join(f"{c[name] / total:.0%}" for name in names)
-        print(f"| {thread} | {total:,} | {cells} |")
+        print(f"| {label} | {total:,} | {cells} |")
 
 
 def main():
