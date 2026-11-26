@@ -8,12 +8,16 @@
 * `em-iterations`: on one masked run of Adult's `age` (a priori bounds),
   the histogram distance of the EM estimate after a fixed number of
   iterations, from 20 to 5,000.
+* `noise-variance`: the variance of the noise GhostDump adds to Adult's
+  whole-number columns, against the variance of the discrete Laplace
+  distribution that `utility_multi.py` subtracts to correct a correlation.
 
 Examples:
 
     python3 scripts/utility_checks.py rr-variance --adult-dir adult/ \\
         --csv docs/bench-results/2026-11-adult.csv
     python3 scripts/utility_checks.py em-iterations --adult-dir adult/
+    python3 scripts/utility_checks.py noise-variance --adult-dir adult/
 
 Only the Python standard library is used.
 """
@@ -98,22 +102,45 @@ def em_iterations(args):
             print(f"| {epsilon:g} | " + " | ".join(cells) + " |")
 
 
+def noise_variance(args):
+    """A row per ε and column: the sample variance of masked minus true
+    values over the 48,842 records, and the variance of the distribution."""
+    import utility_multi as m
+
+    train, test = m.load(args.adult_dir)
+    records = train + test
+    print("| ε | Column | Observed | Discrete Laplace |")
+    print("|---|---|---|---|")
+    with tempfile.TemporaryDirectory() as tmp:
+        workdir = Path(tmp)
+        dump = workdir / "adult.sql"
+        m.write_dump(dump, records)
+        for epsilon in (0.1, 1.0, 10.0):
+            masked = m.masked_records(args.binary, dump, epsilon, args.seed, workdir)
+            for column in m.NUMERIC:
+                noise = [float(a[column]) - float(b[column]) for a, b in zip(masked, records)]
+                expected = m.noise_variance(epsilon, u.ADULT_NUMERIC[column])
+                print(f"| {epsilon:g} | `{column}` | {statistics.variance(noise):,.1f} | {expected:,.1f} |")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("check", choices=["rr-variance", "em-iterations"])
+    parser.add_argument("check", choices=["rr-variance", "em-iterations", "noise-variance"])
     parser.add_argument("--adult-dir", required=True, help="directory with adult.data and adult.test")
     parser.add_argument("--csv", help="rr-variance: the CSV of a run of `utility_eval.py --task adult`")
     parser.add_argument(
         "--binary", default=str(u.PROJECT_ROOT / "target" / "release" / "ghostdump")
     )
-    parser.add_argument("--seed", type=int, default=1, help="em-iterations: the seed of the masked run")
+    parser.add_argument("--seed", type=int, default=1, help="the seed of the masked run")
     args = parser.parse_args()
     if args.check == "rr-variance":
         if not args.csv:
             parser.error("rr-variance needs --csv")
         rr_variance(args)
-    else:
+    elif args.check == "em-iterations":
         em_iterations(args)
+    else:
+        noise_variance(args)
 
 
 if __name__ == "__main__":

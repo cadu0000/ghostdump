@@ -651,20 +651,27 @@ ADULT_COLUMNS = list(ADULT_NUMERIC) + list(ADULT_CATEGORICAL)
 
 
 def load_adult(directory):
-    """The records of adult.data and adult.test; stops when a file is not
-    the published one."""
-    records = []
+    """The records of adult.data and then adult.test."""
+    parts = load_adult_files(directory)
+    return parts["adult.data"] + parts["adult.test"]
+
+
+def load_adult_files(directory):
+    """The records of each file, by name; stops when a file is not the
+    published one."""
+    parts = {}
     for name, digest in ADULT_SHA256.items():
         path = Path(directory) / name
         data = path.read_bytes()
         if hashlib.sha256(data).hexdigest() != digest:
             sys.exit(f"{path}: SHA-256 differs from the published file")
+        records = parts[name] = []
         for line in data.decode("ascii").splitlines():
             fields = [field.strip() for field in line.split(",")]
             # Skips the blank last lines and the first line of adult.test.
             if len(fields) == len(ADULT_FIELDS):
                 records.append(dict(zip(ADULT_FIELDS, fields)))
-    return records
+    return parts
 
 
 def write_adult_dump(path, records):
@@ -836,26 +843,31 @@ def print_summary(rows):
             cells = [column, str(n), f"{eps:g}", arm, analyst]
             for q in queries:
                 errors = by_query.get(q, [])
-                if q != "mean":
+                signed = q == "mean" or q in DIFFERENCES
+                if not signed:
                     errors = [abs(e) for e in errors]
-                cells.append(dispersion(errors, signed=q == "mean"))
+                cells.append(dispersion(errors, signed=signed))
             print("| " + " | ".join(cells) + " |")
 
 
 ARM_ORDER = [
-    "a_priori", "dp_bounds", "oracle", "central_a_priori", "central_oracle",
+    "local", "a_priori", "dp_bounds", "oracle", "central_a_priori", "central_oracle",
     "random_choice", "randomized_response", "central",
 ]
 ANALYST_NAMES = {"naive": "SQL", "estimator": "estimator", "central": "central DP"}
 # Queries whose error is a distance, not a relative error.
-DISTANCES = {"histogram_tv", "tv", "max_share"}
+DISTANCES = {"histogram_tv", "tv", "max_share", "joint_tv"}
+# Queries whose error is a signed difference of two values, not relative.
+DIFFERENCES = {"cramers_v", "correlation", "accuracy", "auc"}
 
 
 def print_query(rows, query, column, n, epsilon):
     """One query as a Markdown table: a row per arm and analyst, a column
     per ε (n fixed) or per n (ε fixed); each cell the mean error over the
-    repetitions ± its standard deviation, in percent for relative errors."""
-    by_cell = {}
+    repetitions ± its standard deviation, in percent for relative errors.
+    Repetitions whose error is undefined (NaN) are left out, and the cell
+    says how many were left, as `(3 of 10)`."""
+    by_cell, undefined = {}, {}
     for r in rows:
         if r["query"] != query or (column and r.get("column", "") != column):
             continue
@@ -865,8 +877,13 @@ def print_query(rows, query, column, n, epsilon):
             continue
         across = float(r["epsilon"]) if n is not None else int(r["n"])
         error = float(r["error"])
-        if not math.isnan(error):
-            by_cell.setdefault((r["arm"], r["analyst"]), {}).setdefault(across, []).append(error)
+        cells = by_cell.setdefault((r["arm"], r["analyst"]), {})
+        if math.isnan(error):
+            cells.setdefault(across, [])
+            key = (r["arm"], r["analyst"], across)
+            undefined[key] = undefined.get(key, 0) + 1
+        else:
+            cells.setdefault(across, []).append(error)
     if not by_cell:
         sys.exit(f"no rows for query {query}")
     acrosses = sorted({a for cells in by_cell.values() for a in cells})
@@ -878,19 +895,23 @@ def print_query(rows, query, column, n, epsilon):
         out = []
         for a in acrosses:
             errors = cells.get(a, [])
+            missing = undefined.get((arm, analyst, a), 0)
+            note = f" ({len(errors)} of {len(errors) + missing})" if missing else ""
             if not errors:
-                out.append("n/a")
+                out.append("n/a" + note)
                 continue
-            signed = query == "mean"
+            signed = query == "mean" or query in DIFFERENCES
             values = errors if signed else [abs(e) for e in errors]
             mean = statistics.fmean(values)
             sd = statistics.stdev(values) if len(values) > 1 else 0.0
-            if query in DISTANCES:
-                out.append(f"{mean:.4f} ± {sd:.4f}")
+            if query in DIFFERENCES:
+                out.append(f"{mean:+.4f} ± {sd:.4f}{note}")
+            elif query in DISTANCES:
+                out.append(f"{mean:.4f} ± {sd:.4f}{note}")
             elif signed:
-                out.append(f"{100 * mean:+.1f}% ± {100 * sd:.1f}%")
+                out.append(f"{100 * mean:+.1f}% ± {100 * sd:.1f}%{note}")
             else:
-                out.append(f"{100 * mean:.1f}% ± {100 * sd:.1f}%")
+                out.append(f"{100 * mean:.1f}% ± {100 * sd:.1f}%{note}")
         print(f"| `{arm}` | {ANALYST_NAMES.get(analyst, analyst)} | " + " | ".join(out) + " |")
 
 
