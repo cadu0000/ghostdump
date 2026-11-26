@@ -44,6 +44,14 @@ With rules, these stop the run (exit status 65); the error names the input line 
 * **Memory is constant in the number of rows, not in their size**: a row, or a statement held whole, is kept in memory up to `--max-row-size`; with `--threads`, at most twice as many segments as threads are out at once. `init` keeps the names of every table and column. Source: [decisions/0002](decisions/0002-parallel-masking.md).
 * **Timings on the development machine vary by 5 to 7%** between runs of one binary, so smaller differences cannot be seen in wall-clock time; the cost of counting input lines was measured in instructions (callgrind) instead. Source: [benchmarks](benchmarks.md), reference machine; roadmap, stage 1.5 decisions.
 
+## Utility
+
+What a masked dump is good for, measured in the [utility evaluation](experiments/utility.md) on synthetic data and on UCI Adult.
+
+* **SQL on a masked numeric column answers means, little else.** On Adult and on 10⁵ synthetic rows or more, at ε = 1, counts in a range are 75–99% off, the 90th percentile 145–270%, and the histogram distance 0.63–0.87, and more rows do not help; at ε = 10, still 11–93%, 5–61% and 0.10–0.42. Means come within about 2% from ε = 0.5 on. Source: utility evaluation, findings 1 and 4.
+* **Correcting for the noise takes post-processing that GhostDump does not ship.** The deconvolution of the evaluation brings quantiles and smooth histograms back, but not a value that holds a large share of a column (40 hours, 47% of Adult's records: 92% off at ε = 1), and as configured it overfits on real data. Source: utility evaluation, findings 2 and 3; roadmap, stage 2.5.
+* **Randomized response loses more with more categories.** Through the unbiased estimator, the distance to the true shares at ε = 1 and n = 48,842 is 0.002 with 2 categories and 0.073 with 16, as the variance of k-ary randomized response predicts; read straight with SQL, the shares are pulled toward uniform. Source: utility evaluation, finding 8.
+
 ## Tools
 
 * **`init` suggests rules from column names.** It is a hint, not a classification: a column `name` of a table of products gets `faker_name`, and personal data in a column named `notes` gets no rule. Review every line. Source: `inventory::tests::test_suggestions_follow_the_column_name`.
@@ -58,5 +66,5 @@ With rules, these stop the run (exit status 65); the error names the input line 
 * **Edge cases**: 73 scripts written by hand, run in the real clients ([client framing](experiments/client-framing.md)).
 * **Fuzzing**: 15 minutes per target in stage 1.3 (1,754,900 inputs for the parser, 199,864 for the engine), and 5 minutes on the engine after each later change to it; no long campaign yet. Since stage 1.6 the full pipeline fuzzes each target for 15 minutes, by hand and before each release.
 * **Property tests**: 256 cases per property in every run of the tests, 1,000,000 in the full pipeline.
-* **Utility**: synthetic data only ([utility evaluation](experiments/utility.md), Limitations).
+* **Utility**: synthetic data, and one real dataset, UCI Adult (48,842 records from 1994), one column at a time ([utility evaluation](experiments/utility.md), Limitations).
 * **Performance**: one shared machine ([benchmarks](benchmarks.md)).

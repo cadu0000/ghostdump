@@ -25,10 +25,23 @@ With `--task categorical`, the same is done for a categorical column
 straight (SQL shares) and through the unbiased frequency estimator, and
 central DP (Laplace on the counts).
 
-Example:
+With `--task adult`, both are done on the UCI Adult dataset (48,842 rows,
+https://archive.ics.uci.edu/dataset/2/adult), one column at a time: the
+numeric columns `age` and `hours_per_week`, and the categorical columns
+`sex`, `race`, `workclass` and `education` (2, 5, 9 and 16 categories).
+`--adult-dir` names a directory holding `adult.data` and `adult.test`; the
+files are checked against their SHA-256 before use.
+
+The summary gives, for each column and configuration, the mean error over
+the repetitions and its standard deviation. `--summarize FILE` prints it
+again from a CSV written by an earlier run.
+
+Examples:
 
     cargo build --release
     python3 scripts/utility_eval.py --sizes 10000,100000 --epsilons 0.5,1,2 --reps 10
+    python3 scripts/utility_eval.py --task adult --adult-dir adult/ --epsilons 0.1,1,10
+    python3 scripts/utility_eval.py --summarize docs/bench-results/2026-11-utility.csv
 
 Only the Python standard library is used.
 """
@@ -36,6 +49,7 @@ Only the Python standard library is used.
 import argparse
 import bisect
 import csv
+import hashlib
 import math
 import os
 import random
@@ -114,21 +128,29 @@ def read_masked(path, convert=float):
 
 
 def run_ghostdump(binary, dump, epsilon, bounds, seed, workdir):
-    lo, hi = bounds
-    rule = (
-        f'{{ name = "salary", strategy = "dp_laplace", epsilon = {epsilon!r}, '
-        f"bounds = [{lo!r}, {hi!r}], scale = 2 }}"
-    )
+    rule = laplace_rule("salary", epsilon, bounds, scale=2)
     return read_masked(mask(binary, dump, rule, seed, workdir))
 
 
-def mask(binary, dump, rule, seed, workdir):
-    """Runs GhostDump with one rule on the `users` table; returns the output path."""
-    rules = workdir / "rules.toml"
-    rules.write_text(f"[tables.users]\ncolumns = [\n    {rule},\n]\n")
+def laplace_rule(column, epsilon, bounds, scale):
+    lo, hi = bounds
+    return (
+        f'{{ name = "{column}", strategy = "dp_laplace", epsilon = {epsilon!r}, '
+        f"bounds = [{lo!r}, {hi!r}], scale = {scale} }}"
+    )
+
+
+def mask(binary, dump, rules, seed, workdir, table="users"):
+    """Runs GhostDump with the rules (one, or a list) on one table; returns
+    the output path."""
+    if isinstance(rules, str):
+        rules = [rules]
+    listed = "".join(f"    {rule},\n" for rule in rules)
+    rules_file = workdir / "rules.toml"
+    rules_file.write_text(f"[tables.{table}]\ncolumns = [\n{listed}]\n")
     out = workdir / "masked.sql"
     subprocess.run(
-        [str(binary), "-c", str(rules), "-i", str(dump), "-o", str(out), "--seed", str(seed)],
+        [str(binary), "-c", str(rules_file), "-i", str(dump), "-o", str(out), "--seed", str(seed)],
         check=True,
         env=dict(os.environ, GHOSTDUMP_LOG="error"),
     )
@@ -169,7 +191,19 @@ def range_queries(true_sorted):
     return ranges
 
 
-def answer_naive(values, ranges):
+def whole_ranges(true_sorted):
+    """Ranges for whole numbers, where the quantiles around the median often
+    coincide (40 hours is both the 45% and the 55% quantile of
+    hours_per_week): [⌊a⌋, ⌈b⌉] with both ends, written as the half-open
+    [⌊a⌋ − 0.5, ⌈b⌉ + 0.5) that the queries count. A range then holds at least
+    the share in its name."""
+    return {
+        name: (math.floor(a) - 0.5, math.ceil(b) + 0.5)
+        for name, (a, b) in range_queries(true_sorted).items()
+    }
+
+
+def answer_naive(values, ranges, edges=HIST_EDGES):
     present = sorted(v for v in values if v is not None)
     answers = {
         "mean": statistics.fmean(present),
@@ -177,7 +211,7 @@ def answer_naive(values, ranges):
         "count": len(present),
         "median": quantile(present, 0.5),
         "p90": quantile(present, 0.9),
-        "histogram": histogram(present, HIST_EDGES),
+        "histogram": histogram(present, edges),
     }
     for name, (a, b) in ranges.items():
         answers[name] = bisect.bisect_left(present, b) - bisect.bisect_left(present, a)
@@ -191,79 +225,98 @@ def laplace_cdf(x, b):
     return 0.5 * math.exp(x / b) if x < 0 else 1.0 - 0.5 * math.exp(-x / b)
 
 
-def deconvolve(noisy, bounds, b):
-    """Distribution of the clamped values over EM_TRUE_BINS bins of the
-    bounds, estimated from the noisy values (Laplace noise of scale b)."""
-    lo, hi = bounds
-    width = (hi - lo) / EM_TRUE_BINS
-    centres = [lo + (j + 0.5) * width for j in range(EM_TRUE_BINS)]
-    obs_lo, obs_hi = lo - 6 * b, hi + 6 * b
-    obs_width = (obs_hi - obs_lo) / EM_OBS_BINS
-    edges = [obs_lo + m * obs_width for m in range(EM_OBS_BINS + 1)]
+def deconvolve(noisy, bounds, b, unit=None):
+    """Distribution of the clamped values over bins of the bounds, estimated
+    from the noisy values (Laplace noise of scale b). Returns the bins, as
+    (left, right, centre, width), and their estimated shares.
 
-    counts = [0] * EM_OBS_BINS
+    Without `unit`, the bins are EM_TRUE_BINS equal parts of the bounds, and
+    the noisy values are counted in EM_OBS_BINS equal cells. With `unit`, the
+    step of the values (1 for whole numbers, where the noise is a whole
+    number too), both follow that grid: one bin per value the bounds allow,
+    and cells of whole units centred on the values. Cells that do not follow
+    the grid fall between the values the noise can take, and stay empty
+    where the model expects mass."""
+    lo, hi = bounds
+    if unit is None:
+        width = (hi - lo) / EM_TRUE_BINS
+        centres = [lo + (j + 0.5) * width for j in range(EM_TRUE_BINS)]
+        bins = [(c - width / 2, c + width / 2, c, width) for c in centres]
+        obs_lo, obs_hi = lo - 6 * b, hi + 6 * b
+        obs_cells = EM_OBS_BINS
+        obs_width = (obs_hi - obs_lo) / obs_cells
+    else:
+        centres = [lo + j * unit for j in range(round((hi - lo) / unit) + 1)]
+        bins = [(c - unit / 2, c + unit / 2, c, unit) for c in centres]
+        margin = math.ceil(6 * b / unit)
+        values = round((hi - lo) / unit) + 1 + 2 * margin
+        per_cell = math.ceil(values / EM_OBS_BINS)
+        obs_cells = math.ceil(values / per_cell)
+        obs_width = per_cell * unit
+        obs_lo = lo - (margin + 0.5) * unit
+    edges = [obs_lo + m * obs_width for m in range(obs_cells + 1)]
+
+    counts = [0] * obs_cells
     for y in noisy:
-        m = min(EM_OBS_BINS - 1, max(0, int((y - obs_lo) // obs_width)))
+        m = min(obs_cells - 1, max(0, int((y - obs_lo) // obs_width)))
         counts[m] += 1
 
     # kernel[m][j] = P(noisy value in bin m | true value at centre j); the
     # outer bins absorb the tails.
     kernel = []
-    for m in range(EM_OBS_BINS):
+    for m in range(obs_cells):
         row = []
         for c in centres:
             low = 0.0 if m == 0 else laplace_cdf(edges[m] - c, b)
-            high = 1.0 if m == EM_OBS_BINS - 1 else laplace_cdf(edges[m + 1] - c, b)
+            high = 1.0 if m == obs_cells - 1 else laplace_cdf(edges[m + 1] - c, b)
             row.append(high - low)
         kernel.append(row)
 
-    observed = [(counts[m], kernel[m]) for m in range(EM_OBS_BINS) if counts[m]]
+    observed = [(counts[m], kernel[m]) for m in range(obs_cells) if counts[m]]
     total = len(noisy)
-    p = [1.0 / EM_TRUE_BINS] * EM_TRUE_BINS
+    p = [1.0 / len(centres)] * len(centres)
     for _ in range(EM_MAX_ITERATIONS):
-        acc = [0.0] * EM_TRUE_BINS
+        acc = [0.0] * len(centres)
         for count, row in observed:
             denom = sum(pj * k for pj, k in zip(p, row))
             if denom <= 0:
                 continue
             factor = count / denom
-            for j in range(EM_TRUE_BINS):
+            for j in range(len(centres)):
                 acc[j] += row[j] * factor
         new = [pj * a / total for pj, a in zip(p, acc)]
         moved = sum(abs(a - b) for a, b in zip(new, p))
         p = new
         if moved < EM_TOLERANCE:
             break
-    return centres, width, p
+    return bins, p
 
 
-def answer_estimator(noisy, bounds, b, ranges):
+def answer_estimator(noisy, bounds, b, ranges, edges=HIST_EDGES, unit=None):
     present = [v for v in noisy if v is not None]
-    centres, width, p = deconvolve(present, bounds, b)
+    bins, p = deconvolve(present, bounds, b, unit)
     n = len(present)
 
     def share_between(a, c):
         """Estimated share of values in [a, c), uniform inside each bin."""
         total = 0.0
-        for centre, pj in zip(centres, p):
-            left, right = centre - width / 2, centre + width / 2
+        for (left, right, _, width), pj in zip(bins, p):
             overlap = max(0.0, min(right, c) - max(left, a))
             total += pj * overlap / width
         return total
 
     def inverse_cdf(q):
         acc = 0.0
-        for centre, pj in zip(centres, p):
+        for (left, _, _, width), pj in zip(bins, p):
             if acc + pj >= q:
-                left = centre - width / 2
                 return left + width * ((q - acc) / pj if pj else 0.0)
             acc += pj
-        return centres[-1] + width / 2
+        return bins[-1][2] + bins[-1][3] / 2
 
-    mean = sum(c * pj for c, pj in zip(centres, p))
-    hist_inner = [share_between(HIST_EDGES[i], HIST_EDGES[i + 1]) for i in range(len(HIST_EDGES) - 1)]
-    under = share_between(-math.inf, HIST_EDGES[0])
-    over = share_between(HIST_EDGES[-1], math.inf)
+    mean = sum(centre * pj for (_, _, centre, _), pj in zip(bins, p))
+    hist_inner = [share_between(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
+    under = share_between(-math.inf, edges[0])
+    over = share_between(edges[-1], math.inf)
     answers = {
         "mean": mean,
         "sum": mean * n,
@@ -297,7 +350,7 @@ def dp_quantile(rng, sorted_values, q, epsilon, grid):
     return rng.choices(candidates, weights=weights)[0]
 
 
-def answer_central(rng, values, bounds, epsilon, ranges):
+def answer_central(rng, values, bounds, epsilon, ranges, edges=HIST_EDGES):
     """Each query answered independently from the raw data with ε-DP under
     replacement of one value. The NULL pattern, and so the count, is public,
     as in the local arms (null_policy = "keep")."""
@@ -317,7 +370,7 @@ def answer_central(rng, values, bounds, epsilon, ranges):
         count = bisect.bisect_left(clamped, b) - bisect.bisect_left(clamped, a)
         answers[name] = count + laplace(rng, 1.0 / epsilon)
     # Replacing one value moves one unit between two bins: L1 sensitivity 2.
-    hist = histogram(clamped, HIST_EDGES)
+    hist = histogram(clamped, edges)
     noisy = [max(0.0, h * n + laplace(rng, 2.0 / epsilon)) for h in hist]
     s = sum(noisy) or 1.0
     answers["histogram"] = [v / s for v in noisy]
@@ -340,18 +393,24 @@ def errors(answers, truth):
     return rows
 
 
-def dp_bounds(rng, values, epsilon_share):
+def dp_bounds(rng, values, epsilon_share, grid=QUANTILE_GRID):
     present = sorted(v for v in values if v is not None)
-    lo = dp_quantile(rng, present, 0.01, epsilon_share / 2, QUANTILE_GRID)
-    hi = dp_quantile(rng, present, 0.99, epsilon_share / 2, QUANTILE_GRID)
+    lo = dp_quantile(rng, present, 0.01, epsilon_share / 2, grid)
+    hi = dp_quantile(rng, present, 0.99, epsilon_share / 2, grid)
     if hi <= lo:
-        hi = lo + QUANTILE_GRID[2]
+        hi = lo + grid[2]
     return lo, hi
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--task", choices=["numeric", "categorical"], default="numeric")
+    parser.add_argument("--task", choices=["numeric", "categorical", "adult"], default="numeric")
+    parser.add_argument("--adult-dir", help="directory with adult.data and adult.test (--task adult)")
+    parser.add_argument("--summarize", metavar="CSV", help="print the summary of an earlier run and exit")
+    parser.add_argument("--query", help="with --summarize: one table of this query, arms by n or by ε")
+    parser.add_argument("--column", help="with --query: the column (for CSVs with several)")
+    parser.add_argument("--n", type=int, help="with --query: fix n, one table column per ε")
+    parser.add_argument("--epsilon", type=float, help="with --query: fix ε, one table column per n")
     parser.add_argument("--sizes", default="10000,100000")
     parser.add_argument("--epsilons", default="0.5,1,2")
     parser.add_argument("--reps", type=int, default=10)
@@ -362,18 +421,33 @@ def main():
     parser.add_argument("--out", default="utility_results.csv")
     args = parser.parse_args()
 
+    if args.summarize:
+        with open(args.summarize, newline="") as f:
+            rows = list(csv.DictReader(f))
+        if args.query:
+            if (args.n is None) == (args.epsilon is None):
+                parser.error("--query needs one of --n and --epsilon")
+            print_query(rows, args.query, args.column, args.n, args.epsilon)
+        else:
+            print_summary(rows)
+        return
+    if args.task == "adult" and not args.adult_dir:
+        parser.error("--task adult needs --adult-dir")
+
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
         if args.task == "numeric":
             rows = run_numeric(args, workdir)
-        else:
+        elif args.task == "categorical":
             rows = run_categorical(args, workdir)
+        else:
+            rows = run_adult(args, workdir)
 
     with open(args.out, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    print_summary(rows, QUERIES if args.task == "numeric" else CATEGORICAL_QUERIES)
+    print_summary(rows)
     print(f"\n{len(rows)} rows written to {args.out}", file=sys.stderr)
 
 
@@ -408,10 +482,10 @@ def run_numeric(args, workdir):
                         ("naive", answer_naive(noisy, ranges)),
                         ("estimator", answer_estimator(noisy, bounds, b, ranges)),
                     ):
-                        rows += result_rows(n, epsilon, arm, analyst, rep, bounds, answers, truth)
+                        rows += result_rows("salary", n, epsilon, arm, analyst, rep, bounds, answers, truth)
                 for arm, bounds in (("central_a_priori", A_PRIORI), ("central_oracle", oracle)):
                     answers = answer_central(rng, salaries, bounds, epsilon, ranges)
-                    rows += result_rows(n, epsilon, arm, "central", rep, bounds, answers, truth)
+                    rows += result_rows("salary", n, epsilon, arm, "central", rep, bounds, answers, truth)
             print(f"n = {n}, ε = {epsilon}: done", file=sys.stderr)
     return rows
 
@@ -438,13 +512,13 @@ def write_category_dump(path, values):
         f.write("\\.\n")
 
 
-def shares(values):
-    counts = {c: 0 for c in CATEGORIES}
+def shares(values, categories=CATEGORIES):
+    counts = {c: 0 for c in categories}
     for v in values:
         if v in counts:
             counts[v] += 1
     total = sum(counts.values()) or 1
-    return [counts[c] / total for c in CATEGORIES]
+    return [counts[c] / total for c in categories]
 
 
 def project(estimates):
@@ -457,26 +531,28 @@ def project(estimates):
 def rr_estimator(observed, epsilon):
     """Unbiased frequency estimate for k-ary randomized response:
     (observed − q) / (p − q), with p = e^ε/(e^ε+k−1) and q = 1/(e^ε+k−1)."""
-    k = len(CATEGORIES)
+    k = len(observed)
     e = math.exp(epsilon)
     p, q = e / (e + k - 1), 1 / (e + k - 1)
     return project([(o - q) / (p - q) for o in observed])
 
 
-def central_shares(rng, values, epsilon):
+def central_shares(rng, values, epsilon, categories=CATEGORIES):
     """Laplace noise on each count; replacing one value changes two counts
     by one, so the L1 sensitivity is 2."""
     n = len(values)
-    return project([s * n + laplace(rng, 2.0 / epsilon) for s in shares(values)])
+    return project([s * n + laplace(rng, 2.0 / epsilon) for s in shares(values, categories)])
 
 
-def categorical_rows(n, epsilon, arm, analyst, rep, estimate, truth):
+def categorical_rows(n, epsilon, arm, analyst, rep, estimate, truth, column="status", categories=CATEGORIES):
     out = []
-    errors = {f"share_{c}": e - t for c, e, t in zip(CATEGORIES, estimate, truth)}
+    errors = {f"share_{c}": e - t for c, e, t in zip(categories, estimate, truth)}
+    errors["max_share"] = max(abs(e - t) for e, t in zip(estimate, truth))
     errors["tv"] = total_variation(estimate, truth)
     for query, error in errors.items():
         out.append(
             {
+                "column": column,
                 "n": n,
                 "epsilon": epsilon,
                 "arm": arm,
@@ -534,11 +610,180 @@ def run_categorical(args, workdir):
     return rows
 
 
-def result_rows(n, epsilon, arm, analyst, rep, bounds, answers, truth):
+# ==========================================
+# ADULT DATASET
+# ==========================================
+# The files of https://archive.ics.uci.edu/static/public/2/adult.zip
+# (Becker and Kohavi, 1996, https://doi.org/10.24432/C5XW20).
+ADULT_SHA256 = {
+    "adult.data": "5b00264637dbfec36bdeaab5676b0b309ff9eb788d63554ca0a249491c86603d",
+    "adult.test": "a2a9044bc167a35b2361efbabec64e89d69ce82d9790d2980119aac5fd7e9c05",
+}
+# The fields of a record, in the order of adult.names.
+ADULT_FIELDS = [
+    "age", "workclass", "fnlwgt", "education", "education_num", "marital_status",
+    "occupation", "relationship", "race", "sex", "capital_gain", "capital_loss",
+    "hours_per_week", "native_country", "income",
+]
+# Bounds a data owner can set from what the column means, without reading
+# it: an age in years, and hours in a working week. The DP quantiles of the
+# dp_bounds arm are searched on a grid of whole units over the same range.
+ADULT_NUMERIC = {
+    "age": (0.0, 100.0),
+    "hours_per_week": (0.0, 100.0),
+}
+# The categories as adult.names lists them; adult.names also says that
+# unknown values were converted to "?", which workclass has.
+ADULT_CATEGORICAL = {
+    "sex": ["Female", "Male"],
+    "race": ["White", "Asian-Pac-Islander", "Amer-Indian-Eskimo", "Other", "Black"],
+    "workclass": [
+        "Private", "Self-emp-not-inc", "Self-emp-inc", "Federal-gov", "Local-gov",
+        "State-gov", "Without-pay", "Never-worked", "?",
+    ],
+    "education": [
+        "Bachelors", "Some-college", "11th", "HS-grad", "Prof-school", "Assoc-acdm",
+        "Assoc-voc", "9th", "7th-8th", "12th", "Masters", "1st-4th", "10th",
+        "Doctorate", "5th-6th", "Preschool",
+    ],
+}
+ADULT_COLUMNS = list(ADULT_NUMERIC) + list(ADULT_CATEGORICAL)
+
+
+def load_adult(directory):
+    """The records of adult.data and adult.test; stops when a file is not
+    the published one."""
+    records = []
+    for name, digest in ADULT_SHA256.items():
+        path = Path(directory) / name
+        data = path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != digest:
+            sys.exit(f"{path}: SHA-256 differs from the published file")
+        for line in data.decode("ascii").splitlines():
+            fields = [field.strip() for field in line.split(",")]
+            # Skips the blank last lines and the first line of adult.test.
+            if len(fields) == len(ADULT_FIELDS):
+                records.append(dict(zip(ADULT_FIELDS, fields)))
+    return records
+
+
+def write_adult_dump(path, records):
+    types = {c: "integer" for c in ADULT_NUMERIC} | {c: "text" for c in ADULT_CATEGORICAL}
+    declared = ", ".join(f"{c} {types[c]}" for c in ADULT_COLUMNS)
+    with open(path, "w") as f:
+        f.write(f"CREATE TABLE adult (id integer, {declared});\n")
+        f.write(f"COPY adult (id, {', '.join(ADULT_COLUMNS)}) FROM stdin;\n")
+        for i, record in enumerate(records, 1):
+            f.write("\t".join([str(i)] + [record[c] for c in ADULT_COLUMNS]) + "\n")
+        f.write("\\.\n")
+
+
+def read_masked_columns(path, table, columns):
+    """The values of each column of a masked COPY block, as text (None for NULL)."""
+    values = {c: [] for c in columns}
+    with open(path) as f:
+        in_copy = False
+        for line in f:
+            if line.startswith(f"COPY {table} "):
+                in_copy = True
+            elif line.startswith("\\."):
+                in_copy = False
+            elif in_copy:
+                fields = line.rstrip("\n").split("\t")[1:]
+                for column, field in zip(columns, fields):
+                    values[column].append(None if field == "\\N" else field)
+    return values
+
+
+def run_adult(args, workdir):
+    records = load_adult(args.adult_dir)
+    n = len(records)
+    dump = workdir / "adult.sql"
+    write_adult_dump(dump, records)
+
+    def masked(rules, seed):
+        return read_masked_columns(mask(args.binary, dump, rules, seed, workdir, "adult"), "adult", ADULT_COLUMNS)
+
+    numeric = {c: [float(r[c]) for r in records] for c in ADULT_NUMERIC}
+    setup = {}
+    for column, values in numeric.items():
+        lo, hi = ADULT_NUMERIC[column]
+        # Edges between whole numbers, so that each bin holds the same whole
+        # numbers as with edges on them, and the estimator's bins fit in it.
+        edges = [lo - 0.5 + i * (hi - lo) / 20 for i in range(21)]
+        true_sorted = sorted(values)
+        ranges = whole_ranges(true_sorted)
+        oracle = (true_sorted[0], true_sorted[-1])
+        setup[column] = (edges, ranges, answer_naive(values, ranges, edges), oracle)
+    categorical = {c: [r[c] for r in records] for c in ADULT_CATEGORICAL}
+    options = {c: ", ".join(f'"{v}"' for v in cats) for c, cats in ADULT_CATEGORICAL.items()}
+
+    rows = []
+    for epsilon in (float(e) for e in args.epsilons.split(",")):
+        for rep in range(args.reps):
+            rng = random.Random(f"adult-{epsilon}-{rep}")
+            arms = {
+                "a_priori": ({c: ADULT_NUMERIC[c] for c in numeric}, epsilon),
+                "dp_bounds": (
+                    {
+                        c: dp_bounds(rng, numeric[c], BOUNDS_SHARE * epsilon, (*ADULT_NUMERIC[c], 1.0))
+                        for c in numeric
+                    },
+                    (1 - BOUNDS_SHARE) * epsilon,
+                ),
+                "oracle": ({c: setup[c][3] for c in numeric}, epsilon),
+            }
+            for arm, (bounds, value_epsilon) in arms.items():
+                out = masked([laplace_rule(c, value_epsilon, bounds[c], scale=0) for c in numeric], rep + 1)
+                for column in numeric:
+                    edges, ranges, truth, _ = setup[column]
+                    noisy = [None if v is None else float(v) for v in out[column]]
+                    b = (bounds[column][1] - bounds[column][0]) / value_epsilon
+                    for analyst, answers in (
+                        ("naive", answer_naive(noisy, ranges, edges)),
+                        ("estimator", answer_estimator(noisy, bounds[column], b, ranges, edges, unit=1.0)),
+                    ):
+                        rows += result_rows(column, n, epsilon, arm, analyst, rep, bounds[column], answers, truth)
+            for column, values in numeric.items():
+                edges, ranges, truth, oracle = setup[column]
+                for arm, bounds in (("central_a_priori", ADULT_NUMERIC[column]), ("central_oracle", oracle)):
+                    answers = answer_central(rng, values, bounds, epsilon, ranges, edges)
+                    rows += result_rows(column, n, epsilon, arm, "central", rep, bounds, answers, truth)
+
+            choice = masked(
+                [f'{{ name = "{c}", strategy = "random_choice", options = [{options[c]}] }}' for c in categorical],
+                rep + 1,
+            )
+            rr = masked(
+                [
+                    f'{{ name = "{c}", strategy = "randomized_response", epsilon = {epsilon!r}, '
+                    f"categories = [{options[c]}] }}"
+                    for c in categorical
+                ],
+                rep + 1,
+            )
+            for column, values in categorical.items():
+                cats = ADULT_CATEGORICAL[column]
+                truth = shares(values, cats)
+                tagged = dict(column=column, categories=cats)
+                observed = shares(choice[column], cats)
+                rows += categorical_rows(n, epsilon, "random_choice", "naive", rep, observed, truth, **tagged)
+                observed = shares(rr[column], cats)
+                rows += categorical_rows(n, epsilon, "randomized_response", "naive", rep, observed, truth, **tagged)
+                estimate = rr_estimator(observed, epsilon)
+                rows += categorical_rows(n, epsilon, "randomized_response", "estimator", rep, estimate, truth, **tagged)
+                estimate = central_shares(rng, values, epsilon, cats)
+                rows += categorical_rows(n, epsilon, "central", "central", rep, estimate, truth, **tagged)
+            print(f"adult, ε = {epsilon}, repetition {rep + 1}: done", file=sys.stderr)
+    return rows
+
+
+def result_rows(column, n, epsilon, arm, analyst, rep, bounds, answers, truth):
     out = []
     for query, (error, estimate) in errors(answers, truth).items():
         out.append(
             {
+                "column": column,
                 "n": n,
                 "epsilon": epsilon,
                 "arm": arm,
@@ -555,27 +800,107 @@ def result_rows(n, epsilon, arm, analyst, rep, bounds, answers, truth):
     return out
 
 
-def print_summary(rows, queries):
-    """Mean absolute error per configuration and query. A query named `mean`
-    is shown signed, so that bias shows."""
+def print_summary(rows):
+    """Mean error over the repetitions, ± its standard deviation, per column,
+    configuration and query: absolute, but signed for a query named `mean`,
+    so that bias shows. Rows may come from a CSV, with every field a string;
+    CSVs written before the `column` field read as one unnamed column. The
+    per-category shares are left out: `max_share` and `tv` sum them up."""
     groups = {}
+    queries_of = {}
     for r in rows:
-        key = (r["n"], r["epsilon"], r["arm"], r["analyst"])
-        groups.setdefault(key, {}).setdefault(r["query"], []).append(r["error"])
-    header = ["n", "ε", "arm", "analyst"] + [
-        "mean (signed)" if q == "mean" else q for q in queries
-    ]
-    print("| " + " | ".join(header) + " |")
-    print("|" + "---|" * len(header))
-    for (n, eps, arm, analyst), by_query in sorted(groups.items()):
-        cells = [str(n), str(eps), arm, analyst]
-        for q in queries:
-            errors = by_query[q]
-            if q == "mean":
-                cells.append(f"{statistics.fmean(errors):+.4f}")
+        query = r["query"]
+        if query.startswith("share_"):
+            continue
+        column = r.get("column", "")
+        queries = queries_of.setdefault(column, [])
+        if query not in queries:
+            queries.append(query)
+        key = (column, int(r["n"]), float(r["epsilon"]), r["arm"], r["analyst"])
+        error = float(r["error"])
+        if not math.isnan(error):
+            groups.setdefault(key, {}).setdefault(query, []).append(error)
+    # One table per set of queries: numeric and categorical columns apart.
+    tables = {}
+    for column, queries in queries_of.items():
+        tables.setdefault(tuple(queries), []).append(column)
+    for queries, columns in tables.items():
+        header = ["column", "n", "ε", "arm", "analyst"] + [
+            "mean (signed)" if q == "mean" else q for q in queries
+        ]
+        print("\n| " + " | ".join(header) + " |")
+        print("|" + "---|" * len(header))
+        for (column, n, eps, arm, analyst), by_query in sorted(groups.items()):
+            if column not in columns:
+                continue
+            cells = [column, str(n), f"{eps:g}", arm, analyst]
+            for q in queries:
+                errors = by_query.get(q, [])
+                if q != "mean":
+                    errors = [abs(e) for e in errors]
+                cells.append(dispersion(errors, signed=q == "mean"))
+            print("| " + " | ".join(cells) + " |")
+
+
+ARM_ORDER = [
+    "a_priori", "dp_bounds", "oracle", "central_a_priori", "central_oracle",
+    "random_choice", "randomized_response", "central",
+]
+ANALYST_NAMES = {"naive": "SQL", "estimator": "estimator", "central": "central DP"}
+# Queries whose error is a distance, not a relative error.
+DISTANCES = {"histogram_tv", "tv", "max_share"}
+
+
+def print_query(rows, query, column, n, epsilon):
+    """One query as a Markdown table: a row per arm and analyst, a column
+    per ε (n fixed) or per n (ε fixed); each cell the mean error over the
+    repetitions ± its standard deviation, in percent for relative errors."""
+    by_cell = {}
+    for r in rows:
+        if r["query"] != query or (column and r.get("column", "") != column):
+            continue
+        if n is not None and int(r["n"]) != n:
+            continue
+        if epsilon is not None and float(r["epsilon"]) != epsilon:
+            continue
+        across = float(r["epsilon"]) if n is not None else int(r["n"])
+        error = float(r["error"])
+        if not math.isnan(error):
+            by_cell.setdefault((r["arm"], r["analyst"]), {}).setdefault(across, []).append(error)
+    if not by_cell:
+        sys.exit(f"no rows for query {query}")
+    acrosses = sorted({a for cells in by_cell.values() for a in cells})
+    label = (lambda a: f"ε = {a:g}") if n is not None else (lambda a: f"n = {a:,}")
+    print("| Arm | Analyst | " + " | ".join(label(a) for a in acrosses) + " |")
+    print("|---|---|" + "---|" * len(acrosses))
+    order = {arm: i for i, arm in enumerate(ARM_ORDER)}
+    for (arm, analyst), cells in sorted(by_cell.items(), key=lambda kv: (order.get(kv[0][0], 99), kv[0][1] != "naive", kv[0][1])):
+        out = []
+        for a in acrosses:
+            errors = cells.get(a, [])
+            if not errors:
+                out.append("n/a")
+                continue
+            signed = query == "mean"
+            values = errors if signed else [abs(e) for e in errors]
+            mean = statistics.fmean(values)
+            sd = statistics.stdev(values) if len(values) > 1 else 0.0
+            if query in DISTANCES:
+                out.append(f"{mean:.4f} ± {sd:.4f}")
+            elif signed:
+                out.append(f"{100 * mean:+.1f}% ± {100 * sd:.1f}%")
             else:
-                cells.append(f"{statistics.fmean(abs(e) for e in errors):.4f}")
-        print("| " + " | ".join(cells) + " |")
+                out.append(f"{100 * mean:.1f}% ± {100 * sd:.1f}%")
+        print(f"| `{arm}` | {ANALYST_NAMES.get(analyst, analyst)} | " + " | ".join(out) + " |")
+
+
+def dispersion(errors, signed=False):
+    """`mean ± sd` of the errors of the repetitions (sample standard deviation)."""
+    if not errors:
+        return "n/a"
+    mean = statistics.fmean(errors)
+    sd = statistics.stdev(errors) if len(errors) > 1 else 0.0
+    return f"{mean:+.4f} ± {sd:.4f}" if signed else f"{mean:.4f} ± {sd:.4f}"
 
 
 if __name__ == "__main__":
