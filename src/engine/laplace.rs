@@ -1,12 +1,11 @@
 //! The Laplace mechanism of `dp_laplace` columns.
 
-use hmac::{Hmac, Mac};
+use hmac::Mac;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use sha2::Sha256;
 
 use crate::codec::SqlValue;
-use crate::engine::mask::MaskStats;
+use crate::engine::mask::{HmacKey, MaskStats};
 
 /// The Laplace mechanism for one column, with its parameters validated.
 ///
@@ -110,7 +109,7 @@ impl LaplaceMechanism {
         &self,
         value: SqlValue,
         rng: &mut impl Rng,
-        secret: &str,
+        key: &HmacKey,
         stats: &mut MaskStats,
     ) -> SqlValue {
         let parsed = value
@@ -125,8 +124,8 @@ impl LaplaceMechanism {
             Sampler::F64 { noise_scale } => {
                 let clamped = self.clamp(parsed);
                 // -0.0 and 0.0 are one value, so they get one key.
-                let key = if clamped == 0.0 { 0.0f64 } else { clamped };
-                let noisy = match self.prf(secret, &key.to_bits().to_le_bytes()) {
+                let clamped_key = if clamped == 0.0 { 0.0f64 } else { clamped };
+                let noisy = match self.prf(key, &clamped_key.to_bits().to_le_bytes()) {
                     Some(mut keyed) => self.noisy(clamped, *noise_scale, &mut keyed),
                     None => self.noisy(clamped, *noise_scale, rng),
                 };
@@ -134,7 +133,7 @@ impl LaplaceMechanism {
             }
             Sampler::Exact(domain) => {
                 let units = domain.to_units(parsed);
-                let noisy = match self.prf(secret, &units.to_le_bytes()) {
+                let noisy = match self.prf(key, &units.to_le_bytes()) {
                     Some(mut keyed) => domain.noisy(units, self.clamp_output, &mut keyed),
                     None => domain.noisy(units, self.clamp_output, rng),
                 };
@@ -179,10 +178,9 @@ impl LaplaceMechanism {
 
     /// For consistent noise: a generator seeded by HMAC-SHA256 of the
     /// column label and the clamped value, keyed with the secret.
-    fn prf(&self, secret: &str, value: &[u8]) -> Option<StdRng> {
+    fn prf(&self, key: &HmacKey, value: &[u8]) -> Option<StdRng> {
         let label = self.consistent.as_ref()?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-            .expect("HMAC accepts keys of any length");
+        let mut mac = key.mac();
         mac.update(b"ghostdump/dp_laplace/");
         mac.update(label.as_bytes());
         mac.update(b"\0");
@@ -488,7 +486,7 @@ mod tests {
 
     fn apply(m: &LaplaceMechanism, value: SqlValue, rng: &mut StdRng) -> (SqlValue, MaskStats) {
         let mut stats = MaskStats::default();
-        let out = m.apply(value, rng, "test-secret", &mut stats);
+        let out = m.apply(value, rng, &HmacKey::new("test-secret"), &mut stats);
         (out, stats)
     }
 
@@ -795,7 +793,12 @@ mod tests {
             let run = |m: &LaplaceMechanism, value: &str, secret: &str, seed: u64| {
                 let mut rng = StdRng::seed_from_u64(seed);
                 let mut stats = MaskStats::default();
-                m.apply(SqlValue::Raw(value.into()), &mut rng, secret, &mut stats)
+                m.apply(
+                    SqlValue::Raw(value.into()),
+                    &mut rng,
+                    &HmacKey::new(secret),
+                    &mut stats,
+                )
             };
             // The run's generator does not matter; the value, column and secret do.
             assert_eq!(run(m, "42", "k", 1), run(m, "42", "k", 2));
@@ -814,8 +817,9 @@ mod tests {
         other.bind("users", "bonus");
         let mut rng = rng();
         let mut stats = MaskStats::default();
-        let a = exact.apply(SqlValue::Raw("42".into()), &mut rng, "k", &mut stats);
-        let b = other.apply(SqlValue::Raw("42".into()), &mut rng, "k", &mut stats);
+        let key = HmacKey::new("k");
+        let a = exact.apply(SqlValue::Raw("42".into()), &mut rng, &key, &mut stats);
+        let b = other.apply(SqlValue::Raw("42".into()), &mut rng, &key, &mut stats);
         assert_ne!(a, b);
         assert!(exact.describe().contains("consistent noise"));
     }

@@ -10,7 +10,7 @@ use rand::rngs::StdRng;
 
 use ghostdump::codec::{SqlValue, copy, values};
 use ghostdump::engine::config::{CompiledConfig, Config};
-use ghostdump::engine::mask::{MaskStats, Masker};
+use ghostdump::engine::mask::{HmacKey, MaskStats, Masker};
 use ghostdump::engine::{AnonymizerEngine, RunOptions};
 use ghostdump::parser::{SqlDialect, SqlParser};
 
@@ -160,10 +160,11 @@ fn maskers(c: &mut Criterion) {
         let masker = compile(column);
         let mut rng = StdRng::seed_from_u64(7);
         let mut stats = MaskStats::default();
+        let key = HmacKey::new("bench-secret-0123456789abcdef");
         group.bench_function(name, |b| {
             b.iter_batched(
                 || SqlValue::Raw("54321.09".into()),
-                |value| masker.apply(value, &mut rng, "bench-secret-0123456789abcdef", &mut stats),
+                |value| masker.apply(value, &mut rng, &key, &mut stats),
                 BatchSize::SmallInput,
             )
         });
