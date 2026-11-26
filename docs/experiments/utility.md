@@ -5,7 +5,7 @@
 * **δ2, the local model:** local DP against central DP at the same ε. Any mechanism that sees one row at a time pays it.
 * **δ3, the state restriction:** given local DP, bounds chosen without the data against bounds informed by the data.
 
-This is the second version (roadmap stage 2.1). Against the first, it adds ε ∈ {0.1, 0.5, 1, 2, 5, 10}, the dispersion over the repetitions in every table, a real dataset (UCI Adult), the error of each column, and randomized response with 2, 5, 9 and 16 categories.
+This is the second version (roadmap stage 2.1). Against the first, it adds ε ∈ {0.1, 0.5, 1, 2, 5, 10}, the dispersion over the repetitions in every table, a real dataset (UCI Adult), the error of each column, and randomized response with 2, 5, 9 and 16 categories. Stage 2.2 adds what is left of the relations between columns ([Several columns](#several-columns)).
 
 **Run it:**
 
@@ -306,6 +306,105 @@ python3 scripts/utility_checks.py rr-variance --adult-dir adult/ \
 
 **The error follows the variance of k-ary randomized response.** Wang et al. (2017, Section 3, Eq. 2) give the variance of the estimated count of a category with true share f: n·q(1 − q)/(p − q)² + n·f(1 − p − q)/(p − q), with p = e^ε/(e^ε + k − 1) and q = 1/(e^ε + k − 1). Taking each estimated share as normal with that variance gives an expected distance of ½ Σ √(2/π)·σᵢ. That is the number in brackets in the table above. From ε = 0.5 on, the prediction lies within two standard deviations of the observed mean in every column. At ε = 0.1 it overshoots everywhere, up to an impossible 1.07 for `education`: clipping the negative shares bounds the error, and the normal approximation no longer holds.
 
+## Several columns
+
+Stage 2.2 masks every column of the evaluation at once, as a rule set for a real table would, and measures what is left of the relations between them.
+
+```bash
+python3 scripts/utility_multi.py --adult-dir adult/ --out multi.csv
+```
+
+The run took 1.5 minutes; its raw results are in `2026-11-multi.csv` (2,040 rows).
+
+**Setup.** One GhostDump run per ε and repetition (10 repetitions) masks the 48,842 records of Adult: `age` and `hours_per_week` with `dp_laplace` (a priori bounds [0, 100], `scale = 0`), and `sex`, `race`, `workclass`, `education`, `relationship` and `income` with `randomized_response` (the categories that `adult.names` lists). Every column gets the ε of the table, so **a record spends 8ε**: 8 at ε = 1, 40 at ε = 5, as the privacy summary at startup reports. The measures:
+
+* **Counts over two columns** (`joint_tv`): the distance between the true and the estimated shares of the cells of five pairs, from 10 to 144 cells. The SQL analyst reads the shares in the masked dump. The estimator inverts the randomized response of both columns: with p + (k − 1)q = 1, the inverse of the matrix of randomized response maps a vector x to (x − q·Σx)/(p − q), applied along each axis; negative shares are then clipped and the rest renormalized. Central DP adds Laplace noise of scale 1/ε to each cell count: the 2ε that the pair spends locally, with sensitivity 2.
+* **Dependence** (`cramers_v`, `correlation`): Cramér's V of each pair, from the same three tables, and the Pearson correlation of `age` and `hours_per_week`, each as a signed difference with its true value. The true V is 0.114 for `sex` × `race`, 0.647 for `sex` × `relationship`, 0.093 for `sex` × `education`, 0.058 for `race` × `workclass` and 0.100 for `workclass` × `education`; the true correlation is 0.072. Adult has no strong numeric correlation, and only `sex` × `relationship` is a strong categorical dependence. The noise is independent of the values, so it leaves the covariance unbiased and adds its own variance to each column's; the estimator of the correlation subtracts that variance. On whole numbers the noise of the exact sampler is discrete Laplace, P(z) ∝ exp(−|z|/t) with t = ⌈100/ε⌉, of variance 2q/(1 − q)² where q = e^(−1/t). The noise of masked runs has that variance:
+
+```bash
+python3 scripts/utility_checks.py noise-variance --adult-dir adult/
+```
+
+| ε | Column | Observed | Discrete Laplace |
+|---|---|---|---|
+| 0.1 | `age` | 2,024,975.2 | 1,999,999.8 |
+| 0.1 | `hours_per_week` | 1,996,417.5 | 1,999,999.8 |
+| 1 | `age` | 19,638.4 | 19,999.8 |
+| 1 | `hours_per_week` | 20,118.2 | 19,999.8 |
+| 10 | `age` | 200.0 | 199.8 |
+| 10 | `hours_per_week` | 197.5 | 199.8 |
+
+* **Classification** (`accuracy`, `auc`): a logistic regression (41 features: the two numeric columns scaled to [0, 1] and the five categorical ones as indicators; plain SGD, 10 epochs, learning rate 0.1/(1 + epoch)) trained on the 32,561 masked rows of `adult.data`, its label `income` masked too, and tested on the 16,281 real rows of `adult.test`. Trained on the real rows, the same model reaches an accuracy of 0.827 and an AUC of 0.877; predicting the majority class gives 0.764. The tables give the difference to the model trained on the real rows.
+
+**Counts over `sex` × `race` (10 cells): distance**
+
+| Arm | Analyst | ε = 0.1 | ε = 0.5 | ε = 1 | ε = 2 | ε = 5 | ε = 10 |
+|---|---|---|---|---|---|---|---|
+| `local` | SQL | 0.6413 ± 0.0019 | 0.5798 ± 0.0009 | 0.4873 ± 0.0012 | 0.2874 ± 0.0021 | 0.0217 ± 0.0008 | 0.0002 ± 0.0000 |
+| `local` | estimator | 0.6011 ± 0.1000 | 0.0924 ± 0.0232 | 0.0329 ± 0.0098 | 0.0109 ± 0.0035 | 0.0014 ± 0.0004 | 0.0001 ± 0.0000 |
+| `central` | central DP | 0.0010 ± 0.0004 | 0.0003 ± 0.0001 | 0.0001 ± 0.0000 | 0.0001 ± 0.0000 | 0.0000 ± 0.0000 | 0.0000 ± 0.0000 |
+
+**Counts over `sex` × `relationship` (12 cells): distance**
+
+| Arm | Analyst | ε = 0.1 | ε = 0.5 | ε = 1 | ε = 2 | ε = 5 | ε = 10 |
+|---|---|---|---|---|---|---|---|
+| `local` | SQL | 0.4077 ± 0.0028 | 0.3852 ± 0.0014 | 0.3449 ± 0.0027 | 0.2286 ± 0.0023 | 0.0197 ± 0.0008 | 0.0002 ± 0.0001 |
+| `local` | estimator | 0.5636 ± 0.1209 | 0.1437 ± 0.0354 | 0.0444 ± 0.0123 | 0.0105 ± 0.0024 | 0.0016 ± 0.0004 | 0.0001 ± 0.0000 |
+| `central` | central DP | 0.0013 ± 0.0005 | 0.0003 ± 0.0001 | 0.0001 ± 0.0000 | 0.0001 ± 0.0000 | 0.0000 ± 0.0000 | 0.0000 ± 0.0000 |
+
+**Counts over `workclass` × `education` (144 cells): distance**
+
+| Arm | Analyst | ε = 0.1 | ε = 0.5 | ε = 1 | ε = 2 | ε = 5 | ε = 10 |
+|---|---|---|---|---|---|---|---|
+| `local` | SQL | 0.6755 ± 0.0024 | 0.6439 ± 0.0021 | 0.5967 ± 0.0018 | 0.4645 ± 0.0005 | 0.0664 ± 0.0009 | 0.0007 ± 0.0001 |
+| `local` | estimator | 0.8148 ± 0.0237 | 0.7541 ± 0.0346 | 0.5058 ± 0.0164 | 0.1225 ± 0.0091 | 0.0096 ± 0.0008 | 0.0006 ± 0.0001 |
+| `central` | central DP | 0.0124 ± 0.0009 | 0.0028 ± 0.0003 | 0.0015 ± 0.0001 | 0.0007 ± 0.0001 | 0.0003 ± 0.0000 | 0.0001 ± 0.0000 |
+
+The pairs `sex` × `education` (32 cells) and `race` × `workclass` (45) lie between these; `--column sex,education` and `--column race,workclass` print them.
+
+**Cramér's V of `sex` × `relationship` (true 0.647): signed difference**
+
+| Arm | Analyst | ε = 0.1 | ε = 0.5 | ε = 1 | ε = 2 | ε = 5 | ε = 10 |
+|---|---|---|---|---|---|---|---|
+| `local` | SQL | -0.6371 ± 0.0014 | -0.6267 ± 0.0029 | -0.5778 ± 0.0048 | -0.3975 ± 0.0032 | -0.0387 ± 0.0010 | -0.0003 ± 0.0001 |
+| `local` | estimator | +0.3401 ± 0.0222 | +0.0608 ± 0.0808 | -0.0134 ± 0.0372 | -0.0063 ± 0.0075 | -0.0004 ± 0.0008 | -0.0000 ± 0.0001 |
+| `central` | central DP | -0.0004 ± 0.0007 | -0.0001 ± 0.0003 | +0.0000 ± 0.0001 | +0.0000 ± 0.0001 | +0.0000 ± 0.0000 | +0.0000 ± 0.0000 |
+
+**Cramér's V of `workclass` × `education` (true 0.100): signed difference**
+
+| Arm | Analyst | ε = 0.1 | ε = 0.5 | ε = 1 | ε = 2 | ε = 5 | ε = 10 |
+|---|---|---|---|---|---|---|---|
+| `local` | SQL | -0.0827 ± 0.0012 | -0.0824 ± 0.0012 | -0.0827 ± 0.0014 | -0.0802 ± 0.0016 | -0.0216 ± 0.0011 | -0.0002 ± 0.0001 |
+| `local` | estimator | +0.3970 ± 0.0224 | +0.3885 ± 0.0234 | +0.3189 ± 0.0107 | +0.1353 ± 0.0146 | +0.0041 ± 0.0043 | +0.0000 ± 0.0001 |
+| `central` | central DP | +0.0294 ± 0.0231 | +0.0035 ± 0.0026 | +0.0012 ± 0.0012 | +0.0006 ± 0.0008 | +0.0000 ± 0.0001 | -0.0001 ± 0.0001 |
+
+**Correlation of `age` and `hours_per_week` (true 0.072): signed difference.** The correction is undefined when the observed variance of a column minus the noise's is not positive; a cell says how many of the 10 repetitions were left.
+
+| Arm | Analyst | ε = 0.1 | ε = 0.5 | ε = 1 | ε = 2 | ε = 5 | ε = 10 |
+|---|---|---|---|---|---|---|---|
+| `local` | SQL | -0.0699 ± 0.0054 | -0.0700 ± 0.0056 | -0.0699 ± 0.0037 | -0.0709 ± 0.0057 | -0.0618 ± 0.0033 | -0.0384 ± 0.0045 |
+| `local` | estimator | -0.3456 ± 0.0000 (1 of 10) | +0.3061 ± 0.4401 (3 of 10) | +0.2141 ± 0.2343 (5 of 10) | +0.0220 ± 0.2927 | -0.0154 ± 0.0199 | +0.0006 ± 0.0097 |
+
+**Classification: accuracy, difference to the model trained on the real rows**
+
+| Arm | Analyst | ε = 0.1 | ε = 0.5 | ε = 1 | ε = 2 | ε = 5 | ε = 10 |
+|---|---|---|---|---|---|---|---|
+| `local` | SQL | -0.2219 ± 0.1596 | -0.1041 ± 0.0674 | -0.0631 ± 0.0015 | -0.0422 ± 0.0169 | -0.0011 ± 0.0010 | +0.0009 ± 0.0008 |
+
+**Classification: AUC, difference to the model trained on the real rows**
+
+| Arm | Analyst | ε = 0.1 | ε = 0.5 | ε = 1 | ε = 2 | ε = 5 | ε = 10 |
+|---|---|---|---|---|---|---|---|
+| `local` | SQL | -0.4237 ± 0.1572 | -0.2277 ± 0.0680 | -0.1230 ± 0.0491 | -0.0518 ± 0.0074 | -0.0088 ± 0.0004 | -0.0042 ± 0.0002 |
+
+**Findings over several columns:**
+
+1. **Counts over two columns need the estimator, and the estimator needs few cells.** Read with SQL, the shares of the five pairs are off by 0.34–0.61 at ε = 1 and 0.02–0.07 at ε = 5. Inverting the randomized response brings the small tables (10 and 12 cells) to 0.03–0.04 at ε = 1, but it amplifies the noise of each cell: with 144 cells it is 0.51 at ε = 1, and at ε ≤ 0.5 it is worse than reading the dump straight (0.75–0.81 against 0.64–0.68 for `workclass` × `education`).
+2. **SQL erases dependence; the estimator recovers a strong one and invents weak ones.** Read with SQL, the strong pair `sex` × `relationship` (V = 0.647) keeps a V of about 0.07 at ε = 1, and the weak pairs lose 78–88% of theirs at ε = 1 and 61–80% at ε = 2. Through the estimator, the strong pair is off by −0.013 ± 0.037 at ε = 1. On the weak pairs, the noise left after the inversion reads as dependence: V comes out too high by 0.07–0.34 at ε = 1 and by 0.40–0.91 at ε = 0.1, and within 0.01 only from ε = 5.
+3. **A weak correlation does not survive below ε = 5.** Read with SQL, the correlation of 0.072 is gone (−0.070 up to ε = 2, −0.038 at ε = 10). The correction removes the bias, but below ε = 2 it is undefined in half the repetitions or more, and its spread (0.23–0.44 at ε = 0.5–1) exceeds the correlation itself; it is within 0.02 from ε = 5.
+4. **A classifier trained on the masked dump loses little only from ε = 5 on.** At ε = 1 the model loses 0.12 of AUC, and its accuracy, 0.764 ± 0.002, is that of predicting the majority class; at ε = 5 it is within 0.01 of AUC and of accuracy of the model trained on the real rows. At ε = 0.1 its accuracy, 0.61 on average, is below the majority class.
+5. **The price is per record.** The relations become usable from ε = 5 per column, where a record of 8 masked columns spends 40. Central DP, with the same 2ε per pair, keeps the counts within 0.013 and Cramér's V within 0.04 at every ε, and within 0.0015 and 0.0013 from ε = 1 on.
+
 ## Findings
 
 1. **Means survive; other queries do not, for the SQL analyst.** Straight SQL on the masked dump gives the mean of `salary` within 2.1% at 10⁵ rows or more and ε ≥ 0.5 with a priori or DP bounds, and the means of Adult's columns within 1% from ε = 2 on. Everything else is noise until ε is large. On Adult and on `salary` from 10⁵ rows, at ε = 1, range counts are 75–99% off, the 90th percentile 145–270% (860% with the true range of `salary`), and the histogram distance 0.63–0.87; at ε = 10, still 11–93%, 5–61% and 0.10–0.42. That bias does not shrink with n.
@@ -320,8 +419,8 @@ python3 scripts/utility_checks.py rr-variance --adult-dir adult/ \
 
 ## Limitations
 
-* Each column is masked and measured alone. What a dump keeps of the relations between columns is stage 2.2.
-* Adult is one real dataset: 48,842 records from 1994, with two numeric columns. Its numbers are whole and its `hours_per_week` has a spike at 40, which the synthetic `salary` has not; other data will behave otherwise.
+* Stages 2.1 and 2.2 measure single columns and pairs of one table. Relations between tables (joins on `hmac` keys) are not measured: `hmac` keeps equal values equal, so joins keep their cardinality, but that is a property of the strategy, not a result of this evaluation.
+* Adult is one real dataset: 48,842 records from 1994, with two numeric columns, one weak numeric correlation and one strong categorical dependence. Its numbers are whole and its `hours_per_week` has a spike at 40, which the synthetic `salary` has not; other data will behave otherwise.
 * The numeric estimator is a plain EM deconvolution without regularization, stopped when the estimate moves by less than 10⁻⁵ or after 5,000 iterations. On Adult that rule overfits (see above); a stopping rule chosen without the truth, or a regularized estimator, is left to stage 2.5.
 * The central comparator gives each query the full ε; a fair comparison of a whole release would split ε across queries, which would raise the central errors.
 * No synthetic-data comparator (MST, AIM) was run (stage 2.4).
