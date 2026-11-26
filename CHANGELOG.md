@@ -4,7 +4,7 @@ Notable changes to GhostDump. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
-The V1 stabilization, stages 1.1 to 1.6 of the [roadmap](docs/roadmap.md), against the `dev` branch at commit `9d086cf`. What GhostDump still does not do is in [limitations](docs/limitations.md).
+The V1 stabilization, stages 1.1 to 1.7 of the [roadmap](docs/roadmap.md), and the V2 stages since, against the `dev` branch at commit `9d086cf`. What GhostDump still does not do is in [limitations](docs/limitations.md).
 
 ### Added
 
@@ -29,6 +29,7 @@ The V1 stabilization, stages 1.1 to 1.6 of the [roadmap](docs/roadmap.md), again
 - The help is in English, like the rest of the interface, and says what each `--dialect` value means.
 - Rust 1.88 or later is required (`rust-version`).
 - A key that the rules file does not know is an error (exit status 78): in a rule, in a table, or at the top. Unknown keys used to be ignored.
+- `hmac` derives its key from the secret once per run instead of once per value, and writes its hex digits from a table. The output is the same; a value costs 168 ns instead of 437 in the microbenchmark.
 
 ### Fixed
 
