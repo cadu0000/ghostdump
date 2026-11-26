@@ -864,8 +864,10 @@ DIFFERENCES = {"cramers_v", "correlation", "accuracy", "auc"}
 def print_query(rows, query, column, n, epsilon):
     """One query as a Markdown table: a row per arm and analyst, a column
     per ε (n fixed) or per n (ε fixed); each cell the mean error over the
-    repetitions ± its standard deviation, in percent for relative errors."""
-    by_cell = {}
+    repetitions ± its standard deviation, in percent for relative errors.
+    Repetitions whose error is undefined (NaN) are left out, and the cell
+    says how many were left, as `(3 of 10)`."""
+    by_cell, undefined = {}, {}
     for r in rows:
         if r["query"] != query or (column and r.get("column", "") != column):
             continue
@@ -875,8 +877,13 @@ def print_query(rows, query, column, n, epsilon):
             continue
         across = float(r["epsilon"]) if n is not None else int(r["n"])
         error = float(r["error"])
-        if not math.isnan(error):
-            by_cell.setdefault((r["arm"], r["analyst"]), {}).setdefault(across, []).append(error)
+        cells = by_cell.setdefault((r["arm"], r["analyst"]), {})
+        if math.isnan(error):
+            cells.setdefault(across, [])
+            key = (r["arm"], r["analyst"], across)
+            undefined[key] = undefined.get(key, 0) + 1
+        else:
+            cells.setdefault(across, []).append(error)
     if not by_cell:
         sys.exit(f"no rows for query {query}")
     acrosses = sorted({a for cells in by_cell.values() for a in cells})
@@ -888,21 +895,23 @@ def print_query(rows, query, column, n, epsilon):
         out = []
         for a in acrosses:
             errors = cells.get(a, [])
+            missing = undefined.get((arm, analyst, a), 0)
+            note = f" ({len(errors)} of {len(errors) + missing})" if missing else ""
             if not errors:
-                out.append("n/a")
+                out.append("n/a" + note)
                 continue
             signed = query == "mean" or query in DIFFERENCES
             values = errors if signed else [abs(e) for e in errors]
             mean = statistics.fmean(values)
             sd = statistics.stdev(values) if len(values) > 1 else 0.0
             if query in DIFFERENCES:
-                out.append(f"{mean:+.4f} ± {sd:.4f}")
+                out.append(f"{mean:+.4f} ± {sd:.4f}{note}")
             elif query in DISTANCES:
-                out.append(f"{mean:.4f} ± {sd:.4f}")
+                out.append(f"{mean:.4f} ± {sd:.4f}{note}")
             elif signed:
-                out.append(f"{100 * mean:+.1f}% ± {100 * sd:.1f}%")
+                out.append(f"{100 * mean:+.1f}% ± {100 * sd:.1f}%{note}")
             else:
-                out.append(f"{100 * mean:.1f}% ± {100 * sd:.1f}%")
+                out.append(f"{100 * mean:.1f}% ± {100 * sd:.1f}%{note}")
         print(f"| `{arm}` | {ANALYST_NAMES.get(analyst, analyst)} | " + " | ".join(out) + " |")
 
 
